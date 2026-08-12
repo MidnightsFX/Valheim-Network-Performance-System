@@ -3,8 +3,8 @@
   <PropertyGroup>
     <OutputType>Library</OutputType>
     <TargetFramework>net48</TargetFramework>
-    <RootNamespace>JotunnModStub</RootNamespace>
-    <AssemblyName>JotunnModStub</AssemblyName>
+    <RootNamespace>NetworkPerformanceSystem</RootNamespace>
+    <AssemblyName>NetworkPerformanceSystem</AssemblyName>
     <FileAlignment>512</FileAlignment>
     <Deterministic>true</Deterministic>
     <LangVersion>10</LangVersion>
@@ -54,7 +54,7 @@
 
   <PropertyGroup>
     <VALHEIM_MANAGED>$(VALHEIM_INSTALL)/valheim_Data/Managed</VALHEIM_MANAGED>
-    <UNITY_FOLDER>$(SolutionDir)JotunnModStubUnity</UNITY_FOLDER>
+    <UNITY_FOLDER>$(SolutionDir)NetworkPerformanceSystemUnity</UNITY_FOLDER>
   </PropertyGroup>
 
   <Target Name="CopyToUnity">

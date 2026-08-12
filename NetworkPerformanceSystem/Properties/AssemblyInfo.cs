@@ -4,12 +4,12 @@ using System.Runtime.InteropServices;
 // General Information about an assembly is controlled through the following
 // set of attributes. Change these attribute values to modify the information
 // associated with an assembly.
-[assembly: AssemblyTitle("JotunnModStub")]
-[assembly: AssemblyDescription("")]
+[assembly: AssemblyTitle("NetworkPerformanceSystem")]
+[assembly: AssemblyDescription("Latency-aware networking for Valheim: per-peer send windows and simulation authority placement.")]
 [assembly: AssemblyConfiguration("")]
-[assembly: AssemblyCompany("")]
-[assembly: AssemblyProduct("JotunnModStub")]
-[assembly: AssemblyCopyright("Copyright ©  2021")]
+[assembly: AssemblyCompany("MidnightsFX")]
+[assembly: AssemblyProduct("NetworkPerformanceSystem")]
+[assembly: AssemblyCopyright("Copyright © 2026")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 
@@ -31,5 +31,5 @@ using System.Runtime.InteropServices;
 // You can specify all the values or you can default the Build and Revision Numbers
 // by using the '*' as shown below:
 // [assembly: AssemblyVersion("1.0.*")]
-[assembly: AssemblyVersion(JotunnModStub.JotunnModStub.PluginVersion)]
-[assembly: AssemblyFileVersion(JotunnModStub.JotunnModStub.PluginVersion)]
+[assembly: AssemblyVersion(NetworkPerformanceSystem.NetworkPerformanceSystem.PluginVersion)]
+[assembly: AssemblyFileVersion(NetworkPerformanceSystem.NetworkPerformanceSystem.PluginVersion)]

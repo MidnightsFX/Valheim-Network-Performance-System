@@ -68,6 +68,10 @@ namespace NetworkPerformanceSystem.Runtime {
             return window;
         }
 
+        internal static void Forget(long peerUid) {
+            LastWindow.Remove(peerUid);
+        }
+
         internal static void Reset() {
             LastWindow.Clear();
         }

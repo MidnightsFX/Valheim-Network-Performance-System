@@ -9,6 +9,7 @@ namespace NetworkPerformanceSystem.Runtime {
     /// one feature rather than taking the whole plugin with it.
     /// </summary>
     internal enum Mechanism {
+        RttSampling,    // M1     - ZRpc.ReceivePing socket RTT probe; the measurement every other mechanism consumes
         SendWindow,     // M2/M2c - ZDOMan.SendZDOs BDP window
         SendScheduler,  // M2b    - ZDOMan.SendZDOToPeers2 round-robin fix
         Ownership,      // M3     - ZDOMan.ReleaseNearbyZDOS arbitration

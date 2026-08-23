@@ -111,9 +111,25 @@ namespace NetworkPerformanceSystem.Runtime {
             List<string> parts = new List<string>();
             foreach (Mechanism mechanism in System.Enum.GetValues(typeof(Mechanism))) {
                 string reason = PatchGuard.GetDisableReason(mechanism);
+                if (reason == null && !IsEnabledInConfig(mechanism)) { reason = "disabled in config"; }
                 parts.Add(reason == null ? $"{mechanism}: on" : $"{mechanism}: OFF ({reason})");
             }
             return string.Join("\n", parts.ToArray());
+        }
+
+        /// <summary>The config toggle behind each mechanism. PatchGuard tracks whether the patch
+        /// could be applied; this tracks whether the admin actually wants it. The report has to
+        /// reflect both, or an intentionally disabled feature reads as active.</summary>
+        private static bool IsEnabledInConfig(Mechanism mechanism) {
+            switch (mechanism) {
+                case Mechanism.RttSampling: return true;    // no config toggle - it is the measurement, not a behaviour
+                case Mechanism.SendWindow: return ValConfig.EnableSendWindowSizing.Value;
+                case Mechanism.SendScheduler: return ValConfig.EnableSchedulerFix.Value;
+                case Mechanism.Ownership: return ValConfig.EnableOwnershipArbitration.Value;
+                case Mechanism.RefPos: return ValConfig.EnableFastRefPos.Value;
+                case Mechanism.Extrapolation: return ValConfig.EnableLatencyCompensation.Value;
+                default: return true;
+            }
         }
 
         private static void AppendPeerTable(StringBuilder sb) {
@@ -161,10 +177,25 @@ namespace NetworkPerformanceSystem.Runtime {
 
             sb.AppendLine();
             sb.AppendLine("Ownership (last pass):");
+            // Candidates first: on a single-player world it reads 1, which immediately explains
+            // why nothing is being optimised and why the per-target cap is the binding constraint.
+            sb.AppendLine($"  candidates  {OwnershipArbiter.LastPassCandidates}");
             sb.AppendLine($"  considered  {OwnershipArbiter.LastPassConsidered}");
-            sb.AppendLine($"  reassigned  {OwnershipArbiter.LastPassReassigned}");
-            sb.AppendLine($"  deferred    {OwnershipArbiter.LastPassDeferredByCap} (hit the per-pass cap)");
-            sb.AppendLine($"  total since start  {OwnershipArbiter.TotalReassignments}");
+            sb.AppendLine($"  unowned     {OwnershipArbiter.LastPassUnownedOnEntry} on entry");
+            sb.AppendLine($"  rescued     {OwnershipArbiter.LastPassRescued} (had no present owner - never capped)");
+            sb.AppendLine($"  released    {OwnershipArbiter.LastPassReleased} (no eligible owner in range)");
+            sb.AppendLine($"  optimised   {OwnershipArbiter.LastPassOptimised} (moved to a lower-latency owner)");
+            sb.AppendLine($"  deferred    {OwnershipArbiter.LastPassDeferred} (optimisations only, hit the per-pass cap)");
+            sb.AppendLine($"  pass time   {OwnershipArbiter.LastPassMs:F1}ms");
+            sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued}, optimised {OwnershipArbiter.TotalOptimised}");
+
+            // The failure this split exists to make visible: a growing backlog of ZDOs with no
+            // simulator is frozen creatures that cannot be damaged, and it is otherwise invisible
+            // in-game - the hit plays its effects and simply does nothing.
+            if (OwnershipArbiter.LastPassUnownedOnEntry > OwnershipArbiter.LastPassRescued
+                && OwnershipArbiter.LastPassUnownedOnEntry * 4 > OwnershipArbiter.LastPassConsidered) {
+                sb.AppendLine("  WARNING: unowned backlog exceeds what this pass restored.");
+            }
         }
 
         private static void AppendExtrapolation(StringBuilder sb) {
@@ -177,6 +208,11 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine("  rendering is exactly vanilla.");
                 return;
             }
+            if (!NpsEnv.IsHost() && !LatencyRegistry.HasFreshTable) {
+                sb.AppendLine($"  latency table stale ({LatencyRegistry.PublishedTableAgeSeconds:F0}s old) - compensation");
+                sb.AppendLine("  suspended until the host publishes again.");
+                return;
+            }
             sb.AppendLine($"  entities corrected  {NpsExtrapolate.SamplesThisSecond}");
             sb.AppendLine($"  mean staleness      {NpsExtrapolate.MeanStalenessMs:F0}ms");
             sb.AppendLine($"  mean correction     {NpsExtrapolate.MeanDisplacement:F2}m");
@@ -187,6 +223,9 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static string BuildOverlay() {
             if (!NpsEnv.IsHost() && !LatencyRegistry.HasPublishedTable) {
                 return "NPS: no latency table (host not running this mod) - rendering is vanilla";
+            }
+            if (!NpsEnv.IsHost() && !LatencyRegistry.HasFreshTable) {
+                return $"NPS: latency table stale ({LatencyRegistry.PublishedTableAgeSeconds:F0}s old) - compensation suspended";
             }
 
             long self = NpsEnv.LocalSessionId();
@@ -201,6 +240,10 @@ namespace NetworkPerformanceSystem.Runtime {
         private static string Pad(string value, int width) {
             if (value == null) { value = ""; }
             return value.Length >= width ? value : value + new string(' ', width - value.Length);
+        }
+
+        internal static void ForgetPeer(long uid) {
+            Stats.Remove(uid);
         }
 
         internal static void Reset() {

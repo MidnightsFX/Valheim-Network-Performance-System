@@ -44,19 +44,25 @@ namespace NetworkPerformanceSystem.Patches {
 
         /// <summary>
         /// ZRpc pings every peer once a second and this fires for both the ping and the pong, so
-        /// it is a free, correctly-paced sampling clock. We read the real RTT out of the socket
-        /// rather than timing the pong ourselves.
+        /// it is a free, correctly-paced sampling clock. The RTT itself comes out of the socket
+        /// via RttProbe rather than from timing the pong ourselves. RttProbe, not the vanilla
+        /// accessor: ZSteamSocket.GetConnectionQuality is hard-wired to the Steamworks client
+        /// interface and throws on a dedicated server, which only has the game-server one. This
+        /// postfix runs inside ZRpc.Update's catch-all, so a throw here would be swallowed, logged
+        /// without our name, and leave every mechanism silently on vanilla.
         /// </summary>
         [HarmonyPatch(typeof(ZRpc), "ReceivePing")]
         [HarmonyPostfix]
         private static void SampleRtt(ZRpc __instance) {
             if (ZNet.instance == null) { return; }
+            if (!PatchGuard.IsActive(Mechanism.RttSampling)) { return; }     // stood down: skip the peer scan too
 
             ZNetPeer peer = FindPeerByRpc(__instance);
             if (peer?.m_socket == null || peer.m_uid == 0L) { return; }
 
-            peer.m_socket.GetConnectionQuality(out float _, out float _, out int ping, out float _, out float _);
-            LatencyRegistry.Sample(peer.m_uid, ping);
+            if (RttProbe.TryGetPingMs(peer.m_socket, out int ping)) {
+                LatencyRegistry.Sample(peer.m_uid, ping);
+            }
         }
 
         private static ZNetPeer FindPeerByRpc(ZRpc rpc) {
@@ -150,13 +156,17 @@ namespace NetworkPerformanceSystem.Patches {
         [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.RemovePeer))]
         [HarmonyPostfix]
         private static void OnPeerRemoved(ZNetPeer netPeer) {
-            if (netPeer != null) { LatencyRegistry.ForgetPeer(netPeer.m_uid); }
+            if (netPeer == null) { return; }
+            LatencyRegistry.ForgetPeer(netPeer.m_uid);
+            SendWindow.Forget(netPeer.m_uid);
+            NetworkStats.ForgetPeer(netPeer.m_uid);
         }
 
         [HarmonyPatch(typeof(ZNet), nameof(ZNet.Shutdown))]
         [HarmonyPostfix]
         private static void OnShutdown() {
             LatencyRegistry.Reset();
+            RttProbe.Reset();
             _latencyTableTimer = 0f;
             _refPosTimer = 0f;
             _lastSentRefPos = Vector3.positiveInfinity;

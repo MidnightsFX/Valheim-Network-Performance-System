@@ -7,9 +7,12 @@ namespace NetworkPerformanceSystem.Runtime {
     /// Per-peer round-trip time, measured on the host and published to clients.
     ///
     /// Vanilla has no usable RTT: ZNet.GetServerPing() returns seconds since the last pong, not a
-    /// round trip. The real number is sitting unused in ISocket.GetConnectionQuality's ping
-    /// out-param (ZSteamSocket reads SteamNetConnectionRealTimeStatus_t.m_nPing), which no game
-    /// code consumes.
+    /// round trip. The real number is the transport's own estimate
+    /// (SteamNetConnectionRealTimeStatus_t.m_nPing), which RttProbe reads once per ZRpc ping
+    /// through whichever Steamworks interface this process initialised. Vanilla's accessor,
+    /// ZSteamSocket.GetConnectionQuality, is hard-wired to the client interface and throws on a
+    /// dedicated server, where only the game-server interface exists; nothing in the game calls
+    /// it server-side, so that went unnoticed. PlayFab sockets report 0.
     ///
     /// Every consumer treats "no sample" as zero and falls back to vanilla behaviour, so a peer on
     /// a transport that does not report ping is never made worse off.
@@ -45,9 +48,25 @@ namespace NetworkPerformanceSystem.Runtime {
         private static readonly Dictionary<long, int> Published = new Dictionary<long, int>();
 
         private static bool _hasPublishedTable;
+        private static float _publishedAtRealtime;
+
+        /// <summary>The host republishes every 2 seconds; a table this many seconds old means the
+        /// channel has gone quiet (host left, mod unloaded, connection dying) and its numbers can
+        /// no longer be trusted. Consumers treat a stale table as no table - collapse to vanilla
+        /// rather than keep compensating from frozen data.</summary>
+        private const float PublishedTableTtlSeconds = 10f;
 
         internal static IEnumerable<KeyValuePair<long, PeerLatency>> AllMeasured => Measured;
+
+        /// <summary>A table arrived at some point this session - i.e. the host runs this mod.</summary>
         internal static bool HasPublishedTable => _hasPublishedTable;
+
+        /// <summary>The table is recent enough to base decisions on.</summary>
+        internal static bool HasFreshTable =>
+            _hasPublishedTable && Time.realtimeSinceStartup - _publishedAtRealtime < PublishedTableTtlSeconds;
+
+        internal static float PublishedTableAgeSeconds =>
+            _hasPublishedTable ? Time.realtimeSinceStartup - _publishedAtRealtime : 0f;
 
         internal static void Sample(long peerUid, int pingMs) {
             if (peerUid == 0L) { return; }                                    // pre-handshake, uid not assigned yet
@@ -118,8 +137,14 @@ namespace NetworkPerformanceSystem.Runtime {
                 return MeasuredRttMs(ownerUid) * 0.5f / 1000f;
             }
 
-            if (!_hasPublishedTable) { return 0f; }
-            return (RttMs(ownerUid) + RttMs(self)) * 0.5f / 1000f;
+            if (!HasFreshTable) { return 0f; }
+            // Both halves of the path must be in the table. A just-joined peer, or an owner id
+            // the host no longer knows, is a number we cannot justify - not a fast peer.
+            if (!Published.TryGetValue(ownerUid, out int ownerMs)
+                || !Published.TryGetValue(self, out int selfMs)) {
+                return 0f;
+            }
+            return (ownerMs + selfMs) * 0.5f / 1000f;
         }
 
         // -- wire format -------------------------------------------------------------------
@@ -165,6 +190,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 Published[uid] = rtt;
             }
             _hasPublishedTable = true;
+            _publishedAtRealtime = Time.realtimeSinceStartup;
         }
 
         internal static void ForgetPeer(long peerUid) {
@@ -175,6 +201,7 @@ namespace NetworkPerformanceSystem.Runtime {
             Measured.Clear();
             Published.Clear();
             _hasPublishedTable = false;
+            _publishedAtRealtime = 0f;
         }
     }
 }

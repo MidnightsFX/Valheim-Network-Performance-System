@@ -26,7 +26,6 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<bool> EnableDebugOverlay;
 
         // Add Server synced config entries under here
-        public static ConfigEntry<float> ConfigApplyDelay;
 
         // M2/M2c - bandwidth-delay-product send window
         public static ConfigEntry<bool> EnableSendWindowSizing;
@@ -44,6 +43,7 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<float> OwnershipMinHoldSeconds;
         public static ConfigEntry<int> OwnershipChallengeMarginMs;
         public static ConfigEntry<int> OwnershipMaxReassignsPerPass;
+        public static ConfigEntry<float> OwnershipLoadPenaltyMs;
 
         // M6 - fast reference position channel
         public static ConfigEntry<bool> EnableFastRefPos;
@@ -55,7 +55,9 @@ namespace NetworkPerformanceSystem {
         public ValConfig(ConfigFile cf) {
             // ensure all the config values are created
             cfg = cf;
-            cfg.SaveOnConfigSet = true;
+            // Deferred until every entry is bound: Awake calls SaveOnSet(true) afterwards, which
+            // flushes the whole file once instead of once per Bind.
+            cfg.SaveOnConfigSet = false;
             CreateConfigValues(cf);
             Logger.SetDebugLogging(EnableDebugMode.Value);
         }
@@ -90,9 +92,6 @@ namespace NetworkPerformanceSystem {
             EnableDebugOverlay = Config.Bind("Client config", "EnableDebugOverlay", false,
                 new ConfigDescription("Show the per-entity latency compensation overlay (owner, estimated staleness, applied displacement).", null,
                 new ConfigurationManagerAttributes { IsAdvanced = true }));
-
-            // Instantiate server synced config entries here
-            ConfigApplyDelay = BindServerConfig("Config", "Config Apply Delay", 1f, "Delay in seconds before a changed config entry is applied in-game. Coalesces a burst of rapid edits (typing, file reloads, server sync) into a single apply. Set to 0 to apply instantly.", true, 0f, 10f);
 
             // --- M2/M2c: bandwidth-delay-product send window -------------------------------
             // Vanilla allows a fixed 10240 bytes of in-flight reliable ZDO data per peer.
@@ -129,11 +128,13 @@ namespace NetworkPerformanceSystem {
             OwnershipAllowHostOwner = BindServerConfig("Ownership", "Allow Host As Owner", true,
                 "Let the host own ZDOs contested by peers in different latency classes. This minimises the worst-case staleness, but on a dedicated server it means the host simulates that object. Disable on CPU-constrained servers to fall back to the lowest-latency peer present.");
             OwnershipMinHoldSeconds = BindServerConfig("Ownership", "Min Hold Seconds", 5f,
-                "Minimum time an owner keeps a ZDO before it can be challenged. Hysteresis against ownership thrash.", false, 0f, 60f);
+                "Minimum time an owner keeps a ZDO before it can be challenged. Hysteresis against ownership thrash. Applies only when moving a ZDO away from an owner that is still present - a ZDO whose owner has left the area or the session is re-owned immediately, at any setting.", false, 0f, 60f);
             OwnershipChallengeMarginMs = BindServerConfig("Ownership", "Challenge Margin Ms", 25,
-                "A challenger must improve estimated staleness by at least this many milliseconds to take ownership. Prevents ping jitter from ping-ponging ownership between similar peers.", false, 0, 250);
+                "A challenger must improve estimated staleness by at least this many milliseconds to take ownership. Prevents ping jitter from ping-ponging ownership between similar peers. Applies only to challenges against a present owner, and also bounds how much the Load Penalty below may shift a decision.", false, 0, 250);
             OwnershipMaxReassignsPerPass = BindServerConfig("Ownership", "Max Reassigns Per Pass", 8,
-                "Cap on ownership transfers per arbitration pass. Each transfer costs a ZDO resend, so this bounds the burst when a group arrives in a new area.", true, 1, 128);
+                "Cap on latency-driven ownership transfers per arbitration pass. Each transfer costs a ZDO resend, so this bounds the burst when a group arrives in a new area. Large servers (20+ players) may raise this so ownership converges faster after groups move. Restoring an owner to a ZDO that has none is never deferred by this: an unowned creature does not move and cannot be damaged.", true, 1, 128);
+            OwnershipLoadPenaltyMs = BindServerConfig("Ownership", "Load Penalty Ms", 0.02f,
+                "Cost added per object a candidate already owns nearby, in milliseconds. Spreads simulation and upload load across peers instead of concentrating every contested object on the lowest-ping player. The total handicap is capped at Challenge Margin Ms, so load can break a tie but never outweigh a meaningful staleness difference. 0 disables load spreading and places purely by staleness.", true, 0f, 0.5f);
 
             // --- M6: fast reference position channel ---------------------------------------
             // ZNet.SendPeriodicData gates client reference positions behind a single 2 second

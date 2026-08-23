@@ -19,6 +19,20 @@ namespace NetworkPerformanceSystem.Runtime {
     /// This replaces the tie-break with an explicit cost function. Note what it does NOT do: it
     /// never moves a Player, Ship or tamed creature away from a healthy owner, because authority
     /// must follow direct control - that is the failure mode behind ship-helm stutter.
+    ///
+    /// A pass does two things, and keeping them apart is load-bearing:
+    ///
+    ///   * RESCUE - a ZDO with no owner, or whose owner has left the sector or the session, has
+    ///     nothing simulating it at all. Vanilla restores these unbudgeted on the pass that finds
+    ///     them, and creatures have no other recovery path (nothing in BaseAI, MonsterAI or
+    ///     Character ever calls ClaimOwnership). This is correctness, so it is uncapped.
+    ///   * OPTIMISATION - moving a ZDO from a healthy, present owner to a lower-latency one. This
+    ///     is a preference, so it carries the per-pass cap, the per-target cap, the min-hold
+    ///     hysteresis and the challenge margin.
+    ///
+    /// Routing rescues through the optimisation budget is what froze creatures mid-animation and
+    /// made them immune to damage: an unowned Character drops every RPC_Damage at its IsOwner
+    /// check while ZSyncAnimation keeps replaying the last-replicated run cycle.
     /// </summary>
     internal static class OwnershipArbiter {
 
@@ -45,8 +59,61 @@ namespace NetworkPerformanceSystem.Runtime {
         private static readonly List<Candidate> Candidates = new List<Candidate>();
         private static readonly List<ZDO> ScratchZdos = new List<ZDO>();
         private static readonly Dictionary<ZDOID, ZDO> Considered = new Dictionary<ZDOID, ZDO>();
-        private static readonly Dictionary<ZDOID, float> LastAssigned = new Dictionary<ZDOID, float>();
+        private static readonly Dictionary<ZDOID, OwnershipRecord> OwnerHistory = new Dictionary<ZDOID, OwnershipRecord>();
         private static readonly List<PendingMove> Pending = new List<PendingMove>();
+        private static readonly Dictionary<Vector2i, SectorVerdict> SectorCache = new Dictionary<Vector2i, SectorVerdict>();
+        private static readonly List<SectorVerdict> VerdictPool = new List<SectorVerdict>();
+        private static int _verdictsInUse;
+        private static readonly Dictionary<long, int> OwnedCount = new Dictionary<long, int>();
+        private static readonly HashSet<Vector2i> ScannedZones = new HashSet<Vector2i>();
+        private static readonly Dictionary<long, int> MovesPerTarget = new Dictionary<long, int>();
+
+        /// <summary>
+        /// Everything the cost function can say about one sector. Eligibility and Score depend
+        /// only on (sector, candidates), not on the individual ZDO, so every ZDO in a sector
+        /// shares one verdict - computed once per pass instead of once per ZDO. With a full
+        /// server that is the difference between thousands of iterations and tens of millions.
+        /// Instances are pooled across passes; only the cache dictionary is rebuilt.
+        /// </summary>
+        private sealed class SectorVerdict {
+            internal bool HasEligible;
+            internal long BestUid;
+            internal float BestTotalMs;
+            /// <summary>Total cost per present candidate, for the incumbent-owner lookup. Priced
+            /// even for candidates barred from owning, because an owner missing here reads as
+            /// infinite cost - which would make every challenge against it tie at float.MaxValue
+            /// and jump the queue on a capped pass, ahead of moves that improve something real.
+            /// </summary>
+            internal readonly Dictionary<long, float> TotalByOwner = new Dictionary<long, float>();
+            /// <summary>Candidates whose active area covers the sector, regardless of CanOwn.
+            /// Backs the "is the owner still here" test - a host barred from owning must still
+            /// count as present, or ZDOs it legitimately owns would read as abandoned.</summary>
+            internal readonly HashSet<long> Present = new HashSet<long>();
+
+            internal void Clear() {
+                HasEligible = false;
+                BestUid = 0L;
+                BestTotalMs = float.MaxValue;
+                TotalByOwner.Clear();
+                Present.Clear();
+            }
+        }
+
+        /// <summary>
+        /// Ownership history per ZDO: who owned it as of the last pass, when that changed, and
+        /// when a pass last saw it. ChangedAt drives the min-hold hysteresis; because it is
+        /// refreshed whenever the observed owner differs from the recorded one, ownership
+        /// claimed by gameplay code between passes (cart grabs, mount transfers,
+        /// ZNetView.ClaimOwnership on doors and the like) gets the same grace period as an
+        /// arbiter assignment instead of being challengeable on the very next pass. First
+        /// sight of an owned ZDO counts as a change, so everything starts with one hold-width
+        /// of grace after load - deliberately conservative.
+        /// </summary>
+        private struct OwnershipRecord {
+            internal long Owner;
+            internal float ChangedAt;
+            internal float LastSeenAt;
+        }
 
         private struct PendingMove {
             internal ZDO Zdo;
@@ -54,22 +121,57 @@ namespace NetworkPerformanceSystem.Runtime {
             internal float ImprovementMs;
         }
 
-        // Diagnostics
+        // Diagnostics. Rescue and optimisation are counted apart on purpose: they are different
+        // operations under different budgets, and a report that merges them cannot tell "the
+        // world is churning normally" from "part of it has no simulator at all".
+        internal static int LastPassCandidates;
         internal static int LastPassConsidered;
-        internal static int LastPassReassigned;
-        internal static int LastPassDeferredByCap;
-        internal static long TotalReassignments;
+        internal static int LastPassUnownedOnEntry;
+        internal static int LastPassRescued;
+        internal static int LastPassReleased;
+        internal static int LastPassOptimised;
+        internal static int LastPassDeferred;      // optimisations only; rescues are never deferred
+        internal static long TotalRescued;
+        internal static long TotalOptimised;
+        internal static float LastPassMs;
 
-        /// <summary>Entries older than this are dropped so the hold-time table cannot grow without
-        /// bound on a long-running server.</summary>
+        /// <summary>Entries no pass has seen for this long are dropped so the history table
+        /// cannot grow without bound on a long-running server. Pruning keys off LastSeenAt, not
+        /// ChangedAt: a stable owner's entry must survive, or expiry would read as a fresh claim
+        /// and re-grant it a hold.</summary>
         private const float HoldTableTtlSeconds = 120f;
         private static float _lastPrune;
+
+        /// <summary>Rate limit for the rescue-backlog warning. The pass runs every two seconds, so
+        /// an unthrottled warning would bury the rest of the log the moment it fires.</summary>
+        private const float RescueWarningIntervalSeconds = 30f;
+        private static float _lastRescueWarning;
+
+        /// <summary>
+        /// How many consecutive passes must rescue more than a quarter of the nearby world before
+        /// that is reported as a problem. One such pass is the normal shape of every login on a
+        /// dedicated server: the joining peer's reference position covers thousands of ZDOs nobody
+        /// is simulating, and vanilla's ReleaseNearbyZDOS grants them all unbudgeted too. A login
+        /// can legitimately produce two in a row - one around the peer's initial zero reference
+        /// position if a pass lands before its first RefPos arrives, then one around the real
+        /// spawn point once it has. Three (six seconds) is not a login or a teleport shape: after
+        /// the spawn burst, walking, a portal or a boat adds at most a zone row per crossing, and
+        /// the failure this exists to catch - something releasing ownership faster than the pass
+        /// restores it - is indefinite, so six seconds of detection latency costs nothing. A
+        /// server restart where several players rejoin disjoint areas within those seconds can
+        /// still chain a burst; if that is ever seen, raise this to 5.
+        /// </summary>
+        private const int RescueWarningConsecutivePasses = 3;
+        private static int _rescueBurstStreak;
 
         internal static void RunPass(ZDOMan zdoMan) {
             if (ZNet.instance == null || ZoneSystem.instance == null) { return; }
 
+            System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
+
             BuildCandidates(zdoMan);
-            if (Candidates.Count == 0) { return; }
+            LastPassCandidates = Candidates.Count;
+            if (Candidates.Count == 0) { LastPassMs = 0f; return; }
 
             CollectConsideredZdos(zdoMan);
 
@@ -77,48 +179,217 @@ namespace NetworkPerformanceSystem.Runtime {
             float minHold = ValConfig.OwnershipMinHoldSeconds.Value;
             float margin = ValConfig.OwnershipChallengeMarginMs.Value;
 
+            SectorCache.Clear();
+            _verdictsInUse = 0;
             Pending.Clear();
+
+            // Rescues and releases are applied inside the loop below rather than queued, so the
+            // counters are reset here instead of in ApplyUpgrades. LastPassUnownedOnEntry is
+            // deliberately absent: CollectConsideredZdos has already filled it in.
             LastPassConsidered = Considered.Count;
+            LastPassRescued = 0;
+            LastPassReleased = 0;
 
             foreach (KeyValuePair<ZDOID, ZDO> entry in Considered) {
                 ZDO zdo = entry.Value;
                 long currentOwner = zdo.GetOwner();
+                float changedAt = Touch(zdo.m_uid, currentOwner, now);
 
-                if (!TryPickOwner(zdo, currentOwner, out long best, out float bestTotal, out float currentTotal)) {
+                SectorVerdict verdict = VerdictFor(zdo.GetSector());
+
+                if (!verdict.HasEligible) {
                     // Nobody can take it. Preserve vanilla's release-to-unowned behaviour so an
                     // owner who walked away does not leave a phantom behind: HasOwner() gates real
                     // game logic (ZSyncTransform only extrapolates when a ZDO claims an owner), so
                     // an absent owner is worse than no owner.
-                    if (currentOwner != 0L && !IsOwnerStillInArea(zdo, currentOwner)) {
+                    //
+                    // Uncapped, and safe precisely because the rescue below is uncapped too: the
+                    // moment an eligible candidate covers this sector again the ZDO is re-owned on
+                    // that same pass, exactly as vanilla does it. The two must stay symmetrical -
+                    // capping one side and not the other is what left creatures frozen.
+                    if (currentOwner != 0L && !verdict.Present.Contains(currentOwner)) {
                         zdo.SetOwner(0L);
-                        LastAssigned.Remove(zdo.m_uid);
+                        OwnerHistory.Remove(zdo.m_uid);
+                        LastPassReleased++;
                     }
                     continue;
                 }
-                if (best == currentOwner) { continue; }
 
-                // Hysteresis: an owner that was just handed this ZDO keeps it for a while, so
-                // ping jitter around the margin cannot ping-pong ownership between two peers.
-                if (currentOwner != 0L
-                    && LastAssigned.TryGetValue(zdo.m_uid, out float assignedAt)
-                    && now - assignedAt < minHold) {
+                // Rescue: nothing is simulating this. Unowned, or owned by someone who has left
+                // the sector or the session. That is not a placement preference, it is a broken
+                // object - BaseAI.UpdateAI returns early for non-owners, ZSyncTransform only
+                // extrapolates when the ZDO claims an owner, ZSyncAnimation stops writing animator
+                // parameters, and Character.Damage routes through ZRoutedRpc to owner 0, which
+                // broadcasts and is then dropped by every receiver at RPC_Damage's IsOwner check.
+                // Frozen mid-animation and silently invulnerable.
+                //
+                // Vanilla's ReleaseNearbyZDOS grants every one of these on the pass that finds it
+                // and budgets nothing, and no creature component ever calls ClaimOwnership, so
+                // this pass is the only recovery path they have. So: no cap, no min-hold, no
+                // margin. A cap here does not smooth the cost, it leaves objects broken for
+                // another pass. If this ever needs to cost less, the lever is spreading rescues
+                // across more eligible candidates - never deferring them in time.
+                //
+                // Deliberately ahead of the direct-control and hysteresis checks below. Those all
+                // require a present owner, so the two paths are disjoint by construction: this can
+                // never take a ship from a helmsman still aboard, but it does rescue one whose
+                // helmsman disconnected - which the release path above cannot reach either,
+                // because some other candidate is still eligible here.
+                if (currentOwner == 0L || !verdict.Present.Contains(currentOwner)) {
+                    zdo.SetOwner(verdict.BestUid);
+                    OwnerHistory[zdo.m_uid] = new OwnershipRecord { Owner = verdict.BestUid, ChangedAt = now, LastSeenAt = now };
+                    LastPassRescued++;
+                    TotalRescued++;
                     continue;
                 }
 
-                float improvement = currentTotal - bestTotal;
-                if (currentOwner != 0L && improvement < margin) { continue; }
+                // Everything from here down is optimisation: the ZDO already has a healthy, present
+                // owner and we are only deciding whether a better one exists. That is a preference,
+                // so every cap and every hysteresis rule belongs here and nowhere else.
+                // currentOwner != 0 and Present.Contains(currentOwner) are invariants below, which
+                // is why none of these checks re-test them.
 
-                Pending.Add(new PendingMove { Zdo = zdo, NewOwner = best, ImprovementMs = improvement });
+                // Directly-controlled objects follow their controller, never the cost function.
+                // This is what stops us yanking a ship out from under its helmsman.
+                if (OwnershipPolicy.IsDirectlyControlled(zdo)) { continue; }
+
+                if (verdict.BestUid == currentOwner) { continue; }
+
+                // Hysteresis: an owner that just received this ZDO - from us or from gameplay
+                // code - keeps it for a while, so ping jitter around the margin cannot
+                // ping-pong ownership between two peers and a player-initiated claim is not
+                // second-guessed on the very next pass.
+                if (now - changedAt < minHold) { continue; }
+
+                // Present owners are always priced by BuildVerdict; the fallback is belt and braces.
+                float currentTotal = verdict.TotalByOwner.TryGetValue(currentOwner, out float knownTotal)
+                    ? knownTotal
+                    : float.MaxValue;
+
+                float improvement = currentTotal - verdict.BestTotalMs;
+                if (improvement < margin) { continue; }
+
+                Pending.Add(new PendingMove { Zdo = zdo, NewOwner = verdict.BestUid, ImprovementMs = improvement });
             }
 
-            ApplyPending(now);
+            ApplyUpgrades(now);
             PruneHoldTable(now);
+
+            watch.Stop();
+            LastPassMs = (float)watch.Elapsed.TotalMilliseconds;
+
+            bool burst = LastPassConsidered > 0 && LastPassRescued * 4 > LastPassConsidered;
+            _rescueBurstStreak = burst ? _rescueBurstStreak + 1 : 0;
+            if (_rescueBurstStreak >= RescueWarningConsecutivePasses
+                && now - _lastRescueWarning > RescueWarningIntervalSeconds) {
+                _lastRescueWarning = now;
+                // Over a quarter of the nearby world had no simulator at the start of each of the
+                // last few passes. One or two such passes are a login, a world load or a mass
+                // teleport and only show on the debug line below; sustained, something is
+                // releasing ownership faster than this pass can restore it.
+                Logger.LogWarning($"Ownership: rescued {LastPassRescued} of {LastPassConsidered} nearby ZDOs with no present owner, {_rescueBurstStreak} passes in a row.");
+            }
+
+            if (Logger.Level >= BepInEx.Logging.LogLevel.Debug) {
+                Logger.LogDebug($"Ownership pass: considered {LastPassConsidered} ({LastPassUnownedOnEntry} unowned), rescued {LastPassRescued}, released {LastPassReleased}, optimised {LastPassOptimised}, deferred {LastPassDeferred}, {LastPassMs:F1}ms.");
+            }
+        }
+
+        /// <summary>Cached verdict for a sector, built on first request this pass.</summary>
+        private static SectorVerdict VerdictFor(Vector2i sector) {
+            if (SectorCache.TryGetValue(sector, out SectorVerdict cached)) { return cached; }
+
+            SectorVerdict verdict;
+            if (_verdictsInUse < VerdictPool.Count) {
+                verdict = VerdictPool[_verdictsInUse];
+                verdict.Clear();
+            } else {
+                verdict = new SectorVerdict();
+                VerdictPool.Add(verdict);
+            }
+            _verdictsInUse++;
+
+            BuildVerdict(sector, verdict);
+            SectorCache[sector] = verdict;
+            return verdict;
+        }
+
+        /// <summary>
+        /// Choose the owner minimising perceived staleness across everyone who can see this
+        /// sector.
+        ///
+        ///     Cost(O) = sum over interested p != O of (rtt(O) + rtt(p)) / 2
+        ///
+        /// With one interested peer that resolves to "the peer owns it" (cost 0). With two peers
+        /// in different latency classes every choice has the same total, so the tie-break on
+        /// worst case decides - and the lowest-RTT candidate wins, which is the fair outcome.
+        /// </summary>
+        private static void BuildVerdict(Vector2i sector, SectorVerdict verdict) {
+            int activatedArea = ZoneSystem.instance.m_activeArea - 1;
+            float loadPenalty = ValConfig.OwnershipLoadPenaltyMs.Value;
+            // OwnedCount tallies every persistent ZDO near a candidate - trees, walls, pickables -
+            // so in a built-up base it reaches thousands, and an unclamped penalty becomes a bigger
+            // handicap than any real RTT spread. That would make placement load-driven rather than
+            // latency-driven, and would silently override IsBetter's lowest-RTT tie-break. The
+            // challenge margin is already "the smallest staleness difference worth acting on", so
+            // capping there says load may shade a decision but never outweigh a meaningful one.
+            float loadCap = ValConfig.OwnershipChallengeMarginMs.Value;
+
+            Verdict bestVerdict = default;
+            bool found = false;
+
+            for (int i = 0; i < Candidates.Count; i++) {
+                Candidate owner = Candidates[i];
+                if (!ZNetScene.InActiveArea(sector, owner.Zone, activatedArea)) { continue; }
+                verdict.Present.Add(owner.Uid);
+
+                Verdict score = Score(owner, sector, activatedArea);
+
+                // Load-aware term: every ZDO this candidate already simulates makes the next one
+                // slightly less attractive, so a run of low-RTT wins spreads across peers instead
+                // of stacking one player's CPU and upload. Deliberately kept out of WorstCostMs,
+                // which stays a pure staleness metric for the tie-break.
+                if (loadPenalty > 0f && OwnedCount.TryGetValue(owner.Uid, out int owned)) {
+                    score.TotalCostMs += Mathf.Min(owned * loadPenalty, loadCap);
+                }
+
+                // Priced before the CanOwn gate: a host barred from owning still owns ZDOs
+                // legitimately, and an incumbent missing from this table reads as infinite cost.
+                // CanOwn gates winning, not being priced.
+                verdict.TotalByOwner[owner.Uid] = score.TotalCostMs;
+                if (!owner.CanOwn) { continue; }
+
+                if (!found || IsBetter(score, bestVerdict)) {
+                    bestVerdict = score;
+                    verdict.BestUid = owner.Uid;
+                    found = true;
+                }
+            }
+
+            verdict.HasEligible = found;
+            verdict.BestTotalMs = found ? bestVerdict.TotalCostMs : float.MaxValue;
+        }
+
+        /// <summary>
+        /// Records what this pass observed about a ZDO's ownership and returns the timestamp of
+        /// the last ownership change, which is what the hold check measures from. An observed
+        /// owner that differs from the recorded one is an external claim and restarts the clock.
+        /// </summary>
+        private static float Touch(ZDOID uid, long currentOwner, float now) {
+            if (OwnerHistory.TryGetValue(uid, out OwnershipRecord record) && record.Owner == currentOwner) {
+                record.LastSeenAt = now;
+                OwnerHistory[uid] = record;
+                return record.ChangedAt;
+            }
+
+            OwnerHistory[uid] = new OwnershipRecord { Owner = currentOwner, ChangedAt = now, LastSeenAt = now };
+            return now;
         }
 
         /// <summary>
         /// Everyone who could take a ZDO: the host plus every connected peer. The host is included
         /// on the same footing as anyone else and, critically, is still subject to the same
-        /// active-area test in TryPickOwner.
+        /// active-area test in BuildVerdict.
         /// </summary>
         private static void BuildCandidates(ZDOMan zdoMan) {
             Candidates.Clear();
@@ -162,8 +433,14 @@ namespace NetworkPerformanceSystem.Runtime {
         /// </summary>
         private static void CollectConsideredZdos(ZDOMan zdoMan) {
             Considered.Clear();
+            OwnedCount.Clear();
+            ScannedZones.Clear();
 
             for (int i = 0; i < Candidates.Count; i++) {
+                // Co-located candidates share a zone; scanning it once is the difference between
+                // one and ten FindSectorObjects sweeps over the same crowded base.
+                if (!ScannedZones.Add(Candidates[i].Zone)) { continue; }
+
                 ScratchZdos.Clear();
                 zdoMan.FindSectorObjects(Candidates[i].Zone, ZoneSystem.instance.m_activeArea, 0, ScratchZdos);
 
@@ -173,91 +450,18 @@ namespace NetworkPerformanceSystem.Runtime {
                     Considered[zdo.m_uid] = zdo;
                 }
             }
-        }
 
-        /// <summary>
-        /// Choose the owner minimising perceived staleness across everyone who can see this ZDO.
-        ///
-        ///     Cost(O) = sum over interested p != O of (rtt(O) + rtt(p)) / 2
-        ///
-        /// With one interested peer that resolves to "the peer owns it" (cost 0). With two peers in
-        /// different latency classes every choice has the same total, so the tie-break on worst
-        /// case decides - and the lowest-RTT candidate wins, which is the fair outcome.
-        /// </summary>
-        private static bool TryPickOwner(ZDO zdo, long currentOwner, out long best, out float bestTotal, out float currentTotal) {
-            best = 0L;
-            bestTotal = float.MaxValue;
-            currentTotal = float.MaxValue;
-
-            Vector2i sector = zdo.GetSector();
-            int activatedArea = ZoneSystem.instance.m_activeArea - 1;
-
-            // Anyone eligible to take it: in the ZDO's active area and allowed to own.
-            int eligibleCount = 0;
-            for (int i = 0; i < Candidates.Count; i++) {
-                if (Candidates[i].CanOwn && ZNetScene.InActiveArea(sector, Candidates[i].Zone, activatedArea)) {
-                    eligibleCount++;
-                }
+            // Tallied after dedup so a ZDO near several groups counts once. Feeds the
+            // load-penalty term in BuildVerdict; the unowned count is the health metric for the
+            // rescue path - in a steady world it tracks the release ring's population and stays
+            // flat, and a number that climbs pass on pass means rescue is not keeping up.
+            LastPassUnownedOnEntry = 0;
+            foreach (KeyValuePair<ZDOID, ZDO> entry in Considered) {
+                long owner = entry.Value.GetOwner();
+                if (owner == 0L) { LastPassUnownedOnEntry++; continue; }
+                OwnedCount.TryGetValue(owner, out int count);
+                OwnedCount[owner] = count + 1;
             }
-            if (eligibleCount == 0) { return false; }
-
-            // Directly-controlled objects follow their controller, never the cost function - but
-            // only while that controller is actually still there. Both halves matter:
-            //
-            //   * skipping while the owner is present is what stops us yanking a ship out from
-            //     under its helmsman, which is the classic failure mode here;
-            //   * NOT skipping once the owner is gone is what stops a ship whose driver
-            //     disconnected from keeping a phantom owner forever - it would be excluded from
-            //     reassignment and from the release path below, so nothing would ever simulate it
-            //     again.
-            if (currentOwner != 0L
-                && OwnershipPolicy.IsDirectlyControlled(zdo)
-                && IsOwnerStillInArea(zdo, currentOwner)) {
-                return false;
-            }
-
-            Verdict bestVerdict = default;
-            bool found = false;
-
-            for (int i = 0; i < Candidates.Count; i++) {
-                Candidate owner = Candidates[i];
-                if (!owner.CanOwn) { continue; }
-                if (!ZNetScene.InActiveArea(sector, owner.Zone, activatedArea)) { continue; }
-
-                Verdict verdict = Score(owner, sector, activatedArea);
-
-                if (owner.Uid == currentOwner) { currentTotal = verdict.TotalCostMs; }
-
-                if (!found || IsBetter(verdict, bestVerdict)) {
-                    bestVerdict = verdict;
-                    best = owner.Uid;
-                    found = true;
-                }
-            }
-
-            if (!found) { return false; }
-
-            bestTotal = bestVerdict.TotalCostMs;
-            // currentTotal is left at float.MaxValue when the current owner is not an eligible
-            // candidate - it walked away, or disconnected. That reads as infinite cost, so any
-            // eligible candidate wins outright and the margin check cannot block the handover.
-            return true;
-        }
-
-        /// <summary>
-        /// Mirrors vanilla's IsInPeerActiveArea test: is the ZDO still inside its owner's active
-        /// area? False for an owner that has moved on or is no longer connected.
-        /// </summary>
-        private static bool IsOwnerStillInArea(ZDO zdo, long ownerUid) {
-            Vector2i sector = zdo.GetSector();
-            int activatedArea = ZoneSystem.instance.m_activeArea - 1;
-
-            for (int i = 0; i < Candidates.Count; i++) {
-                if (Candidates[i].Uid == ownerUid) {
-                    return ZNetScene.InActiveArea(sector, Candidates[i].Zone, activatedArea);
-                }
-            }
-            return false;
         }
 
         /// <summary>
@@ -303,28 +507,38 @@ namespace NetworkPerformanceSystem.Runtime {
         /// Apply the best moves first, up to the per-pass cap. Sorting by improvement means a
         /// capped pass does the reassignments that matter most rather than whichever happened to
         /// be enumerated first, and anything skipped is simply reconsidered next pass.
+        ///
+        /// Only latency-driven moves off a healthy, present owner reach here. Restoring an owner
+        /// to a ZDO that has none is correctness, not placement, and is applied unbudgeted in
+        /// RunPass - so every improvement below is finite and the sort is meaningful.
         /// </summary>
-        private static void ApplyPending(float now) {
-            LastPassReassigned = 0;
-            LastPassDeferredByCap = 0;
+        private static void ApplyUpgrades(float now) {
+            LastPassOptimised = 0;
+            LastPassDeferred = 0;
 
             if (Pending.Count == 0) { return; }
 
             Pending.Sort((a, b) => b.ImprovementMs.CompareTo(a.ImprovementMs));
 
             int cap = Mathf.Max(1, ValConfig.OwnershipMaxReassignsPerPass.Value);
+            // No single peer may soak up the whole budget in one pass: each transfer is a resend
+            // plus new simulation load for the receiver, and a pass that hands one player
+            // everything is the concentration problem in miniature.
+            int perTargetCap = Mathf.Max(1, (cap + 1) / 2);
+            MovesPerTarget.Clear();
+
             for (int i = 0; i < Pending.Count; i++) {
-                if (i >= cap) { LastPassDeferredByCap = Pending.Count - cap; break; }
+                if (LastPassOptimised >= cap) { LastPassDeferred += Pending.Count - i; break; }
 
                 PendingMove move = Pending[i];
-                move.Zdo.SetOwner(move.NewOwner);
-                LastAssigned[move.Zdo.m_uid] = now;
-                LastPassReassigned++;
-                TotalReassignments++;
-            }
+                MovesPerTarget.TryGetValue(move.NewOwner, out int taken);
+                if (taken >= perTargetCap) { LastPassDeferred++; continue; }
+                MovesPerTarget[move.NewOwner] = taken + 1;
 
-            if (Logger.Level >= BepInEx.Logging.LogLevel.Debug) {
-                Logger.LogDebug($"Ownership pass: considered {LastPassConsidered}, reassigned {LastPassReassigned}, deferred {LastPassDeferredByCap}.");
+                move.Zdo.SetOwner(move.NewOwner);
+                OwnerHistory[move.Zdo.m_uid] = new OwnershipRecord { Owner = move.NewOwner, ChangedAt = now, LastSeenAt = now };
+                LastPassOptimised++;
+                TotalOptimised++;
             }
         }
 
@@ -333,25 +547,43 @@ namespace NetworkPerformanceSystem.Runtime {
             _lastPrune = now;
 
             List<ZDOID> stale = null;
-            foreach (KeyValuePair<ZDOID, float> entry in LastAssigned) {
-                if (now - entry.Value > HoldTableTtlSeconds) {
+            foreach (KeyValuePair<ZDOID, OwnershipRecord> entry in OwnerHistory) {
+                if (now - entry.Value.LastSeenAt > HoldTableTtlSeconds) {
                     (stale ??= new List<ZDOID>()).Add(entry.Key);
                 }
             }
             if (stale == null) { return; }
-            for (int i = 0; i < stale.Count; i++) { LastAssigned.Remove(stale[i]); }
+            for (int i = 0; i < stale.Count; i++) { OwnerHistory.Remove(stale[i]); }
         }
 
         internal static void Reset() {
             Candidates.Clear();
             ScratchZdos.Clear();
             Considered.Clear();
-            LastAssigned.Clear();
+            OwnerHistory.Clear();
             Pending.Clear();
+            SectorCache.Clear();
+            VerdictPool.Clear();
+            _verdictsInUse = 0;
+            OwnedCount.Clear();
+            ScannedZones.Clear();
+            MovesPerTarget.Clear();
+            // Both timers are realtimeSinceStartup-based and so survive a shutdown; clearing them
+            // means the next session prunes and warns on its own schedule rather than inheriting
+            // one that has already half-elapsed.
+            _lastPrune = 0f;
+            _lastRescueWarning = 0f;
+            _rescueBurstStreak = 0;
+            LastPassCandidates = 0;
             LastPassConsidered = 0;
-            LastPassReassigned = 0;
-            LastPassDeferredByCap = 0;
-            TotalReassignments = 0;
+            LastPassUnownedOnEntry = 0;
+            LastPassRescued = 0;
+            LastPassReleased = 0;
+            LastPassOptimised = 0;
+            LastPassDeferred = 0;
+            TotalRescued = 0;
+            TotalOptimised = 0;
+            LastPassMs = 0f;
         }
     }
 }

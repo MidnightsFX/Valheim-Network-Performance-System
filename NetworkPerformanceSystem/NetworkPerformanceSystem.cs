@@ -21,18 +21,18 @@ namespace NetworkPerformanceSystem
     [BepInIncompatibility("Searica.Valheim.NetworkTweaks")]
     [BepInIncompatibility("dzk.warheimnetwork")]
     [BepInIncompatibility("com.maxsch.valheim.TimeoutLimit")]
-    // Deliberately NOT blocked - verified to have no patch-site overlap and to compose:
+    // Deliberately NOT blocked - verified to have no patch-site overlap:
     //   CacoFFF.valheim.LeanNet            (gates ZDO.IncreaseDataRevision, one layer above us)
     //   redseiko.valheim.compress          (transpiles SendZDOs at ZRpc.Invoke, not our constants)
     //   redseiko.valheim.enroute           (ZRoutedRpc only)
     //   redseiko.valheim.betterzeerouter   (ZRoutedRpc only)
     //   redseiko.valheim.scenic            (ZNetScene.RemoveObjects only)
-    //   redseiko.valheim.returntosender    (does M2b's job; we detect and stand down - see SendSchedulerPatch)
+    //   redseiko.valheim.returntosender    (it overrides SendSchedulerPatch, allowed)
     internal class NetworkPerformanceSystem : BaseUnityPlugin
     {
         public const string PluginGUID = "MidnightsFX.NetworkPerformanceSystem";
         public const string PluginName = "NetworkPerformanceSystem";
-        public const string PluginVersion = "0.1.0";
+        public const string PluginVersion = "1.0.0";
 
         internal static ManualLogSource Log;
         internal static Harmony HarmonyInstance;

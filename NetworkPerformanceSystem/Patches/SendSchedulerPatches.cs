@@ -6,7 +6,7 @@ using UnityEngine;
 namespace NetworkPerformanceSystem.Patches {
 
     /// <summary>
-    /// M2b - services every peer per send round instead of one peer per rendered frame.
+    /// M2b - services every peer once per send interval instead of one peer per rendered frame.
     ///
     /// Vanilla's SendZDOToPeers2 is a round-robin that advances one peer per Update, and the frame
     /// that opens a round sends to nobody at all. A full round therefore costs N+1 frames on top of
@@ -18,6 +18,12 @@ namespace NetworkPerformanceSystem.Patches {
     /// and it degrades further as server frame rate drops. None of that is network latency, but it
     /// lands on top of it, so a distant group pays for it twice.
     ///
+    /// The sends are strided across the frames inside each interval rather than fired all at
+    /// once: every SendZDOs call is a sector scan, a revision filter and a sort, and running 50
+    /// of those back-to-back in one frame is a stutter that every dt-driven system downstream
+    /// inherits. Striding keeps the per-peer rate at exactly 1/interval while holding per-frame
+    /// cost to a handful of peers.
+    ///
     /// This is the one mechanism here that is not novel - ReturnToSender, VBNetTweaks and SkadiNet
     /// all fix it and agree on the shape. We carry it because we are standalone.
     /// </summary>
@@ -25,6 +31,11 @@ namespace NetworkPerformanceSystem.Patches {
     internal static class SendSchedulerPatches {
 
         private static bool _checkedForReturnToSender;
+
+        /// <summary>Fractional peers owed a send, accumulated per frame. Clamped to one full
+        /// round so a hitch is repaid as at most one burst, not several.</summary>
+        private static float _strideAccumulator;
+        private static int _strideIndex;
 
         [HarmonyPatch(typeof(ZDOMan), "SendZDOToPeers2")]
         [HarmonyPrefix]
@@ -38,24 +49,28 @@ namespace NetworkPerformanceSystem.Patches {
             int count = peers.Count;
             if (count == 0) { return false; }
 
-            __instance.m_sendTimer += dt;
             float interval = Mathf.Max(0.01f, ValConfig.SendIntervalSeconds.Value);
-            if (__instance.m_sendTimer < interval) { return false; }
-            __instance.m_sendTimer = 0f;
+            _strideAccumulator = Mathf.Min(_strideAccumulator + dt * count / interval, count);
 
-            // Rotate which peer leads each round. Per-peer sockets mean ordering has little
-            // effect on bandwidth, but it costs one modulo to stop any shared per-frame budget
-            // from consistently favouring the same peer.
-            int start = __instance.m_nextSendPeer < 0 ? 0 : __instance.m_nextSendPeer % count;
+            int toService = Mathf.FloorToInt(_strideAccumulator);
+            if (toService <= 0) { return false; }
+            _strideAccumulator -= toService;
 
-            for (int i = 0; i < count; i++) {
-                ZDOMan.ZDOPeer peer = peers[(start + i) % count];
+            for (int i = 0; i < toService; i++) {
+                if (_strideIndex >= count) { _strideIndex = 0; }
+                ZDOMan.ZDOPeer peer = peers[_strideIndex];
+                _strideIndex++;
+
                 if (peer?.m_peer?.m_socket == null || !peer.m_peer.m_socket.IsConnected()) { continue; }
                 __instance.SendZDOs(peer, false);
             }
 
-            __instance.m_nextSendPeer = (start + 1) % count;
             return false;
+        }
+
+        internal static void Reset() {
+            _strideAccumulator = 0f;
+            _strideIndex = 0;
         }
 
         /// <summary>

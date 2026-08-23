@@ -61,6 +61,17 @@ Works on dedicated servers and on player-hosted games.
   settle back. Lower `LatencyCompensationStrength` if you find it distracting; `0` disables it.
 - Requires the Steam backend. Crossplay/PlayFab connections do not report round-trip time, and
   without a measurement every mechanism falls back to vanilla behaviour rather than guessing.
+- If the log shows `RttSampling disabled`, the server's Steam interface could not be queried and
+  everything runs as vanilla; `nps_stats` shows the reason.
+- Honest send windows mean a full server can actually use its bandwidth: 50 players at the
+  default 150 KB/s target is ~60 Mbit/s of upload worst case. Backpressure degrades gracefully
+  if the link is smaller, but provision the server's uplink for the player count rather than
+  assuming vanilla's artificially starved usage.
+- On large servers (20+ players), consider raising `Max Reassigns Per Pass` so ownership
+  converges faster after groups move; the default is tuned for small-group play. The `Load
+  Penalty Ms` setting spreads contested objects across low-latency peers instead of piling
+  everything on the single lowest-ping player - leave it on unless you specifically want pure
+  staleness placement.
 
 ## Incompatible with
 

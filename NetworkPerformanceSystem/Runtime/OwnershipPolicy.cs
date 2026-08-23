@@ -20,14 +20,19 @@ namespace NetworkPerformanceSystem.Runtime {
             Player = 1,
             Ship = 2,
             Mount = 3,
+            Cart = 4,
         }
 
         private static readonly Dictionary<int, PrefabClass> ClassCache = new Dictionary<int, PrefabClass>();
 
         /// <summary>
         /// True when this ZDO represents something a player is or could be directly driving.
-        /// Callers only consult this for ZDOs that already have an owner - an unowned ship still
-        /// needs somebody to simulate it.
+        ///
+        /// Only ever reached for a ZDO whose owner is still present: the arbiter's rescue branch
+        /// runs first and returns, so an unowned ship, or one whose helmsman disconnected, never
+        /// consults this at all. That ordering is what stops a stale s_user - a rider id left
+        /// behind by a disconnected player - from reading as "controlled" forever and excluding
+        /// the mount from recovery permanently.
         /// </summary>
         internal static bool IsDirectlyControlled(ZDO zdo) {
             switch (Classify(zdo)) {
@@ -38,7 +43,16 @@ namespace NetworkPerformanceSystem.Runtime {
                 case PrefabClass.Mount:
                     // A tame only counts as controlled while somebody is actually riding it;
                     // an idle tame is an ordinary creature and benefits from arbitration.
-                    return zdo.GetBool(ZDOVars.s_tamed, false);
+                    // Sadle shares the animal's ZDO and stores the rider's id in s_user
+                    // (RPC_RequestControl also hands the rider ownership), so this reads
+                    // "has a rider right now" straight off the ZDO we are arbitrating.
+                    return zdo.GetLong(ZDOVars.s_user, 0L) != 0L;
+                case PrefabClass.Cart:
+                    // Vagon mirrors the ship handoff: grabbing the handle transfers ownership
+                    // to the puller and sets s_attachJointHash until detach. While attached,
+                    // the cart's physics are the puller's input loop - moving it is the same
+                    // failure mode as taking a ship from its helmsman.
+                    return zdo.GetBool(ZDOVars.s_attachJointHash, false);
                 default:
                     return false;
             }
@@ -54,6 +68,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (go != null) {
                     if (go.GetComponent<Player>() != null) { result = PrefabClass.Player; }
                     else if (go.GetComponent<Ship>() != null) { result = PrefabClass.Ship; }
+                    else if (go.GetComponent<Vagon>() != null) { result = PrefabClass.Cart; }
                     else if (go.GetComponent<Tameable>() != null) { result = PrefabClass.Mount; }
                 } else {
                     // Unknown prefab (content mod not loaded here, or a stale ZDO). Do not cache a

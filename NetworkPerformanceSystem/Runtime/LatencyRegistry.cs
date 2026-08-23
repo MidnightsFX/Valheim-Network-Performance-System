@@ -49,6 +49,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
         private static bool _hasPublishedTable;
         private static float _publishedAtRealtime;
+        private static bool _warnedBadTable;
 
         /// <summary>The host republishes every 2 seconds; a table this many seconds old means the
         /// channel has gone quiet (host left, mod unloaded, connection dying) and its numbers can
@@ -67,6 +68,9 @@ namespace NetworkPerformanceSystem.Runtime {
 
         internal static float PublishedTableAgeSeconds =>
             _hasPublishedTable ? Time.realtimeSinceStartup - _publishedAtRealtime : 0f;
+
+        /// <summary>Number of entries in the most recently published table, for diagnostics.</summary>
+        internal static int PublishedEntryCount => Published.Count;
 
         internal static void Sample(long peerUid, int pingMs) {
             if (peerUid == 0L) { return; }                                    // pre-handshake, uid not assigned yet
@@ -138,8 +142,9 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             if (!HasFreshTable) { return 0f; }
-            // Both halves of the path must be in the table. A just-joined peer, or an owner id
-            // the host no longer knows, is a number we cannot justify - not a fast peer.
+            // Both halves of the path must be in the table. A just-joined peer, an owner id the
+            // host no longer knows, or a peer the host has no measurement for (the host omits
+            // those rather than publish a 0) is a number we cannot justify - not a fast peer.
             if (!Published.TryGetValue(ownerUid, out int ownerMs)
                 || !Published.TryGetValue(self, out int selfMs)) {
                 return 0f;
@@ -148,16 +153,47 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         // -- wire format -------------------------------------------------------------------
-        // int count, then (long sessionId, ushort rttMs) per entry. At 10 players this is
-        // ~100 bytes every couple of seconds.
+        // int count, then (long sessionId, ushort rttMs) per entry. Built per recipient, so a
+        // table holds the host plus the measured peers near that recipient - tens of bytes for a
+        // small group, and bounded by group size rather than server size on a full server.
 
-        internal static ZPackage BuildTablePackage() {
+        private const int EntryBytes = 8 + 2;
+
+        /// <summary>Hostile-input guard only: a legitimate table is bounded by the recipient's
+        /// neighbourhood, not the server, so anything near this is garbage.</summary>
+        private const int MaxTableEntries = 4096;
+
+        /// <summary>
+        /// The latency table for one recipient. Two filters, both deliberate:
+        ///
+        /// Only peers with a measurement are included. The client treats a missing entry as "no
+        /// number" and renders vanilla, whereas a published 0 would read as a 0ms peer and
+        /// produce half-path compensation from a value nobody measured - PlayFab/crossplay peers
+        /// never report RTT, and every Steam peer is unmeasured for its first second or two.
+        ///
+        /// Only peers near the recipient are included. A viewer only renders ZDOs inside its own
+        /// active area, and an owner is only ever within the activated area of a sector it owns,
+        /// so an owner can be at most (activeArea + activeArea - 1) zones from any viewer that
+        /// renders its objects; one more zone covers reference-position drift between updates.
+        /// Entries beyond that are never consulted, and sending them to everyone made the channel
+        /// cost O(peers^2) bytes on a full server.
+        ///
+        /// The host's own entry (0ms) and the recipient's own entry (if measured) always qualify.
+        /// </summary>
+        internal static ZPackage BuildTablePackage(ZNetPeer recipient) {
             ZPackage pkg = new ZPackage();
             List<ZNetPeer> peers = ZNet.instance.GetPeers();
 
+            int radius = int.MaxValue;
+            Vector2i recipientZone = default;
+            if (ZoneSystem.instance != null && recipient != null) {
+                radius = 2 * ZoneSystem.instance.m_activeArea + 1;
+                recipientZone = ZoneSystem.GetZone(recipient.GetRefPos());
+            }
+
             int count = 1;                                                    // the host's own entry
             for (int i = 0; i < peers.Count; i++) {
-                if (peers[i].m_uid != 0L) { count++; }
+                if (Qualifies(peers[i], recipientZone, radius)) { count++; }
             }
 
             pkg.Write(count);
@@ -165,21 +201,36 @@ namespace NetworkPerformanceSystem.Runtime {
             pkg.Write((ushort)0);                                             // host is zero hops from its own data
 
             for (int i = 0; i < peers.Count; i++) {
-                long uid = peers[i].m_uid;
-                if (uid == 0L) { continue; }
-                pkg.Write(uid);
-                pkg.Write((ushort)Mathf.Clamp(Mathf.RoundToInt(MeasuredRttMs(uid)), 0, ushort.MaxValue));
+                ZNetPeer peer = peers[i];
+                if (!Qualifies(peer, recipientZone, radius)) { continue; }
+                pkg.Write(peer.m_uid);
+                pkg.Write((ushort)Mathf.Clamp(Mathf.RoundToInt(MeasuredRttMs(peer.m_uid)), 0, ushort.MaxValue));
             }
 
             return pkg;
+        }
+
+        private static bool Qualifies(ZNetPeer peer, Vector2i recipientZone, int radius) {
+            long uid = peer.m_uid;
+            if (uid == 0L || !HasMeasurement(uid)) { return false; }
+            if (radius == int.MaxValue) { return true; }
+            Vector2i zone = ZoneSystem.GetZone(peer.GetRefPos());
+            return Mathf.Abs(zone.x - recipientZone.x) <= radius
+                && Mathf.Abs(zone.y - recipientZone.y) <= radius;
         }
 
         internal static void ApplyTablePackage(ZPackage pkg) {
             if (pkg == null) { return; }
 
             int count = pkg.ReadInt();
-            if (count < 0 || count > 256) {                                   // corrupt or hostile; ignore rather than allocate
-                Logger.LogWarning($"Ignoring latency table with implausible entry count {count}.");
+            // Validate before touching Published: a throw here is swallowed by ZRpc's handler
+            // wrapper, but a half-applied table would leave us compensating from a partial
+            // picture until the next publish. Reject whole and keep the previous table instead.
+            if (count < 0 || count > MaxTableEntries || pkg.Size() - pkg.GetPos() < count * EntryBytes) {
+                if (!_warnedBadTable) {
+                    _warnedBadTable = true;
+                    Logger.LogWarning($"Ignoring malformed latency table ({count} entries, {pkg.Size() - pkg.GetPos()} bytes remaining). Further occurrences this session are not logged.");
+                }
                 return;
             }
 
@@ -202,6 +253,7 @@ namespace NetworkPerformanceSystem.Runtime {
             Published.Clear();
             _hasPublishedTable = false;
             _publishedAtRealtime = 0f;
+            _warnedBadTable = false;
         }
     }
 }

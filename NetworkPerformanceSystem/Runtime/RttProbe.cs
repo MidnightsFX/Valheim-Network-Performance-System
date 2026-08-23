@@ -96,7 +96,7 @@ namespace NetworkPerformanceSystem.Runtime {
             if (++_consecutiveDirectFailures >= MaxConsecutiveDirectFailures) {
                 PatchGuard.Disable(Mechanism.RttSampling,
                     $"neither Steamworks interface will report connection status ({firstError.GetType().Name}: {firstError.Message}); "
-                    + "send window, ownership arbitration and latency compensation fall back to vanilla for this session");
+                    + "send window, ownership arbitration and latency compensation fall back to vanilla for the rest of this process");
             }
             return false;
         }

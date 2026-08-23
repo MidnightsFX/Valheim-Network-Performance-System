@@ -40,13 +40,17 @@ namespace NetworkPerformanceSystem.Patches {
             return false;
         }
 
-        [HarmonyPatch(typeof(ZNet), nameof(ZNet.Shutdown))]
+        /// <summary>StopAll rather than Shutdown: it is the common tail of both Shutdown and
+        /// ShutdownWithoutSave, and it is idempotent (m_haveStoped), so this fires exactly once
+        /// per session end whichever entry point was used.</summary>
+        [HarmonyPatch(typeof(ZNet), "StopAll")]
         [HarmonyPostfix]
-        private static void OnShutdown() {
+        private static void OnStopAll() {
             OwnershipArbiter.Reset();
             OwnershipPolicy.Reset();
             SendWindow.Reset();
             SendSchedulerPatches.Reset();
+            RoutedRpcFilter.Reset();
             // Diagnostics are session-scoped too: an nps_stats collect left running must not
             // silently keep sampling on the next server, and telemetry must not carry over.
             NetworkStats.Reset();

@@ -36,6 +36,7 @@ namespace NetworkPerformanceSystem {
         // M2b - send scheduler
         public static ConfigEntry<bool> EnableSchedulerFix;
         public static ConfigEntry<float> SendIntervalSeconds;
+        public static ConfigEntry<float> SendSchedulerFrameBudgetMs;
 
         // M3 - latency-aware ownership arbitration
         public static ConfigEntry<bool> EnableOwnershipArbitration;
@@ -44,11 +45,15 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<int> OwnershipChallengeMarginMs;
         public static ConfigEntry<int> OwnershipMaxReassignsPerPass;
         public static ConfigEntry<float> OwnershipLoadPenaltyMs;
+        public static ConfigEntry<int> OwnershipUnmeasuredRttMs;
 
         // M6 - fast reference position channel
         public static ConfigEntry<bool> EnableFastRefPos;
         public static ConfigEntry<float> RefPosSendHz;
         public static ConfigEntry<float> RefPosMinMoveDistance;
+
+        // M7 - routed RPC relay filter
+        public static ConfigEntry<bool> EnableRoutedRpcFilter;
 
         public const string cfgFolder = "NetworkPerformanceSystem";
 
@@ -87,7 +92,7 @@ namespace NetworkPerformanceSystem {
                 new ConfigDescription("How much of the measured path latency to correct for. 1.0 corrects fully. Lower values trade accuracy for less overshoot when things stop abruptly. 0 disables the correction while leaving the patch in place.",
                 new AcceptableValueRange<float>(0f, 1f)));
             LatencyCompensationMaxMeters = Config.Bind("Client config", "LatencyCompensationMaxMeters", 3f,
-                new ConfigDescription("Hard cap on how far the correction may move an entity. Keeps fast objects such as projectiles below the 5m threshold at which the game gives up smoothing and teleports them.",
+                new ConfigDescription("Hard cap on the total extrapolated displacement (the game's own gap extrapolation plus this correction). The correction only ever uses whatever headroom remains under the cap, so fast objects such as projectiles stay below the 5m threshold at which the game gives up smoothing and teleports them.",
                 new AcceptableValueRange<float>(0.5f, 4.5f)));
             EnableDebugOverlay = Config.Bind("Client config", "EnableDebugOverlay", false,
                 new ConfigDescription("Show the per-entity latency compensation overlay (owner, estimated staleness, applied displacement).", null,
@@ -118,6 +123,12 @@ namespace NetworkPerformanceSystem {
                 "Send to every peer each tick instead of one peer per rendered frame. Without this the effective per-peer send rate degrades linearly with player count.");
             SendIntervalSeconds = BindServerConfig("Send Scheduler", "Send Interval Seconds", 0.05f,
                 "Seconds between ZDO send rounds. Vanilla is 0.05 (20Hz).", true, 0.02f, 0.2f);
+            // Vanilla's one-peer-per-frame is accidentally self-limiting on CPU; servicing every
+            // peer per interval is not, and on a large server the send path can eat the whole
+            // frame. This is the wall-clock ceiling per frame: the per-peer rate becomes
+            // min(1/interval, budget/cost) instead of the frame time growing without bound.
+            SendSchedulerFrameBudgetMs = BindServerConfig("Send Scheduler", "Frame Budget Ms", 4f,
+                "Maximum milliseconds per frame the host spends sending ZDOs to peers. Peers are serviced in round-robin order until the budget runs out and the remainder is owed to the next frame, so nobody is starved. On a busy server this is what keeps the frame time bounded: the effective per-peer send rate becomes min(1/interval, budget/cost) - raise it to trade server frame time for send rate, lower it on a CPU-constrained host. nps_stats shows the effective rate and how often the budget is hit.", true, 0.5f, 16f);
 
             // --- M3: latency-aware ownership arbitration -----------------------------------
             // Valheim is distributed-authority: whichever peer owns a ZDO simulates it, and
@@ -126,15 +137,22 @@ namespace NetworkPerformanceSystem {
             EnableOwnershipArbitration = BindServerConfig("Ownership", "Enable Latency-Aware Ownership", true,
                 "Assign ZDO ownership to minimise how stale the object looks to the players who can actually see it, instead of vanilla's first-peer-wins ordering.");
             OwnershipAllowHostOwner = BindServerConfig("Ownership", "Allow Host As Owner", true,
-                "Let the host own ZDOs contested by peers in different latency classes. This minimises the worst-case staleness, but on a dedicated server it means the host simulates that object. Disable on CPU-constrained servers to fall back to the lowest-latency peer present.");
+                "Let the host compete for ownership of contested ZDOs in the zones it has loaded. The host is zero hops from everyone, so host-owned is the lowest possible staleness for every viewer, and whenever two or more players share a zone the host has loaded it will win those objects and keep them. A listen host has loaded the zones around its own player; a dedicated server has loaded only the zones around the world origin, so in practice this means a dedicated server owns and simulates the contested objects at the spawn hub whenever players gather there - intended, and worth knowing when budgeting server CPU. Disable to always place on the lowest-latency player present instead.");
             OwnershipMinHoldSeconds = BindServerConfig("Ownership", "Min Hold Seconds", 5f,
                 "Minimum time an owner keeps a ZDO before it can be challenged. Hysteresis against ownership thrash. Applies only when moving a ZDO away from an owner that is still present - a ZDO whose owner has left the area or the session is re-owned immediately, at any setting.", false, 0f, 60f);
             OwnershipChallengeMarginMs = BindServerConfig("Ownership", "Challenge Margin Ms", 25,
                 "A challenger must improve estimated staleness by at least this many milliseconds to take ownership. Prevents ping jitter from ping-ponging ownership between similar peers. Applies only to challenges against a present owner, and also bounds how much the Load Penalty below may shift a decision.", false, 0, 250);
             OwnershipMaxReassignsPerPass = BindServerConfig("Ownership", "Max Reassigns Per Pass", 8,
-                "Cap on latency-driven ownership transfers per arbitration pass. Each transfer costs a ZDO resend, so this bounds the burst when a group arrives in a new area. Large servers (20+ players) may raise this so ownership converges faster after groups move. Restoring an owner to a ZDO that has none is never deferred by this: an unowned creature does not move and cannot be damaged.", true, 1, 128);
+                "Minimum cap on latency-driven ownership transfers per arbitration pass. Each transfer costs a ZDO resend, so this bounds the burst when a group arrives in a new area. The effective cap is the larger of this value and the number of connected players, so a full server converges at the same per-player rate as a small group rather than linearly slower. Restoring an owner to a ZDO that has none is never deferred by this: an unowned creature does not move and cannot be damaged.", true, 1, 128);
             OwnershipLoadPenaltyMs = BindServerConfig("Ownership", "Load Penalty Ms", 0.02f,
-                "Cost added per object a candidate already owns nearby, in milliseconds. Spreads simulation and upload load across peers instead of concentrating every contested object on the lowest-ping player. The total handicap is capped at Challenge Margin Ms, so load can break a tie but never outweigh a meaningful staleness difference. 0 disables load spreading and places purely by staleness.", true, 0f, 0.5f);
+                "Cost added per simulated object (creatures, ships - not walls or trees) a candidate already owns nearby, in milliseconds. Spreads simulation and upload load across peers instead of concentrating every contested object on the lowest-ping player. The total handicap is capped at half of Challenge Margin Ms, so load can shade a close decision but can never on its own amount to the staleness difference that justifies a transfer. 0 disables load spreading and places purely by staleness.", true, 0f, 0.5f);
+            // Crossplay/PlayFab sockets never report a round-trip time and a Steam peer has none
+            // for its first second or two. Scoring those at 0ms handed them every contested object
+            // in range; this is what they are scored at instead. High enough to lose to any
+            // measured peer with a normal ping, irrelevant when the peer is the only viewer
+            // (which it wins at any RTT).
+            OwnershipUnmeasuredRttMs = BindServerConfig("Ownership", "Unmeasured Peer RTT Ms", 150,
+                "Round-trip time assumed for a peer the host has no measurement for - crossplay/PlayFab connections never report one, and every Steam peer is unmeasured for its first seconds. Such a peer still wins objects only it can see, but loses contested ones to any measured peer with a lower ping. Treating unmeasured as 0ms instead would hand them everything in range.", true, 0, 1000);
 
             // --- M6: fast reference position channel ---------------------------------------
             // ZNet.SendPeriodicData gates client reference positions behind a single 2 second
@@ -147,6 +165,17 @@ namespace NetworkPerformanceSystem {
                 "How many times per second a moving client reports its position. At 12 bytes per update this costs about 60 bytes/sec.", false, 1f, 20f);
             RefPosMinMoveDistance = BindServerConfig("Reference Position", "Min Move Distance", 0.5f,
                 "Skip the update when the player has moved less than this many metres since the last one. A standing player sends nothing.", false, 0f, 5f);
+
+            // --- M7: routed RPC relay filter -----------------------------------------------
+            // Every "broadcast" RPC - footsteps, animation triggers, damage numbers, destroy
+            // notices, building damage - is sent once to the host and relayed by the host to
+            // every other player, so its cost is events x players. A receiver discards a
+            // ZDO-targeted one unless it has that object loaded, which only happens inside its
+            // own active area; the host knows exactly which peers that is and can stop relaying
+            // to the rest. On a full server this is most of the relay traffic, and it all counts
+            // against the same per-peer send window as ZDO updates.
+            EnableRoutedRpcFilter = BindServerConfig("Routed RPC", "Enable Relay Filtering", true,
+                "Relay broadcast RPCs (animation triggers, footsteps, damage numbers, object-destroyed notices, building damage and the like) only to the players that can actually use them, instead of to everyone on the server. A receiving client discards these unless it has the object loaded, so nothing visible changes; on a busy server this removes most of the host's relay traffic and stops it from crowding out ZDO updates. Global messages (chat, pings, events, sleep, server messages) are never filtered.");
         }
 
         /// <summary>

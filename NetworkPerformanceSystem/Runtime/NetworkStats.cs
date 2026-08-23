@@ -1,3 +1,4 @@
+using NetworkPerformanceSystem.Patches;
 using System.Collections.Generic;
 using System.Text;
 using UnityEngine;
@@ -95,6 +96,8 @@ namespace NetworkPerformanceSystem.Runtime {
                 : "Role: client");
 
             AppendPeerTable(sb);
+            AppendScheduler(sb);
+            AppendRoutedRpc(sb);
             AppendOwnership(sb);
             AppendExtrapolation(sb);
 
@@ -128,6 +131,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.Ownership: return ValConfig.EnableOwnershipArbitration.Value;
                 case Mechanism.RefPos: return ValConfig.EnableFastRefPos.Value;
                 case Mechanism.Extrapolation: return ValConfig.EnableLatencyCompensation.Value;
+                case Mechanism.RoutedRpcFilter: return ValConfig.EnableRoutedRpcFilter.Value;
                 default: return true;
             }
         }
@@ -172,6 +176,60 @@ namespace NetworkPerformanceSystem.Runtime {
             }
         }
 
+        /// <summary>The send scheduler's effective output. On a small server this simply confirms
+        /// the configured rate; on a large one it is the number that says whether the host is
+        /// CPU-bound on the send path - the frame budget trades per-peer rate for frame time, and
+        /// this is where that trade shows.</summary>
+        private static void AppendScheduler(StringBuilder sb) {
+            if (!NpsEnv.IsHost()) { return; }
+
+            sb.AppendLine();
+            sb.AppendLine("Send scheduler (last second):");
+            if (!PatchGuard.IsActive(Mechanism.SendScheduler) || !ValConfig.EnableSchedulerFix.Value) {
+                sb.AppendLine("  vanilla round-robin (one peer per rendered frame)");
+                return;
+            }
+
+            int peers = ZDOMan.s_instance != null ? ZDOMan.s_instance.m_peers.Count : 0;
+            float targetHz = 1f / Mathf.Max(0.01f, ValConfig.SendIntervalSeconds.Value);
+            float effectiveHz = peers > 0 ? (float)SendSchedulerPatches.ServicedLastSecond / peers : 0f;
+
+            sb.AppendLine($"  sends/s          {SendSchedulerPatches.ServicedLastSecond} across {peers} peers");
+            sb.AppendLine($"  per-peer rate    {effectiveHz:F1} Hz (target {targetHz:F0} Hz)");
+            sb.AppendLine($"  last frame       {SendSchedulerPatches.LastFrameServiced} peers");
+            sb.AppendLine($"  budget breaks/s  {SendSchedulerPatches.BudgetBreaksLastSecond} (frame budget {ValConfig.SendSchedulerFrameBudgetMs.Value:F1}ms)");
+            if (peers > 0 && SendSchedulerPatches.BudgetBreaksLastSecond > 0 && effectiveHz < targetHz * 0.75f) {
+                sb.AppendLine("  NOTE: send rate is CPU-bound - the frame budget is cutting rounds short. Raise Frame Budget Ms");
+                sb.AppendLine("  to trade server frame time for send rate, or accept the lower rate.");
+            }
+        }
+
+        /// <summary>What the relay filter is saving. "Suppressed" deliveries are messages the
+        /// receiver would have discarded anyway; the percentage is the share of relay traffic
+        /// that was pure fan-out waste, which grows with player count.</summary>
+        private static void AppendRoutedRpc(StringBuilder sb) {
+            if (!NpsEnv.IsHost()) { return; }
+
+            sb.AppendLine();
+            sb.AppendLine("Routed RPC relay (since start):");
+            if (!PatchGuard.IsActive(Mechanism.RoutedRpcFilter) || !ValConfig.EnableRoutedRpcFilter.Value) {
+                sb.AppendLine("  vanilla (every broadcast RPC relayed to every peer)");
+                return;
+            }
+
+            AppendRelayRow(sb, "ZDO-targeted", RoutedRpcFilter.TargetedEvents, RoutedRpcFilter.TargetedSent, RoutedRpcFilter.TargetedSuppressed);
+            AppendRelayRow(sb, "DestroyZDO", RoutedRpcFilter.DestroyEvents, RoutedRpcFilter.DestroySent, RoutedRpcFilter.DestroySuppressed);
+            AppendRelayRow(sb, "positional", RoutedRpcFilter.PositionalEvents, RoutedRpcFilter.PositionalSent, RoutedRpcFilter.PositionalSuppressed);
+            sb.AppendLine($"  {Pad("global", 13)} {RoutedRpcFilter.GlobalEvents} events (relayed to everyone, by design)");
+            sb.AppendLine($"  last second   sent {RoutedRpcFilter.SentLastSecond} msgs, suppressed {RoutedRpcFilter.SuppressedLastSecond} msgs");
+        }
+
+        private static void AppendRelayRow(StringBuilder sb, string label, long events, long sent, long suppressed) {
+            long total = sent + suppressed;
+            string saved = total > 0 ? $"{100f * suppressed / total:F0}% saved" : "-";
+            sb.AppendLine($"  {Pad(label, 13)} {events} events, {sent} sent, {suppressed} suppressed ({saved})");
+        }
+
         private static void AppendOwnership(StringBuilder sb) {
             if (!NpsEnv.IsHost()) { return; }
 
@@ -185,7 +243,7 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  rescued     {OwnershipArbiter.LastPassRescued} (had no present owner - never capped)");
             sb.AppendLine($"  released    {OwnershipArbiter.LastPassReleased} (no eligible owner in range)");
             sb.AppendLine($"  optimised   {OwnershipArbiter.LastPassOptimised} (moved to a lower-latency owner)");
-            sb.AppendLine($"  deferred    {OwnershipArbiter.LastPassDeferred} (optimisations only, hit the per-pass cap)");
+            sb.AppendLine($"  deferred    {OwnershipArbiter.LastPassDeferred} (optimisations only, hit the per-pass cap of {OwnershipArbiter.LastPassCap})");
             sb.AppendLine($"  pass time   {OwnershipArbiter.LastPassMs:F1}ms");
             sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued}, optimised {OwnershipArbiter.TotalOptimised}");
 
@@ -212,6 +270,9 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine($"  latency table stale ({LatencyRegistry.PublishedTableAgeSeconds:F0}s old) - compensation");
                 sb.AppendLine("  suspended until the host publishes again.");
                 return;
+            }
+            if (!NpsEnv.IsHost()) {
+                sb.AppendLine($"  table entries       {LatencyRegistry.PublishedEntryCount} (host + measured peers near you)");
             }
             sb.AppendLine($"  entities corrected  {NpsExtrapolate.SamplesThisSecond}");
             sb.AppendLine($"  mean staleness      {NpsExtrapolate.MeanStalenessMs:F0}ms");

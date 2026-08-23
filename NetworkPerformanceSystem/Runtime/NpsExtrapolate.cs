@@ -63,20 +63,27 @@ namespace NetworkPerformanceSystem.Runtime {
             float added = total - rawTimer;
             if (added <= 0f) { return baseline; }
 
-            Vector3 extra = velocity * added;
+            float speed = velocity.magnitude;
+            if (speed <= 0f) { return baseline; }
 
-            // Clamp displacement, not just time. The extrapolated position feeds vanilla's 5m
-            // snap test, and a fast projectile at ~40m/s would cross that in 135ms and start
-            // teleporting. Slow movers never come near this limit.
+            // Clamp the TOTAL displacement from the last-received position, not just our share of
+            // it. The extrapolated target feeds vanilla's 5m snap test, which measures the whole
+            // distance; a fast projectile at ~40m/s crosses that in 135ms and starts teleporting.
+            // Both terms are along `velocity`, so the geometry is one-dimensional: vanilla's own
+            // part is never shrunk, and ours is whatever headroom remains under the cap - which
+            // can be nothing at all if vanilla has already used it. Slow movers never come near
+            // this limit.
             float maxMeters = ValConfig.LatencyCompensationMaxMeters.Value;
-            float sqrMax = maxMeters * maxMeters;
-            if (extra.sqrMagnitude > sqrMax) {
-                extra = extra.normalized * maxMeters;
+            float baseMeters = speed * rawTimer;
+            float extraMeters = speed * added;
+            if (baseMeters + extraMeters > maxMeters) {
+                extraMeters = Mathf.Max(0f, maxMeters - baseMeters);
                 ClampHits++;
             }
+            if (extraMeters <= 0f) { return baseline; }
 
-            Record(staleness, extra.magnitude);
-            return baseline + extra;
+            Record(staleness, extraMeters);
+            return baseline + velocity * (extraMeters / speed);
         }
 
         private static void Record(float stalenessSeconds, float displacement) {
@@ -108,6 +115,7 @@ namespace NetworkPerformanceSystem.Runtime {
             _accumCount = 0;
             _stalenessAccum = 0f;
             _displacementAccum = 0f;
+            _windowStart = 0f;
         }
     }
 }

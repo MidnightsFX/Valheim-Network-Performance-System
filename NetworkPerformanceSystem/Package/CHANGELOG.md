@@ -1,5 +1,76 @@
 # Changelog
 
+**1.1.0**
+
+Scaling pass: what breaks first as a server grows from a small group towards a couple of hundred
+players, plus the correctness issues found on the way. Config additions are all advanced and all
+default to behaviour that is a no-op for a small group.
+
+**New: routed RPC relay filtering (host).** Every "broadcast" RPC - footsteps, animation triggers,
+hit-stop, damage numbers, building damage, pickables, object-destroyed notices - is sent once to the
+host and relayed by the host to every other player, so its cost is events × players and it shares
+the per-peer send window with ZDO updates. A receiving client discards a ZDO-targeted RPC unless it
+has that object loaded, which only happens inside its own active area; the host knows exactly which
+peers that is and now relays only to them. `DestroyZDO` goes only to peers that hold a copy of the
+ZDO; damage text and `SpawnObject` go only to peers within range of the position. Chat, pings,
+server messages, sleep, events, global keys and any RPC the filter does not recognise are relayed
+to everyone exactly as before. Nothing visible changes for anyone; on a full server this removes
+most of the relay traffic. `nps_stats` reports sent vs suppressed per category. Stands down if
+BetterZeeRouter or EnRoute is installed, since both rework the same relay path.
+
+**Fixed: peers with no round-trip measurement were scored as 0 ms and won ownership.** Crossplay
+(PlayFab) sockets never report RTT and every Steam peer is unmeasured for its first seconds; the
+cost function and the lowest-RTT tie-break both preferred them, so on a mixed Steam/Xbox server
+every contested object in range of a console player migrated to it and stayed. Unmeasured peers are
+now priced at the new `Unmeasured Peer RTT Ms` (default 150): they still win objects only they can
+see, and lose contested ones to any measured lower-ping peer. The published latency table likewise
+omits unmeasured peers instead of publishing a 0, so clients render those owners at vanilla rather
+than compensating from a number nobody measured.
+
+**Fixed: a peer that has not yet reported a position was a candidate at the world origin.** Vanilla
+copies the client's reference position from its PeerInfo, which is `(0,0,0)` until the client has
+chosen a spawn point; such a peer was handed spawn-area objects it had not instantiated, which sat
+frozen until the next pass - once per login, continuously on a busy server. A peer at exactly zero
+is now neither an owner, a viewer nor present. The fast reference-position channel also no longer
+sends `(0,0,0)` on connect, and the server validates incoming positions (finite, inside the world)
+before using them.
+
+**Fixed: the load-spreading handicap could satisfy the challenge margin on its own.** It was capped
+at exactly the margin and counted every persistent object (walls, trees), so anyone in a base was
+instantly saturated and each newcomer of equal ping trickled objects off the incumbent for minutes.
+It now counts only simulated objects (creatures, ships) and is capped at half the margin: load may
+shade a close call but never amounts to a transfer by itself.
+
+**Send scheduler frame budget.** Servicing every peer each interval fixes the per-peer rate, which
+also means the host's send-path CPU grows with player count - and once a round costs more than
+the interval it owes a full round every frame and never recovers. Each frame now has a wall-clock
+budget (`Frame Budget Ms`, default 4): peers are serviced in round-robin order until the budget is
+spent and the rest are owed to the next frame. Under load the per-peer rate degrades to
+`min(1/interval, budget/cost)` instead of the frame time growing without bound; `nps_stats` shows
+the effective rate and how often the budget is hit.
+
+**Ownership pass cost.** The pass now scans each zone exactly once (the union of every player's
+scan square) instead of once per player with a per-object dedup dictionary, records hold history
+only for objects that are actually contested, and caches the sector verdict across the zone-grouped
+list. Per-object work drops to one owner lookup and a few compares; the history table shrinks from
+"everything near anyone" to "things someone could take". One deliberate consequence: the first
+challenge against an object whose owner has been the best choice all along now waits one
+`Min Hold Seconds` before moving - the same grace the pass already gave first-sight objects.
+
+**Max Reassigns Per Pass now auto-scales.** The configured value is a floor; the effective cap is the
+larger of it and the number of connected players, so a full server converges at the same
+per-player rate as a small group. `nps_stats` shows the effective cap.
+
+**Latency table is per recipient.** Each client now receives the host plus the measured peers within
+render range of it, instead of every peer on the server: bytes go from O(players²) to O(players ×
+group) and the table can no longer hit a size cap on a large server. Malformed tables are rejected
+whole (the previous table is kept) instead of being half-applied.
+
+**Changed:** latency compensation's distance cap now bounds the *total* extrapolated displacement
+(vanilla's own gap extrapolation plus this correction), since the game's 5m snap test measures the
+whole distance. Session state is reset from `ZNet.StopAll`, which covers both `Shutdown` and
+`ShutdownWithoutSave`.
+
 **1.0.0**
 
 **Fixed: creatures could freeze mid-animation and stop taking damage.** Ownership arbitration

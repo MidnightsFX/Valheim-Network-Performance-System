@@ -22,6 +22,12 @@ namespace NetworkPerformanceSystem.Patches {
         /// a multi-second hysteresis anyway, so there is nothing to gain from going faster.</summary>
         private const float LatencyTableIntervalSeconds = 2f;
 
+        /// <summary>Anything further from the origin than this is not a position in a Valheim
+        /// world (radius 10 000m plus margin). Used to reject garbage reference positions before
+        /// they reach the zone maths, where a NaN or an out-of-range float turns into an
+        /// int.MinValue zone and a sector scan over overflowed coordinates.</summary>
+        private const float MaxRefPosCoordinate = 12000f;
+
         private static float _latencyTableTimer;
         private static float _refPosTimer;
         private static Vector3 _lastSentRefPos = Vector3.positiveInfinity;
@@ -96,13 +102,12 @@ namespace NetworkPerformanceSystem.Patches {
             System.Collections.Generic.List<ZNetPeer> peers = ZNet.instance.GetPeers();
             if (peers.Count == 0) { return; }
 
-            ZPackage pkg = LatencyRegistry.BuildTablePackage();
-            byte[] payload = pkg.GetArray();
-
+            // Built per recipient: each peer gets the host plus the measured peers near it, not
+            // the whole server. Invoke consumes the package, which is why a fresh one per peer is
+            // the natural shape here anyway.
             for (int i = 0; i < peers.Count; i++) {
                 if (!peers[i].IsReady()) { continue; }
-                // Each Invoke consumes the package it is handed, so hand out fresh copies.
-                peers[i].m_rpc.Invoke(RpcLatencyTable, new ZPackage(payload));
+                peers[i].m_rpc.Invoke(RpcLatencyTable, LatencyRegistry.BuildTablePackage(peers[i]));
             }
         }
 
@@ -126,6 +131,11 @@ namespace NetworkPerformanceSystem.Patches {
             if (server == null || !server.IsReady()) { return; }
 
             Vector3 pos = ZNet.instance.GetReferencePosition();
+            // Exactly zero is what ZNet holds before Game.FindSpawnPoint has chosen where we are
+            // going. The server already treats it as "no position yet"; advertising it would only
+            // re-assert the sentinel the vanilla PeerInfo has already given it.
+            if (pos == Vector3.zero) { return; }
+
             float minMove = ValConfig.RefPosMinMoveDistance.Value;
             if (minMove > 0f && (pos - _lastSentRefPos).sqrMagnitude < minMove * minMove) {
                 return;                                                       // standing still costs nothing
@@ -145,10 +155,22 @@ namespace NetworkPerformanceSystem.Patches {
         private static void RPC_RefPos(ZRpc rpc, Vector3 pos) {
             if (!NpsEnv.IsHost()) { return; }
             if (!ValConfig.EnableFastRefPos.Value) { return; }
+            if (!IsPlausibleRefPos(pos)) { return; }
 
             ZNetPeer peer = FindPeerByRpc(rpc);
             if (peer == null) { return; }
             peer.m_refPos = pos;
+        }
+
+        /// <summary>Client-supplied, so it is checked before it can reach ZoneSystem.GetZone.
+        /// Vanilla's own RPC_ServerSyncedPlayerData trusts the same value; this channel is five
+        /// times as frequent, so it at least should not.</summary>
+        private static bool IsPlausibleRefPos(Vector3 pos) {
+            if (float.IsNaN(pos.x) || float.IsNaN(pos.y) || float.IsNaN(pos.z)) { return false; }
+            if (float.IsInfinity(pos.x) || float.IsInfinity(pos.y) || float.IsInfinity(pos.z)) { return false; }
+            return Mathf.Abs(pos.x) <= MaxRefPosCoordinate
+                && Mathf.Abs(pos.y) <= MaxRefPosCoordinate
+                && Mathf.Abs(pos.z) <= MaxRefPosCoordinate;
         }
 
         // -- lifecycle ---------------------------------------------------------------------
@@ -162,9 +184,12 @@ namespace NetworkPerformanceSystem.Patches {
             NetworkStats.ForgetPeer(netPeer.m_uid);
         }
 
-        [HarmonyPatch(typeof(ZNet), nameof(ZNet.Shutdown))]
+        /// <summary>StopAll rather than Shutdown: it is the common tail of both Shutdown and
+        /// ShutdownWithoutSave, and it is idempotent (m_haveStoped), so this fires exactly once
+        /// per session end whichever entry point was used.</summary>
+        [HarmonyPatch(typeof(ZNet), "StopAll")]
         [HarmonyPostfix]
-        private static void OnShutdown() {
+        private static void OnStopAll() {
             LatencyRegistry.Reset();
             RttProbe.Reset();
             _latencyTableTimer = 0f;

@@ -39,6 +39,7 @@ someone who did not have a problem.
 | **Send scheduler fix** | Vanilla services one peer per rendered frame, so the advertised 20Hz silently becomes ~5.5Hz at ten players. This sends to everyone each tick. |
 | **Live position reporting** | Vanilla reports your position to the server only every 2 seconds, and the server uses it to decide both what to send you and who owns what. A 12-byte side channel keeps it current. |
 | **Latency compensation** | Draws other players' creatures where they *are*, not where they were when the packet left. This is the one you feel. |
+| **Relay filtering** | Vanilla relays every footstep, swing, damage number and destroyed object to every player on the server, who then discards it unless they can see it. The host now relays only to the players who can. Nothing visible changes; on a busy server this is most of the relay traffic. |
 | **`nps_stats`** | Per-peer RTT, window size, and how often peers are being starved. Run `nps_stats collect`, play, then `nps_stats`. |
 
 ## Installing
@@ -55,8 +56,12 @@ Works on dedicated servers and on player-hosted games.
 ## Known limitations
 
 - On a **dedicated** server, contested objects go to the lowest-latency player present rather than
-  to the server itself. The server only takes ownership of zones it has actually loaded, because
-  owning something it is not simulating would freeze it. This is a deliberate safety limit.
+  to the server itself - except in the zones the server has actually loaded, which are the ones
+  around the world origin. There, whenever two or more players are present, the server wins
+  contested objects (it is zero hops from everyone, so that is the lowest possible staleness) and
+  simulates them. That is intended and is a CPU cost to plan for on a busy spawn hub; set
+  `Allow Host As Owner` to false to place purely on players. The server never takes ownership of
+  zones it has not loaded, because owning something it is not simulating would freeze it.
 - Latency compensation is dead reckoning: an entity that stops abruptly will overshoot slightly and
   settle back. Lower `LatencyCompensationStrength` if you find it distracting; `0` disables it.
 - Requires the Steam backend. Crossplay/PlayFab connections do not report round-trip time, and
@@ -67,11 +72,16 @@ Works on dedicated servers and on player-hosted games.
   default 150 KB/s target is ~60 Mbit/s of upload worst case. Backpressure degrades gracefully
   if the link is smaller, but provision the server's uplink for the player count rather than
   assuming vanilla's artificially starved usage.
-- On large servers (20+ players), consider raising `Max Reassigns Per Pass` so ownership
-  converges faster after groups move; the default is tuned for small-group play. The `Load
-  Penalty Ms` setting spreads contested objects across low-latency peers instead of piling
-  everything on the single lowest-ping player - leave it on unless you specifically want pure
-  staleness placement.
+- On large servers the two knobs that matter are `Frame Budget Ms` (how much of each server frame
+  the send path may use - under load the per-peer send rate degrades gracefully instead of the
+  frame time growing without bound; `nps_stats` shows the effective rate) and `Max Reassigns Per
+  Pass`, which auto-scales with player count so ownership converges at the same per-player rate on
+  a full server as in a small group. The `Load Penalty Ms` setting spreads contested objects
+  across low-latency peers instead of piling everything on the single lowest-ping player - leave
+  it on unless you specifically want pure staleness placement.
+- Vanilla caps a server at 10 players; going past that needs a separate player-cap mod. Crossplay
+  (PlayFab) peers never report a round-trip time, so they are priced at `Unmeasured Peer RTT Ms`
+  for ownership and rendered at vanilla by other clients.
 
 ## Incompatible with
 
@@ -79,9 +89,10 @@ Other networking mods that rewrite the same code: FiresGhettoNetworking, VBNetTw
 BetterNetworking, Smoothbrain's Network, NetworkTweaks, WarheimNetwork, TimeoutLimit. BepInEx will
 refuse to load this mod alongside them rather than leave you half-patched.
 
-**Verified compatible** (different layers, no overlap): LeanNet, Compress, EnRoute, BetterZeeRouter,
-Scenic. ReturnToSender is fine too — it already fixes the scheduler, so that one mechanism stands
-down and the rest keeps working.
+**Verified compatible** (different layers, no overlap): LeanNet, Compress, Scenic. ReturnToSender is
+fine too — it already fixes the scheduler, so that one mechanism stands down and the rest keeps
+working. EnRoute and BetterZeeRouter are fine in the same way: both rework the routed-RPC relay, so
+the relay-filtering mechanism stands down when either is present and everything else keeps working.
 
 ## Changelog
 

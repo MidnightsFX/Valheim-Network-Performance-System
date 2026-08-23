@@ -15,6 +15,7 @@ namespace NetworkPerformanceSystem.Runtime {
         Ownership,      // M3     - ZDOMan.ReleaseNearbyZDOS arbitration
         RefPos,         // M6     - Nps.RefPos fast reference position channel
         Extrapolation,  // M4     - ZSyncTransform.SyncPosition latency compensation
+        RoutedRpcFilter,// M7     - ZRoutedRpc.RouteRPC interest-filtered relay of broadcast RPCs
     }
 
     /// <summary>
@@ -27,6 +28,12 @@ namespace NetworkPerformanceSystem.Runtime {
         /// scheduler prefix would never fire. It already does the same job - stand down rather
         /// than ship dead code.</summary>
         internal const string ReturnToSenderGUID = "redseiko.valheim.returntosender";
+
+        /// <summary>Both rework ZRoutedRpc's relay path. Two systems deciding who receives a
+        /// routed RPC is a race by construction, so the relay filter stands down when either is
+        /// present rather than layering on top of them.</summary>
+        internal const string BetterZeeRouterGUID = "redseiko.valheim.betterzeerouter";
+        internal const string EnRouteGUID = "redseiko.valheim.enroute";
 
         private static readonly HashSet<Mechanism> Disabled = new HashSet<Mechanism>();
         private static readonly Dictionary<Mechanism, string> DisableReasons = new Dictionary<Mechanism, string>();

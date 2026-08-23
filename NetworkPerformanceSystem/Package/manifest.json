@@ -1,7 +1,7 @@
 {
   "name": "NetworkPerformanceSystem",
   "description": "Makes Valheim playable for groups spread across continents. Sizes each peer's send window and places simulation authority by measured latency.",
-  "version_number": "1.0.0",
+  "version_number": "1.1.0",
   "website_url": "https://github.com/MidnightsFX/Valheim-Network-Performance-System",
   "dependencies": [
     "denikson-BepInExPack_Valheim-5.4.2333",

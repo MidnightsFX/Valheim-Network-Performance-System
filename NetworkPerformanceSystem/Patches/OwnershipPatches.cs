@@ -57,6 +57,7 @@ namespace NetworkPerformanceSystem.Patches {
             NpsExtrapolate.Reset();
             SteamTransport.Reset();
             SyncListCache.Reset();
+            ConnectionTimeout.Reset();
         }
     }
 }

@@ -69,6 +69,12 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<bool> EnablePlayerLimitOverride;
         public static ConfigEntry<int> MaxPlayers;
 
+        // M11 - connection timeouts
+        public static ConfigEntry<bool> EnableConnectionTimeoutTuning;
+        public static ConfigEntry<int> ConnectTimeoutSeconds;
+        public static ConfigEntry<int> ConnectionTimeoutSeconds;
+        public static ConfigEntry<int> LoadingTimeoutSeconds;
+
         public const string cfgFolder = "NetworkPerformanceSystem";
 
         public ValConfig(ConfigFile cf) {
@@ -235,6 +241,24 @@ namespace NetworkPerformanceSystem {
                 "How many players the server accepts. 10 is vanilla. This counts the same players the game counts: on a player-hosted game the host is one of them, on a dedicated server it is not. The number is enforced the moment it changes, but the limit shown in the server browser - and the crossplay capacity, which is a real ceiling rather than a label - are set when the server registers, so lower it live if you must and restart to raise it cleanly. Nothing about raising it makes the traffic free: every player added costs the host upload and CPU against every other player, so treat the rest of this config (Send Scheduler's frame budget, Steam Transport's rate ceiling) as the things that decide whether a larger number is actually playable. Crossplay servers cannot exceed 128 whatever is set here - PlayFab's lobbies do not go higher.",
                 false, 1, 255);
 
+            // --- M11: connection timeouts --------------------------------------------------
+            // Vanilla decides a peer is gone at two layers that do not know about each other -
+            // ZRpc's 30s application ping timeout and Steam's 30s TimeoutConnected - and a peer
+            // dies at whichever fires first, so these move together and are not offered as
+            // separate numbers. Raising them does not make a slow link faster; it stops both ends
+            // giving up on a join that is still working.
+            EnableConnectionTimeoutTuning = BindServerConfig("Connection Timeout", "Enable Timeout Tuning", true,
+                "Let this mod set how long a connection may go quiet before either end hangs up, instead of the game's fixed 30 seconds. Every value below ships at its vanilla setting, so enabling this on its own changes nothing - it only makes the settings reachable and logs a before/after readback of what is actually in force. Turning it back off restores vanilla's values immediately rather than leaving the last-written ones in place.");
+            ConnectTimeoutSeconds = BindServerConfig("Connection Timeout", "Connect Timeout Seconds", 10,
+                "How long a connection attempt may take before Steam abandons it, in seconds. 10 is Steam's own default, which the game never changes. This covers only the handshake, before the connection exists - NAT traversal between two awkward home routers is the usual reason it is not enough, and it is the one timeout the server cannot decide for a client, because nothing has been synced to that client yet: whoever is failing to connect has to raise it in their own config.",
+                false, 5, 120);
+            ConnectionTimeoutSeconds = BindServerConfig("Connection Timeout", "Connection Timeout Seconds", 30,
+                "How long an established connection may go without a packet before it is dropped, in seconds. 30 is vanilla. This is the setting for players who get disconnected mid-join or during a hitch on a weak link - it is written to BOTH layers the game times out at (ZRpc's ping timeout and Steam's TimeoutConnected), because the effective timeout is the lower of the two and raising one alone achieves nothing. The cost falls on the host: a player who is genuinely gone now holds their slot, and keeps ownership of everything they were simulating, for this long instead of 30 seconds - and objects an absent owner holds do not move. Size it to the worst connection you actually want to keep.",
+                false, 10, 600);
+            LoadingTimeoutSeconds = BindServerConfig("Connection Timeout", "Loading Timeout Seconds", 90,
+                "The longer allowance the game already gives itself while a crossplay peer is joining and the world is being transferred, in seconds. 90 is vanilla. A slow client can spend minutes here on a large world, and this is the timeout that ends the join when it does. Never applied below 'Connection Timeout Seconds' - a loading peer is not given less slack than an idle one, whatever this is set to.",
+                true, 30, 900);
+
             // Steam's networking config is process-global and re-writable at any time, so these
             // four take effect on edit rather than needing a restart. The two Send Window entries
             // are here as well because the coupling warning compares them against the transport
@@ -246,10 +270,22 @@ namespace NetworkPerformanceSystem {
             SteamNagleMicros.SettingChanged += OnSteamTransportSettingChanged;
             EnableSendWindowSizing.SettingChanged += OnSteamTransportSettingChanged;
             SendWindowTargetRateKBps.SettingChanged += OnSteamTransportSettingChanged;
+
+            // Both timeout layers are process-global and re-writable at any time as well, so these
+            // apply on edit too - including the edit Jotunn performs on a client when the server
+            // pushes its own values down at join time.
+            EnableConnectionTimeoutTuning.SettingChanged += OnConnectionTimeoutSettingChanged;
+            ConnectTimeoutSeconds.SettingChanged += OnConnectionTimeoutSettingChanged;
+            ConnectionTimeoutSeconds.SettingChanged += OnConnectionTimeoutSettingChanged;
+            LoadingTimeoutSeconds.SettingChanged += OnConnectionTimeoutSettingChanged;
         }
 
         private static void OnSteamTransportSettingChanged(object sender, EventArgs e) {
             Runtime.SteamTransport.OnConfigChanged();
+        }
+
+        private static void OnConnectionTimeoutSettingChanged(object sender, EventArgs e) {
+            Runtime.ConnectionTimeout.OnConfigChanged();
         }
 
         /// <summary>

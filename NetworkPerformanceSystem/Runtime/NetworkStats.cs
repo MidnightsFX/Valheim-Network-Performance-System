@@ -129,6 +129,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendPeerTable(sb);
             AppendLinkPressure(sb);
             AppendTransport(sb);
+            AppendTimeouts(sb);
             AppendScheduler(sb);
             AppendSyncListCache(sb);
             AppendRoutedRpc(sb);
@@ -168,6 +169,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.RoutedRpcFilter: return ValConfig.EnableRoutedRpcFilter.Value;
                 case Mechanism.SteamTransport: return ValConfig.EnableSteamTransportTuning.Value;
                 case Mechanism.SyncListCache: return ValConfig.EnableSyncListCache.Value;
+                case Mechanism.ConnectionTimeout: return ValConfig.EnableConnectionTimeoutTuning.Value;
                 default: return true;
             }
         }
@@ -300,6 +302,28 @@ namespace NetworkPerformanceSystem.Runtime {
             if (targetKBps > capKBps) {
                 sb.AppendLine("  WARNING: sizing windows for throughput the transport will not pass. The surplus becomes");
                 sb.AppendLine("  queueing delay. Raise 'Steam Transport / Send Rate Max KBps' or lower the target.");
+            }
+        }
+
+        /// <summary>
+        /// What either end will actually hang up at. Worth printing whether or not it has been
+        /// changed, because the number in force on a client is the server's rather than the one in
+        /// that player's own config file - and because the two layers are independent, so a stray
+        /// mod writing one of them is otherwise invisible.
+        /// </summary>
+        private static void AppendTimeouts(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Connection timeouts:");
+            sb.AppendLine($"  drop after       {ConnectionTimeout.EffectiveRpcTimeoutSeconds}s without a packet (ZRpc ping)");
+            sb.AppendLine(ConnectionTimeout.LastSteamReadback == null
+                ? "  steam layer      not applied (no Steam networking interface in this process)"
+                : $"  steam layer      {ConnectionTimeout.LastSteamReadback}");
+            sb.AppendLine($"  loading phase    {ConnectionTimeout.EffectiveLoadingTimeoutSeconds}s (crossplay joins and world transfer)");
+            if (!ConnectionTimeout.Active) {
+                sb.AppendLine("  vanilla (timeout tuning is off)");
+            } else if (NpsEnv.IsHost() && ValConfig.ConnectionTimeoutSeconds.Value > ConnectionTimeout.VanillaRpcTimeoutSeconds) {
+                sb.AppendLine("  note: a peer that is genuinely gone holds its slot, and ownership of everything it was");
+                sb.AppendLine("  simulating, for that long. Objects an absent owner holds do not move.");
             }
         }
 

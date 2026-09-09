@@ -19,6 +19,7 @@ namespace NetworkPerformanceSystem.Runtime {
         SteamTransport, // M8     - ZSteamSocket.RegisterGlobalCallbacks send-rate bounds and Nagle
         SyncListCache,  // M9     - ZDOMan.CreateSyncList per-peer sector scan reuse
         PlayerLimit,    // M10    - ZNet.RPC_PeerInfo configurable player cap
+        ConnectionTimeout, // M11 - ZRpc.SetLongTimeout + Steam TimeoutInitial/TimeoutConnected
     }
 
     /// <summary>

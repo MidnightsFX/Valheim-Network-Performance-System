@@ -41,6 +41,7 @@ someone who did not have a problem.
 | **Latency compensation** | Draws other players' creatures where they *are*, not where they were when the packet left. This is the one you feel. |
 | **Relay filtering** | Vanilla relays every footstep, swing, damage number and destroyed object to every player on the server, who then discards it unless they can see it. The host now relays only to the players who can. Nothing visible changes; on a busy server this is most of the relay traffic. |
 | **Configurable player limit** | Vanilla is hard-wired to 10. Set your own — and it is set in all three places the game keeps the number, including the crossplay lobby, which is the one that actually turns console players away. |
+| **Configurable timeouts** | Vanilla gives up on a quiet connection after 30 seconds, which is not enough for a slow link mid-join. Raise it — in both places the game times out, since the shorter one is what actually fires. |
 | **`nps_stats`** | Per-peer RTT, window size, and how often peers are being starved. Run `nps_stats collect`, play, then `nps_stats`. |
 
 ## Installing
@@ -85,6 +86,13 @@ Works on dedicated servers and on player-hosted games.
   the server ever sees them. Steam-only servers have no such ceiling. Crossplay (PlayFab) peers
   also never report a round-trip time, so they are priced at `Unmeasured Peer RTT Ms` for ownership
   and rendered at vanilla by other clients.
+- `Connection Timeout Seconds` is for players who get dropped mid-join or during a hitch on a weak
+  link. It does not make a slow connection faster — it stops both ends declaring it dead while it is
+  still working — and it is not free: a player who is genuinely gone now holds their slot, and keeps
+  ownership of everything they were simulating, for that long instead of 30 seconds, and objects an
+  absent owner holds do not move. Size it to the worst connection you actually want to keep. The one
+  timeout a server cannot set for a client is `Connect Timeout Seconds`, which covers the handshake
+  before anything has been synced — whoever cannot get connected has to raise that one themselves.
 - Raising `Max Players` is not free and nothing here makes it free: each added player costs the
   host upload and CPU against every other player. `Frame Budget Ms` and the Steam transport
   ceiling below are what decide whether a bigger number is actually playable - read the two
@@ -94,7 +102,10 @@ Works on dedicated servers and on player-hosted games.
 
 Other networking mods that rewrite the same code: FiresGhettoNetworking, VBNetTweaks, SkadiNet,
 BetterNetworking, Smoothbrain's Network, NetworkTweaks, WarheimNetwork, TimeoutLimit. BepInEx will
-refuse to load this mod alongside them rather than leave you half-patched.
+refuse to load this mod alongside them rather than leave you half-patched. TimeoutLimit in
+particular is no longer something you give up: the `Connection Timeout` settings cover the same
+ground, and unlike a timeout raised at one layer only, they move both of the places vanilla times
+out at.
 
 **Verified compatible** (different layers, no overlap): LeanNet, Compress, Scenic. ReturnToSender is
 fine too — it already fixes the scheduler, so that one mechanism stands down and the rest keeps

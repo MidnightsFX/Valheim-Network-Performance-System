@@ -1,5 +1,9 @@
 # Changelog
 
+**1.2.1**
+- Bumps the maximum connection timeout limit to 600s
+
+
 **1.2.0**
 
 Configurable connection timeouts. Vanilla drops a quiet connection after 30 seconds, which is not

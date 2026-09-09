@@ -47,25 +47,32 @@
     <PackageReference Include="JotunnLib" Version="2.27.1" />
   </ItemGroup>
 
+  <PropertyGroup>
+    <!-- VALHEIM_MANAGED and BEPINEX_PATH are resolved in ..\Directory.Build.props, which
+         runs early enough for JotunnLib's reference HintPaths to see them. Only fill in
+         what is still missing here. Declared before the reference group below, which uses them. -->
+    <VALHEIM_MANAGED Condition=" '$(VALHEIM_MANAGED)' == '' ">$(VALHEIM_INSTALL)/valheim_Data/Managed</VALHEIM_MANAGED>
+    <BEPINEX_PATH Condition=" '$(BEPINEX_PATH)' == '' ">$(VALHEIM_INSTALL)/BepInEx</BEPINEX_PATH>
+    <UNITY_FOLDER>$(SolutionDir)NetworkPerformanceSystemUnity</UNITY_FOLDER>
+  </PropertyGroup>
+
   <ItemGroup>
     <!-- Steamworks.NET, for Runtime/RttProbe.cs (game-server networking interface on dedicated
          servers). Jotunn's build props reference the publicized game assemblies but not this one.
          Not copied to the output: the game ships it. -->
     <Reference Include="com.rlabrecque.steamworks.net">
-      <HintPath>$(VALHEIM_INSTALL)/valheim_Data/Managed/com.rlabrecque.steamworks.net.dll</HintPath>
+      <HintPath>$(VALHEIM_MANAGED)/com.rlabrecque.steamworks.net.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- JotunnLib's reference list still carries assemblies that Valheim's Unity version
+         dropped. Nothing here uses them, and leaving them in warns MSB3245 every build. -->
+    <Reference Remove="UnityEngine.ProfilerModule" Condition="!Exists('$(VALHEIM_MANAGED)/UnityEngine.ProfilerModule.dll')" />
   </ItemGroup>
 
   <ItemGroup>
     <Folder Include="Assets\" />
     <Folder Include="Localizations\" />
   </ItemGroup>
-
-  <PropertyGroup>
-    <VALHEIM_MANAGED>$(VALHEIM_INSTALL)/valheim_Data/Managed</VALHEIM_MANAGED>
-    <UNITY_FOLDER>$(SolutionDir)NetworkPerformanceSystemUnity</UNITY_FOLDER>
-  </PropertyGroup>
 
   <Target Name="CopyToUnity">
     <Message Text="Copy assemblies to Unity" Importance="high" />

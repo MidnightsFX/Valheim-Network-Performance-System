@@ -6,6 +6,21 @@ Scaling pass: what breaks first as a server grows from a small group towards a c
 players, plus the correctness issues found on the way. Config additions are all advanced and all
 default to behaviour that is a no-op for a small group.
 
+**New: configurable player limit (host).** `Player Limit / Max Players` replaces the 10 the game
+hard-codes; it ships at 10, so enabling the mechanism on its own changes nothing. Vanilla keeps
+that number in three places that do not read each other, and all three are now set from the one
+setting: the check that turns the 11th peer away, the Steam lobby size the server browser renders
+as "3 / 10", and the PlayFab lobby size. That last one matters more than it looks - crossplay
+clients join the PlayFab lobby *before* ZNet ever sees them, so a server that raised only the ZNet
+limit would keep telling console players it was full while Steam players walked in. It is also why
+a dedicated crossplay server has always filled up at nine: the server process occupies a lobby slot
+without being a player, and vanilla asks for ten slots either way. The lobby is now sized for the
+limit plus that slot where it applies. Crossplay servers still cannot exceed 128, which is
+PlayFab's own ceiling; `nps_stats` reports the limit in force and says so out loud if the crossplay
+half could not be applied. Raising the limit is not free - it is the rest of this config
+(`Frame Budget Ms`, the Steam transport rate ceiling) that decides whether a larger number is
+playable.
+
 **New: routed RPC relay filtering (host).** Every "broadcast" RPC - footsteps, animation triggers,
 hit-stop, damage numbers, building damage, pickables, object-destroyed notices - is sent once to the
 host and relayed by the host to every other player, so its cost is events × players and it shares

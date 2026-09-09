@@ -23,6 +23,23 @@ namespace NetworkPerformanceSystem.Runtime {
             internal int SendsSkippedByBackpressure;
             internal int LastQueueBytes;
             internal int LastWindowBytes;
+
+            // M8 - the transport's own view, which splits the single queue figure above into the
+            // two halves that mean opposite things. See RttProbe.LinkStatus.
+            internal int StatusSamples;
+            internal long PendingByteSum;
+            internal int PendingBytesPeak;
+            internal long InFlightByteSum;
+            internal int InFlightBytesPeak;
+            internal int LastSendRateBytesPerSec;
+            /// <summary>Samples where Steam was holding data it had not yet put on the wire. The
+            /// count matters more than the size: sustained pending is standing queue, whereas a
+            /// single busy tick is just a burst passing through.</summary>
+            internal int SamplesWithPending;
+
+            internal float MeanPendingBytes => StatusSamples > 0 ? (float)PendingByteSum / StatusSamples : 0f;
+            internal float MeanInFlightBytes => StatusSamples > 0 ? (float)InFlightByteSum / StatusSamples : 0f;
+            internal float PendingSampleShare => StatusSamples > 0 ? (float)SamplesWithPending / StatusSamples : 0f;
         }
 
         private static readonly Dictionary<long, PeerStats> Stats = new Dictionary<long, PeerStats>();
@@ -68,6 +85,19 @@ namespace NetworkPerformanceSystem.Runtime {
             bool overWindow = !flush && queue > window;
             bool tooLittleHeadroom = (window - queue) < MinPackageBytes;
             if (overWindow || tooLittleHeadroom) { entry.SendsSkippedByBackpressure++; }
+
+            // M8. One more transport read per peer per send tick, on the same opt-in budget as
+            // GetSendQueueSize above. A socket that will not answer simply contributes no sample,
+            // which is why StatusSamples is counted separately from SendAttempts.
+            if (RttProbe.TryGetLinkStatus(netPeer.m_socket, out RttProbe.LinkStatus status)) {
+                entry.StatusSamples++;
+                entry.PendingByteSum += status.PendingBytes;
+                entry.InFlightByteSum += status.InFlightBytes;
+                entry.LastSendRateBytesPerSec = status.SendRateBytesPerSec;
+                if (status.PendingBytes > entry.PendingBytesPeak) { entry.PendingBytesPeak = status.PendingBytes; }
+                if (status.InFlightBytes > entry.InFlightBytesPeak) { entry.InFlightBytesPeak = status.InFlightBytes; }
+                if (status.PendingBytes > 0) { entry.SamplesWithPending++; }
+            }
         }
 
         private static PeerStats GetOrCreate(long uid, string name) {
@@ -95,8 +125,12 @@ namespace NetworkPerformanceSystem.Runtime {
                 ? (NpsEnv.IsDedicated() ? "Role: dedicated host" : "Role: listen host")
                 : "Role: client");
 
+            AppendPlayerLimit(sb);
             AppendPeerTable(sb);
+            AppendLinkPressure(sb);
+            AppendTransport(sb);
             AppendScheduler(sb);
+            AppendSyncListCache(sb);
             AppendRoutedRpc(sb);
             AppendOwnership(sb);
             AppendExtrapolation(sb);
@@ -132,6 +166,8 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.RefPos: return ValConfig.EnableFastRefPos.Value;
                 case Mechanism.Extrapolation: return ValConfig.EnableLatencyCompensation.Value;
                 case Mechanism.RoutedRpcFilter: return ValConfig.EnableRoutedRpcFilter.Value;
+                case Mechanism.SteamTransport: return ValConfig.EnableSteamTransportTuning.Value;
+                case Mechanism.SyncListCache: return ValConfig.EnableSyncListCache.Value;
                 default: return true;
             }
         }
@@ -174,6 +210,144 @@ namespace NetworkPerformanceSystem.Runtime {
             if (Collecting) {
                 sb.AppendLine($"  (sampling for {CollectingSeconds:F0}s)");
             }
+        }
+
+        /// <summary>
+        /// M8 - the question the peer table above cannot answer.
+        ///
+        /// Its "queue" column is GetSendQueueSize, which sums bytes on the wire with bytes Steam
+        /// is holding back. Those mean opposite things: in-flight is the bandwidth-delay product
+        /// being filled, which is what the M2 window is sized to do, while pending is standing
+        /// queue that adds delay to everything behind it. A peer whose link is working perfectly
+        /// and one being overdriven into bufferbloat produce the same summed number.
+        ///
+        /// The window is currently open-loop - RTT times a configured target rate - so this table
+        /// is how you find out whether that target is set above what a link will actually carry.
+        /// Read it before changing Target Rate KBps in either direction.
+        /// </summary>
+        private static void AppendLinkPressure(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Link pressure (transport view):");
+
+            if (!Collecting) {
+                sb.AppendLine("  (not sampling - run 'nps_stats collect')");
+                return;
+            }
+
+            List<ZNetPeer> peers = ZNet.instance.GetPeers();
+            bool anySamples = false;
+
+            sb.AppendLine("  name                 in-flight  pending   pending%  steam est   fill   verdict");
+            for (int i = 0; i < peers.Count; i++) {
+                long uid = peers[i].m_uid;
+                if (!Stats.TryGetValue(uid, out PeerStats entry) || entry.StatusSamples == 0) { continue; }
+                anySamples = true;
+
+                string name = string.IsNullOrEmpty(peers[i].m_playerName) ? "(connecting)" : peers[i].m_playerName;
+                int window = entry.LastWindowBytes > 0 ? entry.LastWindowBytes : SendWindow.VanillaWindowBytes;
+                float fill = entry.MeanInFlightBytes / window;
+                float pendingShare = entry.PendingSampleShare;
+
+                sb.AppendLine(
+                    $"  {Pad(name, 20)} " +
+                    $"{Pad($"{entry.MeanInFlightBytes / 1024f:F1}KB", 10)} " +
+                    $"{Pad($"{entry.MeanPendingBytes / 1024f:F1}KB", 9)} " +
+                    $"{Pad($"{pendingShare * 100f:F0}%", 9)} " +
+                    $"{Pad($"{entry.LastSendRateBytesPerSec / 1024f:F0}KB/s", 11)} " +
+                    $"{Pad($"{fill * 100f:F0}%", 6)} " +
+                    Verdict(pendingShare, fill));
+            }
+
+            if (!anySamples) {
+                sb.AppendLine("  (no transport samples - Steam sockets only; crossplay peers report nothing here)");
+                return;
+            }
+
+            sb.AppendLine("  in-flight = on the wire, unacked (the window working). pending = Steam holding it back (congestion).");
+            sb.AppendLine("  fill = in-flight as a share of the sized window. steam est = Steam's own rate estimate for the link.");
+        }
+
+        /// <summary>
+        /// Two independent signals, and the pair is what identifies the state:
+        ///   pending high              -> the link cannot take what it is being given, whatever
+        ///                                the window says. Target Rate KBps is too high for it.
+        ///   pending low, fill high    -> the window is the binding constraint and is doing its
+        ///                                job. Raising the target would buy more throughput.
+        ///   pending low, fill low     -> neither the window nor the link is the limit; there is
+        ///                                simply not that much to send, or the limit is upstream.
+        /// </summary>
+        private static string Verdict(float pendingShare, float fill) {
+            if (pendingShare > 0.25f) { return "CONGESTED - target rate above what this link carries"; }
+            if (pendingShare > 0.05f) { return "some queueing"; }
+            if (fill > 0.8f) { return "window-bound (working)"; }
+            if (fill > 0.25f) { return "healthy"; }
+            return "idle - nothing to send";
+        }
+
+        /// <summary>The transport ceiling underneath everything else, and whether we moved it.</summary>
+        private static void AppendTransport(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Steam transport:");
+            if (SteamTransport.LastReadback == null) {
+                sb.AppendLine("  not applied (disabled, or no Steam networking interface in this process)");
+                return;
+            }
+            sb.AppendLine($"  {SteamTransport.LastReadback}");
+
+            int capKBps = SteamTransport.EffectiveSendRateMaxBytesPerSec / 1024;
+            int targetKBps = ValConfig.SendWindowTargetRateKBps.Value;
+            sb.AppendLine($"  window target    {targetKBps} KB/s against a transport ceiling of {capKBps} KB/s");
+            if (targetKBps > capKBps) {
+                sb.AppendLine("  WARNING: sizing windows for throughput the transport will not pass. The surplus becomes");
+                sb.AppendLine("  queueing delay. Raise 'Steam Transport / Send Rate Max KBps' or lower the target.");
+            }
+        }
+
+        /// <summary>Hit rate is the whole story: it is the share of sends that did not have to
+        /// rebuild the sector scan. A low rate on a busy world is the cache correctly refusing to
+        /// serve entries invalidated by object destruction, not a fault.</summary>
+        /// <summary>
+        /// What the server will actually turn people away at. Worth printing even when it is
+        /// vanilla, because the three numbers behind it can disagree - a crossplay lobby stuck at
+        /// 10 refuses console players while Steam players keep joining, and nothing else in the
+        /// game surfaces that.
+        /// </summary>
+        private static void AppendPlayerLimit(StringBuilder sb) {
+            if (!NpsEnv.IsHost()) { return; }
+
+            sb.AppendLine();
+            sb.AppendLine("Player limit:");
+            if (!PlayerLimit.Active) {
+                sb.AppendLine($"  vanilla ({PlayerLimit.VanillaLimit} players)");
+                string reason = PatchGuard.GetDisableReason(Mechanism.PlayerLimit);
+                if (reason != null) { sb.AppendLine($"  stood down: {reason}"); }
+                return;
+            }
+
+            sb.AppendLine($"  accepting        {ZNet.instance.GetNrOfPlayers()} of {PlayerLimit.Configured}");
+            if (PlayerLimit.CrossplayCapacityPinned && PlayerLimit.Configured > PlayerLimit.VanillaLimit) {
+                sb.AppendLine($"  WARNING: the crossplay lobby is still capped at {PlayerLimit.VanillaLimit}. Steam players can join");
+                sb.AppendLine("  past that; crossplay players are told the server is full. See the warning at startup.");
+            }
+        }
+
+        private static void AppendSyncListCache(StringBuilder sb) {
+            if (!NpsEnv.IsHost()) { return; }
+
+            sb.AppendLine();
+            sb.AppendLine("Sector scan cache (since start):");
+            if (!PatchGuard.IsActive(Mechanism.SyncListCache) || !ValConfig.EnableSyncListCache.Value) {
+                sb.AppendLine("  vanilla (full sector scan rebuilt on every send, per peer)");
+                return;
+            }
+
+            long total = SyncListCache.Hits + SyncListCache.Misses;
+            if (total == 0) {
+                sb.AppendLine("  no sends yet");
+                return;
+            }
+            sb.AppendLine($"  scans avoided    {SyncListCache.Hits}/{total} sends ({100f * SyncListCache.Hits / total:F0}%)");
+            sb.AppendLine($"  cache window     {ValConfig.SyncListCacheMs.Value:F0}ms (invalidated early on zone change or any destroy)");
         }
 
         /// <summary>The send scheduler's effective output. On a small server this simply confirms

@@ -45,6 +45,10 @@ namespace NetworkPerformanceSystem
             // All startup hooks should go after the config & Logger have been wired up
             HarmonyInstance = new Harmony(PluginGUID);
             HarmonyInstance.PatchAll(typeof(NetworkPerformanceSystem).Assembly);
+            // M10's crossplay half is applied by hand: binding ZPlayFabMatchmaking.CreateLobby
+            // loads the PlayFab assemblies, and a failure there inside PatchAll would take the
+            // rest of the assembly's patches with it. See PlayerLimitPatches.
+            Patches.PlayerLimitPatches.ApplyPlayFabCapacityPatch(HarmonyInstance);
             PatchGuard.VerifyAfterPatching();
 
             // Configs are not written until after they are all wired up, they exist in memory before this.

@@ -143,6 +143,125 @@ namespace NetworkPerformanceSystem.Runtime {
             return pingMs > 0;
         }
 
+        /// <summary>
+        /// The three numbers ZDOMan.SendZDOs cannot tell apart, plus Steam's own rate estimate.
+        ///
+        /// GetSendQueueSize - the value vanilla budgets against and the one nps_stats reported
+        /// until now - sums pending and in-flight bytes into a single figure. Those two mean
+        /// opposite things:
+        ///
+        ///   * IN FLIGHT (m_cbSentUnackedReliable) is data on the wire and not yet acknowledged.
+        ///     A high number here is the bandwidth-delay product being filled, which is precisely
+        ///     what the M2 window is sized to achieve. It is the goal, not a problem.
+        ///   * PENDING (m_cbPendingReliable/Unreliable) is data Steam has accepted but has not put
+        ///     on the wire yet, because its own rate limiter will not pass it. This is real
+        ///     congestion, and it is standing queue - latency added to every subsequent update.
+        ///
+        /// Summed, a peer whose link is working perfectly and a peer being overdriven into
+        /// bufferbloat look identical. Separated, they are unmistakable, which is the whole reason
+        /// this read exists: the M2 window is currently open-loop - RTT times a *configured*
+        /// target rate - so nothing in the mod can otherwise tell that the target is set above
+        /// what a given link will actually carry.
+        /// </summary>
+        internal struct LinkStatus {
+            internal int PendingBytes;         // queued in Steam, not yet sent - congestion
+            internal int InFlightBytes;        // sent, unacknowledged - the window doing its job
+            internal int SendRateBytesPerSec;  // Steam's own bandwidth estimate for this connection
+            internal float QualityLocal;
+            internal float QualityRemote;
+        }
+
+        /// <summary>
+        /// Reads the transport's real-time view of one socket. Never throws. False means the
+        /// socket is not a Steam socket, is not connected, or this process has no interface that
+        /// will answer - in every case the caller simply records no sample.
+        /// </summary>
+        /// <summary>Consecutive calls on which neither interface produced a status. This read runs
+        /// per peer per send tick while sampling, so a build where it simply does not work must
+        /// stop costing two interop exceptions every time rather than paying them at 20Hz.</summary>
+        private static int _consecutiveStatusFailures;
+        private static bool _statusUnavailable;
+        private const int MaxConsecutiveStatusFailures = 20;
+
+        internal static bool TryGetLinkStatus(ISocket socket, out LinkStatus status) {
+            status = default;
+            if (socket == null || _statusUnavailable) { return false; }
+            if (!PatchGuard.IsActive(Mechanism.RttSampling)) { return false; }
+
+            if (!(Unwrap(socket) is ZSteamSocket steam)) { return false; }
+            if (!steam.IsConnected()) { return false; }
+
+            // Reuse whichever interface the ping path already proved out. Before the first ping
+            // has resolved that, guess from the build exactly as TrySteam does, and let a failure
+            // fall through to the other one.
+            SteamApi first = _resolved != SteamApi.Unresolved
+                ? _resolved
+                : (NpsEnv.IsDedicated() ? SteamApi.GameServer : SteamApi.Client);
+            SteamApi other = first == SteamApi.Client ? SteamApi.GameServer : SteamApi.Client;
+
+            if (TryStatus(first, steam, ref status) || TryStatus(other, steam, ref status)) {
+                _consecutiveStatusFailures = 0;
+                return true;
+            }
+
+            // A connected socket that will not report status on either interface is a property of
+            // the build, not of the moment. Latch off rather than keep probing - this is a
+            // diagnostic, and it must never cost more than the thing it measures.
+            if (++_consecutiveStatusFailures >= MaxConsecutiveStatusFailures) {
+                _statusUnavailable = true;
+                Logger.LogInfo("Link-pressure sampling is unavailable on this build - neither Steamworks sockets " +
+                               "interface reports connection status. nps_stats still shows RTT, window and queue size; " +
+                               "the pending-vs-in-flight split is what is missing.");
+            }
+            return false;
+        }
+
+        private static bool TryStatus(SteamApi api, ZSteamSocket steam, ref LinkStatus status) {
+            try {
+                return api == SteamApi.GameServer
+                    ? StatusGameServer(steam, ref status)
+                    : StatusClient(steam, ref status);
+            } catch (System.Exception) {
+                // The interface this process does not have, or a type-load failure. Deliberately
+                // not counted against the RTT sampler's failure streak: this is a diagnostic read
+                // and must never be able to stand down the mechanisms that matter.
+                return false;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static bool StatusGameServer(ZSteamSocket steam, ref LinkStatus status) {
+            SteamNetConnectionRealTimeStatus_t raw = default;
+            SteamNetConnectionRealTimeLaneStatus_t lanes = default;
+            if (SteamGameServerNetworkingSockets.GetConnectionRealTimeStatus(steam.m_con, ref raw, 0, ref lanes) != EResult.k_EResultOK) {
+                return false;
+            }
+            Fill(raw, ref status);
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static bool StatusClient(ZSteamSocket steam, ref LinkStatus status) {
+            SteamNetConnectionRealTimeStatus_t raw = default;
+            SteamNetConnectionRealTimeLaneStatus_t lanes = default;
+            if (SteamNetworkingSockets.GetConnectionRealTimeStatus(steam.m_con, ref raw, 0, ref lanes) != EResult.k_EResultOK) {
+                return false;
+            }
+            Fill(raw, ref status);
+            return true;
+        }
+
+        private static void Fill(SteamNetConnectionRealTimeStatus_t raw, ref LinkStatus status) {
+            // Both pending classes are standing queue, so they are summed: unreliable pending is
+            // rarer here (Valheim's ZDO traffic is reliable) but it delays the reliable stream
+            // just the same when it is present.
+            status.PendingBytes = raw.m_cbPendingReliable + raw.m_cbPendingUnreliable;
+            status.InFlightBytes = raw.m_cbSentUnackedReliable;
+            status.SendRateBytesPerSec = raw.m_nSendRateBytesPerSecond;
+            status.QualityLocal = raw.m_flConnectionQualityLocal;
+            status.QualityRemote = raw.m_flConnectionQualityRemote;
+        }
+
         /// <summary>See through socket wrappers to the transport underneath. Steady state is the
         /// first check: a ZSteamSocket is returned before any reflection happens.</summary>
         private static ISocket Unwrap(ISocket socket) {
@@ -164,9 +283,12 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>Session end. _resolved, the wrapper cache and the PatchGuard state are process
-        /// facts and deliberately survive; only the failure streak is per-session noise.</summary>
+        /// facts and deliberately survive; only the failure streak is per-session noise.
+        /// _statusUnavailable is a process fact too - which interfaces this build has cannot
+        /// change between sessions - so it survives as well.</summary>
         internal static void Reset() {
             _consecutiveDirectFailures = 0;
+            _consecutiveStatusFailures = 0;
         }
     }
 }

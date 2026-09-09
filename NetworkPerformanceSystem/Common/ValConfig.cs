@@ -55,6 +55,20 @@ namespace NetworkPerformanceSystem {
         // M7 - routed RPC relay filter
         public static ConfigEntry<bool> EnableRoutedRpcFilter;
 
+        // M9 - per-peer sector scan cache
+        public static ConfigEntry<bool> EnableSyncListCache;
+        public static ConfigEntry<float> SyncListCacheMs;
+
+        // M8 - Steam transport configuration
+        public static ConfigEntry<bool> EnableSteamTransportTuning;
+        public static ConfigEntry<int> SteamSendRateMaxKBps;
+        public static ConfigEntry<int> SteamSendRateMinKBps;
+        public static ConfigEntry<int> SteamNagleMicros;
+
+        // M10 - configurable player limit
+        public static ConfigEntry<bool> EnablePlayerLimitOverride;
+        public static ConfigEntry<int> MaxPlayers;
+
         public const string cfgFolder = "NetworkPerformanceSystem";
 
         public ValConfig(ConfigFile cf) {
@@ -176,6 +190,66 @@ namespace NetworkPerformanceSystem {
             // against the same per-peer send window as ZDO updates.
             EnableRoutedRpcFilter = BindServerConfig("Routed RPC", "Enable Relay Filtering", true,
                 "Relay broadcast RPCs (animation triggers, footsteps, damage numbers, object-destroyed notices, building damage and the like) only to the players that can actually use them, instead of to everyone on the server. A receiving client discards these unless it has the object loaded, so nothing visible changes; on a busy server this removes most of the host's relay traffic and stops it from crowding out ZDO updates. Global messages (chat, pings, events, sleep, server messages) are never filtered.");
+
+            // --- M9: per-peer sector scan cache --------------------------------------------
+            // ZDOMan.CreateSyncList runs FindSectorObjects - a (2*activeArea+1)^2 bucket walk plus
+            // the distant ring - once per peer per send. Vanilla sent to one peer per frame behind
+            // a 50ms gate, so that ran about 4x/sec per peer; the scheduler above services every
+            // peer every interval, which is 20x/sec per peer. Frame Budget Ms currently absorbs
+            // that by cutting the send rate, which trades away the thing the scheduler exists to
+            // deliver. Caching the scan removes the cost instead.
+            EnableSyncListCache = BindServerConfig("Sync List Cache", "Enable Sector Scan Cache", true,
+                "Reuse each peer's sector scan across the send sweep instead of rebuilding it on every send. The recipient filter and the priority sort still run every single send, so exactly the same ZDOs go out in the same order - only the scan that produces the candidate list is shared. Invalidated immediately whenever the peer changes zone or any object is destroyed.");
+            SyncListCacheMs = BindServerConfig("Sync List Cache", "Cache Ms", 100f,
+                "How long a peer's sector scan may be reused, in milliseconds. The cost is that an object newly arriving in a peer's area can wait this long before it is first considered - bounded, and small next to the send interval. Destroyed objects are never affected: any destruction invalidates the scan immediately, at any setting. 0 disables the cache and rebuilds the scan every send, as vanilla.",
+                false, 0f, 500f);
+
+            // --- M8: Steam transport configuration -----------------------------------------
+            // ZSteamSocket.RegisterGlobalCallbacks pins SendRateMin AND SendRateMax to the same
+            // 153600 B/s at Global scope. Clamped from both sides, Steam's bandwidth estimator
+            // has no range to work in at all - vanilla Valheim effectively runs with congestion
+            // control switched off and a hard 150 KB/s ceiling underneath everything this mod
+            // does. Sizing a send window above that just moves the queue one layer down.
+            EnableSteamTransportTuning = BindServerConfig("Steam Transport", "Enable Transport Tuning", true,
+                "Let this mod write Steam's global networking config (send-rate bounds and Nagle). Every value below ships at its vanilla setting, so enabling this on its own changes nothing - it only makes the settings reachable and logs a before/after readback of what the transport is actually doing. Requires the Steam backend; on crossplay-only processes it stands down quietly.");
+            SteamSendRateMaxKBps = BindServerConfig("Steam Transport", "Send Rate Max KBps", 0,
+                "Ceiling on Steam's per-connection bandwidth estimate, in kilobytes/sec. 0 leaves vanilla's 150. This is a ceiling, not a target: raising it lets the estimator climb during a burst, it does not push traffic. Until it is raised, Send Window sizing above 150 KBps cannot do anything - the transport meters at 150 regardless and the surplus becomes standing queue. Raise this and Target Rate KBps together, and provision the uplink for the result: 10 players at 500 KBps is 40 Mbit/s of upload worst case.",
+                false, 0, 4096);
+            SteamSendRateMinKBps = BindServerConfig("Steam Transport", "Send Rate Min KBps", 0,
+                "Floor under Steam's bandwidth estimate, in kilobytes/sec. 0 leaves vanilla's 150. Vanilla sets this equal to the ceiling, which is why the estimator never moves; LOWERING it is the useful direction, because it lets congestion control actually back off for a peer on a weak downlink instead of overdriving the link into loss. This setting cannot be raised above vanilla - that direction converts congestion into buffering and is never what you want.",
+                true, 0, 150);
+            SteamNagleMicros = BindServerConfig("Steam Transport", "Nagle Micros", 0,
+                "Microseconds Steam may hold a small reliable message back to coalesce it with the next one. Vanilla and Steam both default to 5000 (5ms), which is up to 5ms added in each direction on every update for a saving that mattered on a modem. 0 sends immediately. This mod already batches at the ZDO layer, so there is very little left for Nagle to coalesce - which is why 0 is the default here rather than vanilla's 5000.",
+                false, 0, 100000);
+
+            // --- M10: configurable player limit --------------------------------------------
+            // Vanilla hard-codes 10 in three places that do not read each other: the check that
+            // actually turns the 11th peer away (ZNet.RPC_PeerInfo), the Steam lobby size that
+            // the server browser prints as "3 / 10", and the PlayFab lobby size - which is a real
+            // ceiling, because crossplay clients join that lobby before ZNet ever sees them.
+            // Raising one and not the others produces a server that is full at a different number
+            // than it advertises, or full for console players only.
+            EnablePlayerLimitOverride = BindServerConfig("Player Limit", "Enable Player Limit Override", true,
+                "Let this mod decide how many players the server accepts, instead of the game's hard-coded 10. Max Players below ships at 10, so enabling this on its own changes nothing - it only makes the number reachable. Applies on the host; a client has no say in it.");
+            MaxPlayers = BindServerConfig("Player Limit", "Max Players", 10,
+                "How many players the server accepts. 10 is vanilla. This counts the same players the game counts: on a player-hosted game the host is one of them, on a dedicated server it is not. The number is enforced the moment it changes, but the limit shown in the server browser - and the crossplay capacity, which is a real ceiling rather than a label - are set when the server registers, so lower it live if you must and restart to raise it cleanly. Nothing about raising it makes the traffic free: every player added costs the host upload and CPU against every other player, so treat the rest of this config (Send Scheduler's frame budget, Steam Transport's rate ceiling) as the things that decide whether a larger number is actually playable. Crossplay servers cannot exceed 128 whatever is set here - PlayFab's lobbies do not go higher.",
+                false, 1, 255);
+
+            // Steam's networking config is process-global and re-writable at any time, so these
+            // four take effect on edit rather than needing a restart. The two Send Window entries
+            // are here as well because the coupling warning compares them against the transport
+            // ceiling - changing either can turn that warning on or off without any Steam value
+            // itself changing.
+            EnableSteamTransportTuning.SettingChanged += OnSteamTransportSettingChanged;
+            SteamSendRateMaxKBps.SettingChanged += OnSteamTransportSettingChanged;
+            SteamSendRateMinKBps.SettingChanged += OnSteamTransportSettingChanged;
+            SteamNagleMicros.SettingChanged += OnSteamTransportSettingChanged;
+            EnableSendWindowSizing.SettingChanged += OnSteamTransportSettingChanged;
+            SendWindowTargetRateKBps.SettingChanged += OnSteamTransportSettingChanged;
+        }
+
+        private static void OnSteamTransportSettingChanged(object sender, EventArgs e) {
+            Runtime.SteamTransport.OnConfigChanged();
         }
 
         /// <summary>

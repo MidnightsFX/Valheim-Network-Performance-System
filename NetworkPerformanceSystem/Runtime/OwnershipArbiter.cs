@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 
 namespace NetworkPerformanceSystem.Runtime {
@@ -35,12 +35,28 @@ namespace NetworkPerformanceSystem.Runtime {
     /// check while ZSyncAnimation keeps replaying the last-replicated run cycle.
     ///
     /// Cost shape matters here because the pass runs every two seconds on the host's main thread
-    /// and visits every persistent ZDO near every player. The work per ZDO is kept to: one
-    /// sector-list read, one owner lookup and a handful of compares. Everything that used to be a
-    /// dictionary write per ZDO - dedup, hold-history - is now either structural (each zone is
-    /// scanned exactly once, so there is nothing to dedup) or deferred until a ZDO is actually
-    /// contested. On a full server that is the difference between a few milliseconds and a
-    /// visible hitch.
+    /// and visits every persistent ZDO near every player. Everything that used to be a dictionary
+    /// write per ZDO - dedup, hold-history - is now either structural (each zone is scanned
+    /// exactly once, so there is nothing to dedup) or deferred until a ZDO is actually contested.
+    /// On a full server that is the difference between a few milliseconds and a visible hitch.
+    ///
+    /// The pass is organised around one fact about the cost of reading a ZDO: ZDO.GetOwner is a
+    /// dictionary lookup keyed by ZDOID, and ZDOExtraData.GetOwner spells it out as ContainsKey
+    /// followed by the indexer - two full probes, each hashing a ZDOID through a List indexer.
+    /// ZDO.HasOwner and ZDO.IsOwner, by contrast, are single bits of m_dataFlags maintained by
+    /// SetOwnerInternal. Profiling put GetOwner at roughly half this pass's cost on a loaded
+    /// frame, so the loops below are shaped to answer as many ZDOs as possible from the flags and
+    /// to read an owner id only where a decision genuinely needs one:
+    ///
+    ///   * Zones are visited one at a time and the sector verdict is fetched once per zone. A
+    ///     ZDO's sector is the key of the list it lives in, so nothing calls GetSector and there
+    ///     is no intermediate list of considered ZDOs to fill and index back out.
+    ///   * A zone no candidate covers releases everything owned - a flag test per ZDO, no lookups.
+    ///     At the stock near simulation distance of 2 the scan square is 5x5 and the presence
+    ///     square is 3x3, so that is sixteen of every twenty-five zones a lone player pulls in.
+    ///   * A zone exactly one candidate covers collapses "owner present" and "owner is best" into
+    ///     one test, which the flags answer outright whenever that candidate is the host.
+    ///   * Only genuinely contested zones run the full comparison.
     /// </summary>
     internal static class OwnershipArbiter {
 
@@ -52,10 +68,14 @@ namespace NetworkPerformanceSystem.Runtime {
         /// </summary>
         private struct Candidate {
             internal long Uid;
-            internal Vector2i Zone;
+            internal Vector2s Zone;
             internal float RttMs;
             internal bool CanOwn;      // eligible to be assigned ownership
             internal bool IsViewer;    // a human sees this ZDO from here, so its staleness counts
+
+            /// <summary>Zone radius this candidate loads - the old ZoneSystem.m_activeArea, now
+            /// negotiated per peer, so it is captured here rather than read once for the pass.</summary>
+            internal int NearRadius;
         }
 
         private struct Verdict {
@@ -67,22 +87,13 @@ namespace NetworkPerformanceSystem.Runtime {
         private static readonly List<Candidate> Candidates = new List<Candidate>();
 
         /// <summary>Every zone inside at least one candidate's scan square this pass. Scanning each
-        /// zone exactly once is what makes the considered list duplicate-free without a per-ZDO
-        /// dictionary: a ZDO lives in exactly one sector list, so it can only be appended once.</summary>
-        private static readonly HashSet<Vector2i> ZonesToScan = new HashSet<Vector2i>();
-        private static readonly List<ZDO> ZoneScratch = new List<ZDO>();
-
-        /// <summary>Persistent ZDOs under consideration this pass, in scan order - which means
-        /// grouped by zone, so consecutive entries almost always share a sector and a verdict.
-        /// ConsideredOwner carries the owner observed at collection time, so the decision loop
-        /// does not repeat the owner lookup. Nothing between collection and decision changes
-        /// ownership, and the loop only ever writes the ZDO it is currently looking at.</summary>
-        private static readonly List<ZDO> Considered = new List<ZDO>();
-        private static readonly List<long> ConsideredOwner = new List<long>();
+        /// zone exactly once is what keeps the pass duplicate-free without a per-ZDO dictionary:
+        /// a ZDO lives in exactly one sector list, so it can only be visited once.</summary>
+        private static readonly HashSet<Vector2s> ZonesToScan = new HashSet<Vector2s>();
 
         private static readonly Dictionary<ZDOID, OwnershipRecord> OwnerHistory = new Dictionary<ZDOID, OwnershipRecord>();
         private static readonly List<PendingMove> Pending = new List<PendingMove>();
-        private static readonly Dictionary<Vector2i, SectorVerdict> SectorCache = new Dictionary<Vector2i, SectorVerdict>();
+        private static readonly Dictionary<Vector2s, SectorVerdict> SectorCache = new Dictionary<Vector2s, SectorVerdict>();
         private static readonly List<SectorVerdict> VerdictPool = new List<SectorVerdict>();
         private static int _verdictsInUse;
         private static readonly Dictionary<long, int> OwnedCount = new Dictionary<long, int>();
@@ -107,8 +118,13 @@ namespace NetworkPerformanceSystem.Runtime {
             internal readonly Dictionary<long, float> TotalByOwner = new Dictionary<long, float>();
             /// <summary>Candidates whose active area covers the sector, regardless of CanOwn.
             /// Backs the "is the owner still here" test - a host barred from owning must still
-            /// count as present, or ZDOs it legitimately owns would read as abandoned.</summary>
-            internal readonly HashSet<long> Present = new HashSet<long>();
+            /// count as present, or ZDOs it legitimately owns would read as abandoned.
+            ///
+            /// A list rather than a set: BuildVerdict visits each candidate once so there is
+            /// nothing to dedup, and the membership test runs per contested ZDO over a handful
+            /// of longs, where a linear scan beats hashing. Its size is also what selects the
+            /// specialised zone loops in RunPass - see ZoneMode.</summary>
+            internal readonly List<long> Present = new List<long>();
 
             internal void Clear() {
                 HasEligible = false;
@@ -204,114 +220,39 @@ namespace NetworkPerformanceSystem.Runtime {
             LastPassCandidates = Candidates.Count;
             if (Candidates.Count == 0) { LastPassMs = 0f; return; }
 
-            CollectConsideredZdos(zdoMan, loadPenalty > 0f);
+            CollectZonesToScan();
+            TallyOwnedLoad(zdoMan, loadPenalty > 0f);
 
             SectorCache.Clear();
             _verdictsInUse = 0;
             Pending.Clear();
 
-            // Rescues and releases are applied inside the loop below rather than queued, so the
-            // counters are reset here instead of in ApplyUpgrades. LastPassUnownedOnEntry is
-            // deliberately absent: CollectConsideredZdos has already filled it in.
-            LastPassConsidered = Considered.Count;
+            // Rescues and releases are applied inside the zone loops rather than queued, so the
+            // counters are reset here instead of in ApplyUpgrades.
+            LastPassConsidered = 0;
+            LastPassUnownedOnEntry = 0;
             LastPassRescued = 0;
             LastPassReleased = 0;
 
-            // The considered list is grouped by zone, so the verdict for the previous ZDO is very
-            // likely the verdict for this one. Holding it in locals turns the per-ZDO SectorCache
-            // lookup into two int compares.
-            Vector2i lastSector = default;
-            SectorVerdict verdict = null;
+            long sessionId = zdoMan.m_sessionID;
 
-            for (int i = 0; i < Considered.Count; i++) {
-                ZDO zdo = Considered[i];
-                long currentOwner = ConsideredOwner[i];
+            // Walk zone by zone rather than over a flat pre-collected list. A ZDO's sector is the
+            // key of the list it lives in, so the zone is already known here: nothing needs
+            // GetSector, nothing needs a per-ZDO SectorCache probe, and there is no considered
+            // list to fill and then index back out. The verdict is fetched once per zone.
+            foreach (Vector2s zone in ZonesToScan) {
+                List<ZDO> objects = ZoneObjects(zdoMan, zone);
+                List<ZDO> portals = ZonePortals(zdoMan, zone);
+                bool hasObjects = objects != null && objects.Count > 0;
+                bool hasPortals = portals != null && portals.Count > 0;
+                if (!hasObjects && !hasPortals) { continue; }
 
-                Vector2i sector = zdo.GetSector();
-                if (verdict == null || sector.x != lastSector.x || sector.y != lastSector.y) {
-                    verdict = VerdictFor(sector);
-                    lastSector = sector;
-                }
+                SectorVerdict verdict = VerdictFor(zone);
 
-                if (!verdict.HasEligible) {
-                    // Nobody can take it. Preserve vanilla's release-to-unowned behaviour so an
-                    // owner who walked away does not leave a phantom behind: HasOwner() gates real
-                    // game logic (ZSyncTransform only extrapolates when a ZDO claims an owner), so
-                    // an absent owner is worse than no owner.
-                    //
-                    // Uncapped, and safe precisely because the rescue below is uncapped too: the
-                    // moment an eligible candidate covers this sector again the ZDO is re-owned on
-                    // that same pass, exactly as vanilla does it. The two must stay symmetrical -
-                    // capping one side and not the other is what left creatures frozen.
-                    if (currentOwner != 0L && !verdict.Present.Contains(currentOwner)) {
-                        zdo.SetOwner(0L);
-                        OwnerHistory.Remove(zdo.m_uid);
-                        LastPassReleased++;
-                    }
-                    continue;
-                }
-
-                // Rescue: nothing is simulating this. Unowned, or owned by someone who has left
-                // the sector or the session. That is not a placement preference, it is a broken
-                // object - BaseAI.UpdateAI returns early for non-owners, ZSyncTransform only
-                // extrapolates when the ZDO claims an owner, ZSyncAnimation stops writing animator
-                // parameters, and Character.Damage routes through ZRoutedRpc to owner 0, which
-                // broadcasts and is then dropped by every receiver at RPC_Damage's IsOwner check.
-                // Frozen mid-animation and silently invulnerable.
-                //
-                // Vanilla's ReleaseNearbyZDOS grants every one of these on the pass that finds it
-                // and budgets nothing, and no creature component ever calls ClaimOwnership, so
-                // this pass is the only recovery path they have. So: no cap, no min-hold, no
-                // margin. A cap here does not smooth the cost, it leaves objects broken for
-                // another pass. If this ever needs to cost less, the lever is spreading rescues
-                // across more eligible candidates - never deferring them in time.
-                //
-                // Deliberately ahead of the direct-control and hysteresis checks below. Those all
-                // require a present owner, so the two paths are disjoint by construction: this can
-                // never take a ship from a helmsman still aboard, but it does rescue one whose
-                // helmsman disconnected - which the release path above cannot reach either,
-                // because some other candidate is still eligible here.
-                if (currentOwner == 0L || !verdict.Present.Contains(currentOwner)) {
-                    zdo.SetOwner(verdict.BestUid);
-                    OwnerHistory[zdo.m_uid] = new OwnershipRecord { Owner = verdict.BestUid, ChangedAt = now, LastSeenAt = now };
-                    LastPassRescued++;
-                    TotalRescued++;
-                    continue;
-                }
-
-                // Everything from here down is optimisation: the ZDO already has a healthy, present
-                // owner and we are only deciding whether a better one exists. That is a preference,
-                // so every cap and every hysteresis rule belongs here and nowhere else.
-                // currentOwner != 0 and Present.Contains(currentOwner) are invariants below, which
-                // is why none of these checks re-test them.
-
-                // Directly-controlled objects follow their controller, never the cost function.
-                // This is what stops us yanking a ship out from under its helmsman.
-                if (OwnershipPolicy.IsDirectlyControlled(zdo)) { continue; }
-
-                if (verdict.BestUid == currentOwner) { continue; }
-
-                // Only a ZDO that has survived every early-out above is contested, and only a
-                // contested ZDO needs a hold timestamp - so this is the first and only point at
-                // which the history table is touched for it. See OwnershipRecord for why that is
-                // both cheaper and slightly more conservative than recording everything.
-                float changedAt = Touch(zdo.m_uid, currentOwner, now);
-
-                // Hysteresis: an owner that just received this ZDO - from us or from gameplay
-                // code - keeps it for a while, so ping jitter around the margin cannot
-                // ping-pong ownership between two peers and a player-initiated claim is not
-                // second-guessed on the very next pass.
-                if (now - changedAt < minHold) { continue; }
-
-                // Present owners are always priced by BuildVerdict; the fallback is belt and braces.
-                float currentTotal = verdict.TotalByOwner.TryGetValue(currentOwner, out float knownTotal)
-                    ? knownTotal
-                    : float.MaxValue;
-
-                float improvement = currentTotal - verdict.BestTotalMs;
-                if (improvement < margin) { continue; }
-
-                Pending.Add(new PendingMove { Zdo = zdo, NewOwner = verdict.BestUid, ImprovementMs = improvement });
+                // Two lists, one verdict: the decision is a property of the sector, and portals
+                // only sit apart because the game moved them to their own store.
+                if (hasObjects) { ApplyVerdict(objects, verdict, sessionId, now, minHold, margin); }
+                if (hasPortals) { ApplyVerdict(portals, verdict, sessionId, now, minHold, margin); }
             }
 
             ApplyUpgrades(now);
@@ -337,8 +278,33 @@ namespace NetworkPerformanceSystem.Runtime {
             }
         }
 
+        /// <summary>
+        /// Turn one sector verdict into action over one list of that sector's ZDOs.
+        /// </summary>
+        private static void ApplyVerdict(List<ZDO> objects, SectorVerdict verdict, long sessionId,
+                                         float now, float minHold, float margin) {
+            int present = verdict.Present.Count;
+
+            if (!verdict.HasEligible && present == 0) {
+                // Nobody covers this zone at all, so no owner can be present and every owned ZDO
+                // here is released. That decision needs no owner id, only the flag - which matters
+                // because at the stock near simulation distance of 2 the scan square is 5x5 while
+                // the presence square is 3x3, so sixteen of every twenty-five zones a lone
+                // candidate pulls in land here.
+                ReleaseZone(objects);
+            } else if (verdict.HasEligible && present == 1) {
+                // Exactly one candidate covers this zone, and BuildVerdict only ever picks a
+                // winner from the candidates it marked present - so the sole present peer is
+                // the best one. "Owner present" and "owner is best" collapse into the same
+                // test, which is what lets AssignZone answer most ZDOs from flags alone.
+                AssignZone(objects, verdict.BestUid, sessionId, now);
+            } else {
+                ArbitrateZone(objects, verdict, now, minHold, margin);
+            }
+        }
+
         /// <summary>Cached verdict for a sector, built on first request this pass.</summary>
-        private static SectorVerdict VerdictFor(Vector2i sector) {
+        private static SectorVerdict VerdictFor(Vector2s sector) {
             if (SectorCache.TryGetValue(sector, out SectorVerdict cached)) { return cached; }
 
             SectorVerdict verdict;
@@ -366,8 +332,7 @@ namespace NetworkPerformanceSystem.Runtime {
         /// in different latency classes every choice has the same total, so the tie-break on
         /// worst case decides - and the lowest-RTT candidate wins, which is the fair outcome.
         /// </summary>
-        private static void BuildVerdict(Vector2i sector, SectorVerdict verdict) {
-            int activatedArea = ZoneSystem.instance.m_activeArea - 1;
+        private static void BuildVerdict(Vector2s sector, SectorVerdict verdict) {
             float loadPenalty = ValConfig.OwnershipLoadPenaltyMs.Value;
             // The challenge margin is "the smallest staleness difference worth acting on". Load may
             // shade a decision but must never, on its own, amount to one - so the handicap is
@@ -381,10 +346,10 @@ namespace NetworkPerformanceSystem.Runtime {
 
             for (int i = 0; i < Candidates.Count; i++) {
                 Candidate owner = Candidates[i];
-                if (!ZNetScene.InActiveArea(sector, owner.Zone, activatedArea)) { continue; }
+                if (!ZoneCompat.InActiveArea(sector, owner.Zone, ZoneCompat.ActiveZoneRadius)) { continue; }
                 verdict.Present.Add(owner.Uid);
 
-                Verdict score = Score(owner, sector, activatedArea);
+                Verdict score = Score(owner, sector);
 
                 // Load-aware term: every simulated object this candidate already owns makes the
                 // next one slightly less attractive, so a run of low-RTT wins spreads across
@@ -447,12 +412,14 @@ namespace NetworkPerformanceSystem.Runtime {
             // lowest-RTT peer present, and contested objects in the origin zones go to the host
             // whenever two or more players are there (its cost is the theoretical minimum for
             // every viewer). That last part is intended - see the Allow Host As Owner config.
+            SimulationDistance hostDistance = ZoneCompat.Local();
             Candidates.Add(new Candidate {
                 Uid = zdoMan.m_sessionID,
                 Zone = ZoneSystem.GetZone(ZNet.instance.GetReferencePosition()),
                 RttMs = 0f,                                                  // zero hops from its own simulation
                 CanOwn = ValConfig.OwnershipAllowHostOwner.Value,
                 IsViewer = !NpsEnv.IsDedicated(),                            // a listen host has a player looking
+                NearRadius = Mathf.Max(1, hostDistance.NearSimulationDistance),
             });
 
             // A peer we have no round-trip measurement for - PlayFab/crossplay, which never
@@ -485,62 +452,276 @@ namespace NetworkPerformanceSystem.Runtime {
                     RttMs = LatencyRegistry.HasMeasurement(uid) ? LatencyRegistry.MeasuredRttMs(uid) : unmeasuredMs,
                     CanOwn = true,
                     IsViewer = true,
+                    NearRadius = ZoneCompat.NearFor(netPeer),
                 });
             }
         }
 
         /// <summary>
-        /// The persistent ZDOs near any candidate, each exactly once. Vanilla gathers this same
-        /// set once per candidate; we take the union of every candidate's scan square at the zone
-        /// level and read each zone's sector list a single time, so the scan cost is bounded by
-        /// the number of distinct zones players occupy rather than by player count, and no per-ZDO
-        /// bookkeeping is needed to dedup.
+        /// The zones near any candidate, each exactly once. Vanilla gathers this same set once per
+        /// candidate; we take the union of every candidate's scan square at the zone level, so the
+        /// scan cost is bounded by the number of distinct zones players occupy rather than by
+        /// player count, and no per-ZDO bookkeeping is needed to dedup.
         /// </summary>
-        private static void CollectConsideredZdos(ZDOMan zdoMan, bool tallyLoad) {
-            Considered.Clear();
-            ConsideredOwner.Clear();
-            OwnedCount.Clear();
+        private static void CollectZonesToScan() {
             ZonesToScan.Clear();
 
-            // The same (2 * activeArea + 1)^2 square that FindSectorObjects(zone, activeArea, 0)
-            // walks - just collected across all candidates first, so overlapping squares cost
-            // nothing extra.
-            int area = ZoneSystem.instance.m_activeArea;
+            // The same (2 * near + 1)^2 square FindSectorObjects walks for that peer's near ring -
+            // just collected across all candidates first, so overlapping squares cost nothing
+            // extra. The radius is per candidate now that simulation distance is negotiated
+            // individually: a peer running a longer distance loads zones a shorter-range peer
+            // never sees, and those still need arbitrating.
             for (int i = 0; i < Candidates.Count; i++) {
-                Vector2i centre = Candidates[i].Zone;
+                Candidate candidate = Candidates[i];
+                Vector2s centre = candidate.Zone;
+                int area = candidate.NearRadius;
                 for (int dx = -area; dx <= area; dx++) {
                     for (int dy = -area; dy <= area; dy++) {
-                        ZonesToScan.Add(new Vector2i(centre.x + dx, centre.y + dy));
+                        ZonesToScan.Add(new Vector2s(centre.x + dx, centre.y + dy));
                     }
                 }
             }
+        }
 
-            // The unowned count is the health metric for the rescue path - in a steady world it
-            // tracks the release ring's population and stays flat, and a number that climbs pass
-            // on pass means rescue is not keeping up. The load tally feeds BuildVerdict and counts
-            // only Prioritized ZDOs (characters, ships - things that actually cost their owner
-            // simulation time), not walls and trees: counting everything persistent meant anyone
-            // standing in a base was instantly saturated and the term stopped saying anything.
-            LastPassUnownedOnEntry = 0;
-            foreach (Vector2i zone in ZonesToScan) {
-                ZoneScratch.Clear();
-                zdoMan.FindObjects(zone, ZoneScratch);
+        /// <summary>
+        /// A zone's live sector list, or null when the zone holds nothing.
+        ///
+        /// ZDOMan.FindObjects copies the list into a scratch buffer; we read it in place. The only
+        /// ZDO mutation this pass performs is SetOwner, which writes the owner dictionary, two
+        /// flag bits and the owner revision - re-bucketing happens in SetSector alone, and nothing
+        /// here moves a ZDO. Skipping the copy matters now that each zone is walked twice, once to
+        /// tally load and once to decide: the copy was a memcpy of every ZDO reference in the
+        /// zone, which in a built-up base is the largest single allocation-shaped cost in the pass.
+        /// </summary>
+        private static List<ZDO> ZoneObjects(ZDOMan zdoMan, Vector2s zone) {
+            return ZoneCompat.SectorObjects(zdoMan, zone);
+        }
 
-                for (int j = 0; j < ZoneScratch.Count; j++) {
-                    ZDO zdo = ZoneScratch[j];
-                    if (zdo == null || !zdo.Persistent) { continue; }
+        /// <summary>
+        /// A zone's portal ZDOs. Portals used to sit in the sector lists with everything else and
+        /// now have a store of their own, so they need a second walk or they would silently drop
+        /// out of arbitration - and a portal whose owner has left is exactly the kind of ZDO the
+        /// rescue path exists for.
+        /// </summary>
+        private static List<ZDO> ZonePortals(ZDOMan zdoMan, Vector2s zone) {
+            return ZoneCompat.PortalObjects(zdoMan, zone);
+        }
 
-                    long owner = zdo.GetOwner();
-                    Considered.Add(zdo);
-                    ConsideredOwner.Add(owner);
+        /// <summary>
+        /// How many simulated objects each candidate already owns, which BuildVerdict turns into
+        /// the load handicap. It has to complete before the first verdict is built, so it is a
+        /// separate walk - and it is a cheap one: Persistent, Type and HasOwner are all flag reads
+        /// on the ZDO itself, so only what survives all three (a character or a ship that has an
+        /// owner) costs an owner lookup.
+        ///
+        /// Counting only Prioritized ZDOs is deliberate - things that actually cost their owner
+        /// simulation time, not walls and trees. Counting everything persistent meant anyone
+        /// standing in a base was instantly saturated and the term stopped saying anything.
+        /// </summary>
+        private static void TallyOwnedLoad(ZDOMan zdoMan, bool tallyLoad) {
+            OwnedCount.Clear();
+            if (!tallyLoad) { return; }
 
-                    if (owner == 0L) { LastPassUnownedOnEntry++; continue; }
-                    if (tallyLoad && zdo.Type == ZDO.ObjectType.Prioritized) {
-                        OwnedCount.TryGetValue(owner, out int count);
-                        OwnedCount[owner] = count + 1;
-                    }
-                }
+            foreach (Vector2s zone in ZonesToScan) {
+                TallyZone(ZoneObjects(zdoMan, zone));
+                TallyZone(ZonePortals(zdoMan, zone));
             }
+        }
+
+        private static void TallyZone(List<ZDO> objects) {
+            if (objects == null) { return; }
+
+            for (int i = 0; i < objects.Count; i++) {
+                ZDO zdo = objects[i];
+                if (zdo == null || !zdo.Persistent) { continue; }
+                if (zdo.Type != ZDO.ObjectType.Prioritized) { continue; }
+                if (!zdo.HasOwner()) { continue; }
+
+                long owner = zdo.GetOwner();
+                OwnedCount.TryGetValue(owner, out int count);
+                OwnedCount[owner] = count + 1;
+            }
+        }
+
+        /// <summary>
+        /// No candidate covers this zone, so no owner can be present in it and every owned ZDO is
+        /// released. Preserves vanilla's release-to-unowned behaviour so an owner who walked away
+        /// does not leave a phantom behind: HasOwner() gates real game logic (ZSyncTransform only
+        /// extrapolates when a ZDO claims an owner), so an absent owner is worse than no owner.
+        ///
+        /// Uncapped, and safe precisely because rescue is uncapped too: the moment an eligible
+        /// candidate covers this zone again every ZDO here is re-owned on that same pass, exactly
+        /// as vanilla does it. The two must stay symmetrical - capping one side and not the other
+        /// is what left creatures frozen.
+        ///
+        /// Note what is absent: no ZDO.GetOwner. HasOwner() is the Owned flag on the ZDO, and
+        /// GetOwner is defined as "!Owned ? 0 : &lt;owner dictionary lookup&gt;", so the flag is
+        /// exactly the "owner != 0" test this needs and the lookup never happens. Vanilla's own
+        /// ReleaseNearbyZDOS reads it the same way.
+        /// </summary>
+        private static void ReleaseZone(List<ZDO> objects) {
+            for (int i = 0; i < objects.Count; i++) {
+                ZDO zdo = objects[i];
+                if (zdo == null || !zdo.Persistent) { continue; }
+                LastPassConsidered++;
+
+                if (!zdo.HasOwner()) { LastPassUnownedOnEntry++; continue; }
+
+                zdo.SetOwner(0L);
+                OwnerHistory.Remove(zdo.m_uid);
+                LastPassReleased++;
+            }
+        }
+
+        /// <summary>
+        /// One candidate covers this zone and it is the eligible winner, so the whole decision
+        /// reduces to "is this already owned by that candidate". Every other outcome - unowned, or
+        /// owned by someone who has left - is a rescue to the same peer, and the optimisation path
+        /// is unreachable because a present owner here can only be the best owner.
+        ///
+        /// Which means most ZDOs never need their owner id read at all. HasOwner() settles the
+        /// unowned case, and IsOwner() - the Owner flag, which SetOwnerInternal maintains as
+        /// "owner == ZDOMan.GetSessionID()" - settles the rest whenever the host is the sole
+        /// candidate. When the winner is a remote peer, IsOwner() still rules out host-owned ZDOs
+        /// for free and only the remainder pay for a lookup.
+        /// </summary>
+        private static void AssignZone(List<ZDO> objects, long bestUid, long sessionId, float now) {
+            bool bestIsSelf = bestUid == sessionId;
+
+            for (int i = 0; i < objects.Count; i++) {
+                ZDO zdo = objects[i];
+                if (zdo == null || !zdo.Persistent) { continue; }
+                LastPassConsidered++;
+
+                if (!zdo.HasOwner()) {
+                    LastPassUnownedOnEntry++;
+                    Rescue(zdo, bestUid, now);
+                    continue;
+                }
+
+                if (bestIsSelf) {
+                    if (zdo.IsOwner()) { continue; }
+                } else if (!zdo.IsOwner() && zdo.GetOwner() == bestUid) {
+                    continue;
+                }
+
+                Rescue(zdo, bestUid, now);
+            }
+        }
+
+        /// <summary>
+        /// The general case: more than one candidate covers this zone, or candidates cover it but
+        /// none may own. This is the only loop that has to read owner ids, and the only one where
+        /// a ZDO can reach the optimisation path.
+        /// </summary>
+        private static void ArbitrateZone(List<ZDO> objects, SectorVerdict verdict, float now, float minHold, float margin) {
+            for (int i = 0; i < objects.Count; i++) {
+                ZDO zdo = objects[i];
+                if (zdo == null || !zdo.Persistent) { continue; }
+                LastPassConsidered++;
+
+                // Unowned is a flag read, so the commonest rescue costs nothing to spot.
+                if (!zdo.HasOwner()) {
+                    LastPassUnownedOnEntry++;
+                    if (verdict.HasEligible) { Rescue(zdo, verdict.BestUid, now); }
+                    continue;
+                }
+
+                long currentOwner = zdo.GetOwner();
+
+                if (!verdict.HasEligible) {
+                    // Nobody can take it - see ReleaseZone for why an absent owner is released
+                    // rather than left in place.
+                    if (!IsPresent(verdict, currentOwner)) {
+                        zdo.SetOwner(0L);
+                        OwnerHistory.Remove(zdo.m_uid);
+                        LastPassReleased++;
+                    }
+                    continue;
+                }
+
+                // Rescue: nothing is simulating this. Owned by someone who has left the sector or
+                // the session. That is not a placement preference, it is a broken object -
+                // BaseAI.UpdateAI returns early for non-owners, ZSyncTransform only extrapolates
+                // when the ZDO claims an owner, ZSyncAnimation stops writing animator parameters,
+                // and Character.Damage routes through ZRoutedRpc to owner 0, which broadcasts and
+                // is then dropped by every receiver at RPC_Damage's IsOwner check. Frozen
+                // mid-animation and silently invulnerable.
+                //
+                // Vanilla's ReleaseNearbyZDOS grants every one of these on the pass that finds it
+                // and budgets nothing, and no creature component ever calls ClaimOwnership, so
+                // this pass is the only recovery path they have. So: no cap, no min-hold, no
+                // margin. A cap here does not smooth the cost, it leaves objects broken for
+                // another pass. If this ever needs to cost less, the lever is spreading rescues
+                // across more eligible candidates - never deferring them in time.
+                //
+                // Deliberately ahead of the direct-control and hysteresis checks below. Those all
+                // require a present owner, so the two paths are disjoint by construction: this can
+                // never take a ship from a helmsman still aboard, but it does rescue one whose
+                // helmsman disconnected - which the release path above cannot reach either,
+                // because some other candidate is still eligible here.
+                if (!IsPresent(verdict, currentOwner)) {
+                    Rescue(zdo, verdict.BestUid, now);
+                    continue;
+                }
+
+                // Everything from here down is optimisation: the ZDO already has a healthy, present
+                // owner and we are only deciding whether a better one exists. That is a preference,
+                // so every cap and every hysteresis rule belongs here and nowhere else.
+                // currentOwner != 0 and IsPresent(currentOwner) are invariants below, which is why
+                // none of these checks re-test them.
+
+                // Ahead of the direct-control test because it is a single compare and it retires
+                // nearly every ZDO in the zone - in a settled world the owner already is the best
+                // choice. Both branches only continue, so the order between them is free to pick;
+                // classifying every uncontested ZDO's prefab first was pure overhead.
+                if (verdict.BestUid == currentOwner) { continue; }
+
+                // Directly-controlled objects follow their controller, never the cost function.
+                // This is what stops us yanking a ship out from under its helmsman.
+                if (OwnershipPolicy.IsDirectlyControlled(zdo)) { continue; }
+
+                // Only a ZDO that has survived every early-out above is contested, and only a
+                // contested ZDO needs a hold timestamp - so this is the first and only point at
+                // which the history table is touched for it. See OwnershipRecord for why that is
+                // both cheaper and slightly more conservative than recording everything.
+                float changedAt = Touch(zdo.m_uid, currentOwner, now);
+
+                // Hysteresis: an owner that just received this ZDO - from us or from gameplay
+                // code - keeps it for a while, so ping jitter around the margin cannot
+                // ping-pong ownership between two peers and a player-initiated claim is not
+                // second-guessed on the very next pass.
+                if (now - changedAt < minHold) { continue; }
+
+                // Present owners are always priced by BuildVerdict; the fallback is belt and braces.
+                float currentTotal = verdict.TotalByOwner.TryGetValue(currentOwner, out float knownTotal)
+                    ? knownTotal
+                    : float.MaxValue;
+
+                float improvement = currentTotal - verdict.BestTotalMs;
+                if (improvement < margin) { continue; }
+
+                Pending.Add(new PendingMove { Zdo = zdo, NewOwner = verdict.BestUid, ImprovementMs = improvement });
+            }
+        }
+
+        /// <summary>Restore an owner to a ZDO that has none present. Uncapped by design - see
+        /// ArbitrateZone.</summary>
+        private static void Rescue(ZDO zdo, long newOwner, float now) {
+            zdo.SetOwner(newOwner);
+            OwnerHistory[zdo.m_uid] = new OwnershipRecord { Owner = newOwner, ChangedAt = now, LastSeenAt = now };
+            LastPassRescued++;
+            TotalRescued++;
+        }
+
+        /// <summary>Is this owner one of the candidates covering the sector? Present holds at most
+        /// one entry per candidate, so a linear scan of longs is cheaper than hashing one.</summary>
+        private static bool IsPresent(SectorVerdict verdict, long uid) {
+            List<long> present = verdict.Present;
+            for (int i = 0; i < present.Count; i++) {
+                if (present[i] == uid) { return true; }
+            }
+            return false;
         }
 
         /// <summary>
@@ -564,7 +745,7 @@ namespace NetworkPerformanceSystem.Runtime {
             return candidate.OwnerRttMs < incumbent.OwnerRttMs;
         }
 
-        private static Verdict Score(Candidate owner, Vector2i sector, int activatedArea) {
+        private static Verdict Score(Candidate owner, Vector2s sector) {
             float total = 0f;
             float worst = 0f;
 
@@ -572,7 +753,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 Candidate viewer = Candidates[i];
                 if (!viewer.IsViewer) { continue; }                          // nobody is watching through a dedicated host
                 if (viewer.Uid == owner.Uid) { continue; }                   // the owner sees its own simulation instantly
-                if (!ZNetScene.InActiveArea(sector, viewer.Zone, activatedArea)) { continue; }
+                if (!ZoneCompat.InActiveArea(sector, viewer.Zone, ZoneCompat.ActiveZoneRadius)) { continue; }
 
                 float staleness = (owner.RttMs + viewer.RttMs) * 0.5f;
                 total += staleness;
@@ -645,9 +826,6 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static void Reset() {
             Candidates.Clear();
             ZonesToScan.Clear();
-            ZoneScratch.Clear();
-            Considered.Clear();
-            ConsideredOwner.Clear();
             OwnerHistory.Clear();
             Pending.Clear();
             SectorCache.Clear();

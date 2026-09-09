@@ -182,6 +182,7 @@ namespace NetworkPerformanceSystem.Patches {
             LatencyRegistry.ForgetPeer(netPeer.m_uid);
             SendWindow.Forget(netPeer.m_uid);
             NetworkStats.ForgetPeer(netPeer.m_uid);
+            SyncListCache.ForgetPeer(netPeer.m_uid);
         }
 
         /// <summary>StopAll rather than Shutdown: it is the common tail of both Shutdown and

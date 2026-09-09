@@ -251,8 +251,7 @@ namespace NetworkPerformanceSystem.Runtime {
             // distance cap; an effect is only visible within the active area), and a peer's
             // reference position on the host can be a couple of seconds old. A zone beyond the
             // active area covers both.
-            Vector2i zone = ZoneSystem.GetZone(pos);
-            int radius = ZoneSystem.instance.m_activeArea + 1;
+            Vector2s zone = ZoneSystem.GetZone(pos);
 
             List<ZNetPeer> peers = router.m_peers;
             ZPackage pkg = null;
@@ -263,8 +262,12 @@ namespace NetworkPerformanceSystem.Runtime {
                 ZNetPeer peer = peers[i];
                 if (peer == null || !peer.IsReady() || peer.m_uid == data.m_senderPeerID) { continue; }
 
-                Vector2i peerZone = ZoneSystem.GetZone(peer.GetRefPos());
-                if (Mathf.Abs(peerZone.x - zone.x) > radius || Mathf.Abs(peerZone.y - zone.y) > radius) {
+                // Per peer, not once for the whole relay: simulation distance is negotiated
+                // individually now, so a peer that loads more of the world around itself has to
+                // be judged against its own radius or it stops receiving events it can see.
+                int radius = ZoneCompat.NearFor(peer) + 1;
+                Vector2s peerZone = ZoneSystem.GetZone(peer.GetRefPos());
+                if (!ZoneCompat.InActiveArea(peerZone, zone, radius)) {
                     suppressed++;
                     continue;
                 }

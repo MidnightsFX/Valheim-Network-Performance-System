@@ -31,8 +31,8 @@ namespace NetworkPerformanceSystem.Patches {
             // Verify the IL is the shape we think it is before touching anything. A game update
             // that changes these constants must disable the mechanism loudly, not silently apply
             // a window to the wrong comparison.
-            int windowConstants = CountInt32Constant(codes, VanillaWindowConstant);
-            int minPackageConstants = CountInt32Constant(codes, VanillaMinPackageConstant);
+            int windowConstants = IlMatch.CountInt32Constant(codes, VanillaWindowConstant);
+            int minPackageConstants = IlMatch.CountInt32Constant(codes, VanillaMinPackageConstant);
 
             if (windowConstants != ExpectedWindowConstants || minPackageConstants != ExpectedMinPackageConstants) {
                 PatchGuard.Disable(Mechanism.SendWindow,
@@ -49,7 +49,7 @@ namespace NetworkPerformanceSystem.Patches {
             int rewritten = 0;
 
             foreach (CodeInstruction code in codes) {
-                if (IsInt32Constant(code, VanillaWindowConstant)) {
+                if (IlMatch.IsInt32Constant(code, VanillaWindowConstant)) {
                     // Replace `ldc.i4 10240` with `ldarg.1; call SendWindow.For(peer)`.
                     // SendZDOs is an instance method, so arg1 is the ZDOPeer. Labels and exception
                     // blocks must stay on the first emitted instruction or branches to this offset
@@ -68,25 +68,6 @@ namespace NetworkPerformanceSystem.Patches {
 
             Logger.LogInfo($"Send window sizing active ({rewritten} sites rewritten in ZDOMan.SendZDOs).");
             return patched;
-        }
-
-        /// <summary>
-        /// Matches both the wide and short encodings. 10240 and 2048 both exceed sbyte range so
-        /// the compiler emits Ldc_I4 today, but matching Ldc_I4_S as well costs nothing and stops
-        /// a recompile of the game from silently halving our match count.
-        /// </summary>
-        private static bool IsInt32Constant(CodeInstruction code, int value) {
-            if (code.opcode == OpCodes.Ldc_I4 && code.operand is int wide) { return wide == value; }
-            if (code.opcode == OpCodes.Ldc_I4_S && code.operand is sbyte narrow) { return narrow == value; }
-            return false;
-        }
-
-        private static int CountInt32Constant(List<CodeInstruction> codes, int value) {
-            int count = 0;
-            for (int i = 0; i < codes.Count; i++) {
-                if (IsInt32Constant(codes[i], value)) { count++; }
-            }
-            return count;
         }
     }
 }

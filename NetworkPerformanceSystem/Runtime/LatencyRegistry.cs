@@ -185,9 +185,11 @@ namespace NetworkPerformanceSystem.Runtime {
             List<ZNetPeer> peers = ZNet.instance.GetPeers();
 
             int radius = int.MaxValue;
-            Vector2i recipientZone = default;
+            Vector2s recipientZone = default;
             if (ZoneSystem.instance != null && recipient != null) {
-                radius = 2 * ZoneSystem.instance.m_activeArea + 1;
+                // Scaled off the recipient's own simulation distance, since that is whose
+                // surroundings the table is being trimmed to.
+                radius = 2 * ZoneCompat.NearFor(recipient) + 1;
                 recipientZone = ZoneSystem.GetZone(recipient.GetRefPos());
             }
 
@@ -210,13 +212,12 @@ namespace NetworkPerformanceSystem.Runtime {
             return pkg;
         }
 
-        private static bool Qualifies(ZNetPeer peer, Vector2i recipientZone, int radius) {
+        private static bool Qualifies(ZNetPeer peer, Vector2s recipientZone, int radius) {
             long uid = peer.m_uid;
             if (uid == 0L || !HasMeasurement(uid)) { return false; }
             if (radius == int.MaxValue) { return true; }
-            Vector2i zone = ZoneSystem.GetZone(peer.GetRefPos());
-            return Mathf.Abs(zone.x - recipientZone.x) <= radius
-                && Mathf.Abs(zone.y - recipientZone.y) <= radius;
+            Vector2s zone = ZoneSystem.GetZone(peer.GetRefPos());
+            return ZoneCompat.InActiveArea(zone, recipientZone, radius);
         }
 
         internal static void ApplyTablePackage(ZPackage pkg) {

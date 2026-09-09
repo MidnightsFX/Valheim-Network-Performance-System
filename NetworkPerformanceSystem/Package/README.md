@@ -40,6 +40,7 @@ someone who did not have a problem.
 | **Live position reporting** | Vanilla reports your position to the server only every 2 seconds, and the server uses it to decide both what to send you and who owns what. A 12-byte side channel keeps it current. |
 | **Latency compensation** | Draws other players' creatures where they *are*, not where they were when the packet left. This is the one you feel. |
 | **Relay filtering** | Vanilla relays every footstep, swing, damage number and destroyed object to every player on the server, who then discards it unless they can see it. The host now relays only to the players who can. Nothing visible changes; on a busy server this is most of the relay traffic. |
+| **Configurable player limit** | Vanilla is hard-wired to 10. Set your own — and it is set in all three places the game keeps the number, including the crossplay lobby, which is the one that actually turns console players away. |
 | **`nps_stats`** | Per-peer RTT, window size, and how often peers are being starved. Run `nps_stats collect`, play, then `nps_stats`. |
 
 ## Installing
@@ -79,9 +80,15 @@ Works on dedicated servers and on player-hosted games.
   a full server as in a small group. The `Load Penalty Ms` setting spreads contested objects
   across low-latency peers instead of piling everything on the single lowest-ping player - leave
   it on unless you specifically want pure staleness placement.
-- Vanilla caps a server at 10 players; going past that needs a separate player-cap mod. Crossplay
-  (PlayFab) peers never report a round-trip time, so they are priced at `Unmeasured Peer RTT Ms`
-  for ownership and rendered at vanilla by other clients.
+- `Max Players` raises vanilla's cap of 10, but a **crossplay** server cannot go past 128 whatever
+  it is set to - PlayFab's lobbies do not hold more, and crossplay clients join that lobby before
+  the server ever sees them. Steam-only servers have no such ceiling. Crossplay (PlayFab) peers
+  also never report a round-trip time, so they are priced at `Unmeasured Peer RTT Ms` for ownership
+  and rendered at vanilla by other clients.
+- Raising `Max Players` is not free and nothing here makes it free: each added player costs the
+  host upload and CPU against every other player. `Frame Budget Ms` and the Steam transport
+  ceiling below are what decide whether a bigger number is actually playable - read the two
+  bullets above before setting one.
 
 ## Incompatible with
 

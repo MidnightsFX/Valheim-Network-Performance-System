@@ -16,6 +16,15 @@ namespace NetworkPerformanceSystem.Patches {
                 "Network performance: per-peer RTT, send window and backpressure. " +
                 "'nps_stats collect' starts sampling the send path, 'nps_stats stop' ends it.",
                 args => {
+                    // Admin-gated rather than hidden behind devcommands. Sampling the send path
+                    // costs a Steam API call per peer per tick, so it is not something any player
+                    // on a server should be able to switch on. A solo player or host always passes;
+                    // a client only when it is on the server's admin list, which the server syncs.
+                    if (ZNet.instance == null || !ZNet.instance.LocalPlayerIsAdminOrHost()) {
+                        args.Context.AddString("'nps_stats' requires admin.");
+                        return;
+                    }
+
                     string sub = args.Length > 1 ? args[1].ToLowerInvariant() : "";
 
                     switch (sub) {

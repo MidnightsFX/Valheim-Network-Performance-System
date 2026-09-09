@@ -55,6 +55,8 @@ namespace NetworkPerformanceSystem.Patches {
             // silently keep sampling on the next server, and telemetry must not carry over.
             NetworkStats.Reset();
             NpsExtrapolate.Reset();
+            SteamTransport.Reset();
+            SyncListCache.Reset();
         }
     }
 }

@@ -16,6 +16,9 @@ namespace NetworkPerformanceSystem.Runtime {
         RefPos,         // M6     - Nps.RefPos fast reference position channel
         Extrapolation,  // M4     - ZSyncTransform.SyncPosition latency compensation
         RoutedRpcFilter,// M7     - ZRoutedRpc.RouteRPC interest-filtered relay of broadcast RPCs
+        SteamTransport, // M8     - ZSteamSocket.RegisterGlobalCallbacks send-rate bounds and Nagle
+        SyncListCache,  // M9     - ZDOMan.CreateSyncList per-peer sector scan reuse
+        PlayerLimit,    // M10    - ZNet.RPC_PeerInfo configurable player cap
     }
 
     /// <summary>

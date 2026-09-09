@@ -237,7 +237,7 @@ namespace NetworkPerformanceSystem {
             // than it advertises, or full for console players only.
             EnablePlayerLimitOverride = BindServerConfig("Player Limit", "Enable Player Limit Override", true,
                 "Let this mod decide how many players the server accepts, instead of the game's hard-coded 10. Max Players below ships at 10, so enabling this on its own changes nothing - it only makes the number reachable. Applies on the host; a client has no say in it.");
-            MaxPlayers = BindServerConfig("Player Limit", "Max Players", 10,
+            MaxPlayers = BindServerConfig("Player Limit", "Max Players", 60,
                 "How many players the server accepts. 10 is vanilla. This counts the same players the game counts: on a player-hosted game the host is one of them, on a dedicated server it is not. The number is enforced the moment it changes, but the limit shown in the server browser - and the crossplay capacity, which is a real ceiling rather than a label - are set when the server registers, so lower it live if you must and restart to raise it cleanly. Nothing about raising it makes the traffic free: every player added costs the host upload and CPU against every other player, so treat the rest of this config (Send Scheduler's frame budget, Steam Transport's rate ceiling) as the things that decide whether a larger number is actually playable. Crossplay servers cannot exceed 128 whatever is set here - PlayFab's lobbies do not go higher.",
                 false, 1, 255);
 

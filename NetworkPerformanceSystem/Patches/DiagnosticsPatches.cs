@@ -1,10 +1,13 @@
 using HarmonyLib;
 using NetworkPerformanceSystem.Runtime;
+using System.Collections.Generic;
 
 namespace NetworkPerformanceSystem.Patches {
 
     /// <summary>
-    /// M5 - the nps_stats console command and the (opt-in) send-path sampling behind it.
+    /// M5 - the nps_stats console command and the (opt-in) send-path sampling behind it. The
+    /// report is open to anyone; the sampling switch is a cheat, because it is the half that
+    /// costs something.
     /// </summary>
     [HarmonyPatch]
     internal static class DiagnosticsPatches {
@@ -12,35 +15,31 @@ namespace NetworkPerformanceSystem.Patches {
         [HarmonyPatch(typeof(Terminal), "InitTerminal")]
         [HarmonyPostfix]
         private static void RegisterCommands() {
+            // Reading the report costs nothing - it prints counters that have already been
+            // gathered - so it is open to anyone. Nothing it prints lets a player change what the
+            // server is doing, and a player who can see their own RTT is a player who can tell you
+            // something useful about a bad connection.
             new Terminal.ConsoleCommand("nps_stats",
                 "Network performance: per-peer RTT, send window and backpressure. " +
-                "'nps_stats collect' starts sampling the send path, 'nps_stats stop' ends it.",
+                "Run 'nps_stats_collect' first to gather samples.",
+                args => args.Context.AddString(NetworkStats.BuildReport()));
+
+            // Turning sampling on is the half with a price - a Steam API call per peer per send
+            // tick - so it belongs behind devcommands like any other switch that changes what the
+            // game is doing. It is its own command rather than a subcommand because isCheat is a
+            // per-command flag, and it is the flag the game's own help listing, autocomplete and
+            // cheat tracking read; a hand-rolled check inside the action reaches none of those.
+            new Terminal.ConsoleCommand("nps_stats_collect",
+                "Start sampling the send path for 'nps_stats'. 'nps_stats_collect stop' ends it.",
                 args => {
-                    // Admin-gated rather than hidden behind devcommands. Sampling the send path
-                    // costs a Steam API call per peer per tick, so it is not something any player
-                    // on a server should be able to switch on. A solo player or host always passes;
-                    // a client only when it is on the server's admin list, which the server syncs.
-                    if (ZNet.instance == null || !ZNet.instance.LocalPlayerIsAdminOrHost()) {
-                        args.Context.AddString("'nps_stats' requires admin.");
-                        return;
-                    }
-
-                    string sub = args.Length > 1 ? args[1].ToLowerInvariant() : "";
-
-                    switch (sub) {
-                        case "collect":
-                            NetworkStats.SetCollecting(true);
-                            args.Context.AddString("Sampling the send path. Play for a while, then run 'nps_stats'.");
-                            return;
-                        case "stop":
-                            NetworkStats.SetCollecting(false);
-                            args.Context.AddString("Stopped sampling.");
-                            return;
-                        default:
-                            args.Context.AddString(NetworkStats.BuildReport());
-                            return;
-                    }
-                });
+                    bool stop = args.Length > 1 && args[1].ToLowerInvariant() == "stop";
+                    NetworkStats.SetCollecting(!stop);
+                    args.Context.AddString(stop
+                        ? "Stopped sampling."
+                        : "Sampling the send path. Play for a while, then run 'nps_stats'.");
+                },
+                isCheat: true,
+                optionsFetcher: () => new List<string> { "stop" });
         }
 
         /// <summary>

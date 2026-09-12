@@ -1,5 +1,10 @@
 # Changelog
 
+**1.3.0**
+- Removes admin requirement from server commands
+	-  nps_stats_collect requires devcommands
+- Adds support for Playfab servers to increase connection limits beyond vanilla 10
+
 **1.2.1**
 - Bumps the maximum connection timeout limit to 600s
 

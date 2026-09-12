@@ -9,13 +9,14 @@ using System.Runtime.CompilerServices;
 namespace NetworkPerformanceSystem.Patches {
 
     /// <summary>
-    /// M10 - rewrites the three hard-coded 10s that together decide how many players a server
+    /// M10 - rewrites the four hard-coded 10s that together decide how many players a server
     /// holds. See <see cref="PlayerLimit"/> for what each site actually controls; only the first
-    /// enforces anything, and only the third can turn a crossplay client away.
+    /// enforces anything, the second and third are what the server browser prints, and the third
+    /// and fourth are what actually admit and carry a crossplay client.
     ///
     /// Host-side by construction: ZNet.RPC_PeerInfo runs the limit check inside its own
-    /// <c>m_isServer</c> branch, and both lobbies are only ever created by the process that
-    /// registers the server. Nothing here needs a side gate of its own.
+    /// <c>m_isServer</c> branch, and the lobbies and the Party network are only ever created by
+    /// the process that registers the server. Nothing here needs a side gate of its own.
     /// </summary>
     [HarmonyPatch]
     internal static class PlayerLimitPatches {
@@ -117,6 +118,17 @@ namespace NetworkPerformanceSystem.Patches {
                     $"({ex.GetType().Name}: {ex.Message}). Crossplay clients will still be refused past 10; " +
                     "Steam clients are unaffected.");
             }
+
+            // Caught separately from the lobby above: the two sites fail for different reasons and
+            // a server with one of them raised is still better off than a server with neither.
+            try {
+                PatchPartyNetwork(harmony);
+            } catch (Exception ex) {
+                PlayerLimit.CrossplayNetworkPinned = true;
+                Logger.LogWarning("Could not reach ZPlayFabMatchmaking.CreateAndJoinNetwork to raise the crossplay Party " +
+                    $"network capacity ({ex.GetType().Name}: {ex.Message}). Crossplay connections will stop at 10 " +
+                    "devices whatever the lobby advertises; Steam clients are unaffected.");
+            }
         }
 
         /// <summary>
@@ -167,6 +179,71 @@ namespace NetworkPerformanceSystem.Patches {
                 Logger.LogWarning($"ZPlayFabMatchmaking.CreateLobby does not have the expected IL shape (found {matches} " +
                     $"MaxPlayers = {PlayerLimit.VanillaLimit} assignments, expected 1). The crossplay lobby stays at 10 " +
                     "members, so crossplay clients will be refused past 10. Steam clients are unaffected.");
+                return codes;
+            }
+
+            IlMatch.ReplaceInPlace(codes, site, new CodeInstruction(OpCodes.Call, capacity));
+            return codes;
+        }
+
+        // --- real capacity, PlayFab Party network -----------------------------------------------
+
+        /// <summary>
+        /// Kept out of its caller for the same reason as <see cref="PatchPlayFabLobby"/>: the type
+        /// load has to happen at a call the caller can wrap.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void PatchPartyNetwork(Harmony harmony) {
+            MethodInfo target = AccessTools.Method(typeof(ZPlayFabMatchmaking), "CreateAndJoinNetwork");
+            if (target == null) {
+                PlayerLimit.CrossplayNetworkPinned = true;
+                Logger.LogWarning("ZPlayFabMatchmaking.CreateAndJoinNetwork not found; the crossplay Party network stays at " +
+                    "10 devices. Crossplay players will be admitted by the lobby and then fail to connect past 10.");
+                return;
+            }
+
+            harmony.Patch(target, transpiler: new HarmonyMethod(
+                AccessTools.Method(typeof(PlayerLimitPatches), nameof(RaisePartyCapacity))));
+        }
+
+        /// <summary>
+        /// <c>MaxPlayerCount = 10u</c> in ZPlayFabMatchmaking.CreateAndJoinNetwork. Sizes the
+        /// PlayFab Party network that crossplay peers are carried over - the lowest of M10's four
+        /// ceilings and the only one with no UI at all, so leaving it behind produces a server
+        /// that advertises its real limit, lets crossplay players through the lobby, and then
+        /// cannot carry more than ten of them.
+        ///
+        /// The sibling assignment in this method is
+        /// <c>DirectPeerConnectivityOptions = (..)15u</c>, so the constant is not ambiguous, but
+        /// the anchor still pairs the 10 with the member it is assigned to rather than trusting
+        /// that to stay true.
+        ///
+        /// MaxPlayerCount is a property whose setter rejects anything outside 1..128 by logging
+        /// and keeping its own default of 32 - a silent shrink, not a throw - which is why
+        /// <see cref="PlayerLimit.PartyNetworkCapacity"/> clamps before returning. Matched on the
+        /// member name alone so this method carries no reference to a PlayFab type.
+        /// </summary>
+        private static IEnumerable<CodeInstruction> RaisePartyCapacity(IEnumerable<CodeInstruction> instructions) {
+            List<CodeInstruction> codes = new List<CodeInstruction>(instructions);
+
+            MethodInfo capacity = AccessTools.Method(typeof(PlayerLimit), nameof(PlayerLimit.PartyNetworkCapacity));
+
+            int site = -1;
+            int matches = 0;
+            for (int i = 0; i + 1 < codes.Count; i++) {
+                if (!IlMatch.IsInt32Constant(codes[i], PlayerLimit.VanillaLimit)) { continue; }
+                if (!IlMatch.TargetsMemberNamed(codes[i + 1], "MaxPlayerCount")
+                    && !IlMatch.TargetsMemberNamed(codes[i + 1], "set_MaxPlayerCount")) { continue; }
+                site = i;
+                matches++;
+            }
+
+            if (matches != 1) {
+                PlayerLimit.CrossplayNetworkPinned = true;
+                Logger.LogWarning($"ZPlayFabMatchmaking.CreateAndJoinNetwork does not have the expected IL shape (found " +
+                    $"{matches} MaxPlayerCount = {PlayerLimit.VanillaLimit} assignments, expected 1). The crossplay Party " +
+                    "network stays at 10 devices, so crossplay players will be admitted by the lobby and then fail to " +
+                    "connect past 10. Steam clients are unaffected.");
                 return codes;
             }
 

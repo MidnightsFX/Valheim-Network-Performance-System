@@ -138,7 +138,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             if (!Collecting) {
                 sb.AppendLine();
-                sb.AppendLine("Send-window instrumentation is off. Run 'nps_stats collect' to start sampling,");
+                sb.AppendLine("Send-window instrumentation is off. Run 'nps_stats_collect' to start sampling,");
                 sb.AppendLine("play for a while, then run 'nps_stats' again.");
             }
 
@@ -232,7 +232,7 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine("Link pressure (transport view):");
 
             if (!Collecting) {
-                sb.AppendLine("  (not sampling - run 'nps_stats collect')");
+                sb.AppendLine("  (not sampling - run 'nps_stats_collect')");
                 return;
             }
 
@@ -349,10 +349,32 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             sb.AppendLine($"  accepting        {ZNet.instance.GetNrOfPlayers()} of {PlayerLimit.Configured}");
+
+            // The three advertise-side sites, reported as what they actually returned rather than
+            // what they should return. A site that reads "not called" on a registered server is
+            // the one fact that separates "the patch missed" from "this backend was never used" -
+            // a Steam-only server never touches the PlayFab pair, and vice versa, so a blank here
+            // is only a fault if it is the backend the server registered on.
+            sb.AppendLine($"  browser shows    {Advertised(PlayerLimit.AdvertisedSteamCapacity)} (Steam lobby)");
+            sb.AppendLine($"                   {Advertised(PlayerLimit.AdvertisedPlayFabCapacity)} (PlayFab lobby members)");
+            sb.AppendLine($"  crossplay net    {Advertised(PlayerLimit.AdvertisedPartyCapacity)} (Party network devices)");
+
             if (PlayerLimit.CrossplayCapacityPinned && PlayerLimit.Configured > PlayerLimit.VanillaLimit) {
                 sb.AppendLine($"  WARNING: the crossplay lobby is still capped at {PlayerLimit.VanillaLimit}. Steam players can join");
                 sb.AppendLine("  past that; crossplay players are told the server is full. See the warning at startup.");
             }
+            if (PlayerLimit.CrossplayNetworkPinned && PlayerLimit.Configured > PlayerLimit.VanillaLimit) {
+                sb.AppendLine($"  WARNING: the crossplay Party network is still capped at {PlayerLimit.VanillaLimit} devices. Crossplay");
+                sb.AppendLine("  players get past the lobby and then fail to connect. See the warning at startup.");
+            }
+        }
+
+        /// <summary>
+        /// Distinguishes "the site ran and returned this" from "the site never ran", which is the
+        /// whole diagnostic value of these three numbers.
+        /// </summary>
+        private static string Advertised(int capacity) {
+            return capacity > 0 ? capacity.ToString() : "not called";
         }
 
         private static void AppendSyncListCache(StringBuilder sb) {

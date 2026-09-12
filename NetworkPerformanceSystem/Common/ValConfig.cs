@@ -229,12 +229,15 @@ namespace NetworkPerformanceSystem {
                 false, 0, 100000);
 
             // --- M10: configurable player limit --------------------------------------------
-            // Vanilla hard-codes 10 in three places that do not read each other: the check that
+            // Vanilla hard-codes 10 in four places that do not read each other: the check that
             // actually turns the 11th peer away (ZNet.RPC_PeerInfo), the Steam lobby size that
-            // the server browser prints as "3 / 10", and the PlayFab lobby size - which is a real
-            // ceiling, because crossplay clients join that lobby before ZNet ever sees them.
-            // Raising one and not the others produces a server that is full at a different number
-            // than it advertises, or full for console players only.
+            // the server browser prints as "3 / 10", the PlayFab lobby size - which is both the
+            // browser's number for a crossplay client and a real ceiling, because crossplay
+            // clients join that lobby before ZNet ever sees them - and the PlayFab Party network
+            // that carries those clients once they are past the lobby. Raising one and not the
+            // others produces a server that is full at a different number than it advertises, or
+            // full for console players only, or one that admits console players and then drops
+            // them.
             EnablePlayerLimitOverride = BindServerConfig("Player Limit", "Enable Player Limit Override", true,
                 "Let this mod decide how many players the server accepts, instead of the game's hard-coded 10. Max Players below ships at 10, so enabling this on its own changes nothing - it only makes the number reachable. Applies on the host; a client has no say in it.");
             MaxPlayers = BindServerConfig("Player Limit", "Max Players", 60,

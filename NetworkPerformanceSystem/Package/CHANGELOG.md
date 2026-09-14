@@ -1,5 +1,9 @@
 # Changelog
 
+**1.4.1**
+- Fixes the player limit not applying to crossplay on dedicated servers.
+- The Steam server browser now shows the configured limit for dedicated servers.
+
 **1.4.0**
 - Fixes items vanishing when inserted into a fermenter, smelter, cooking station, fireplace or similar in multiplayer. This is a vanilla bug made worse with more players.
 	- Station item requests are now delivered to the object's current owner. This is best paired with the Valheim Community Patch, which addresses the other half of this.

@@ -359,7 +359,7 @@ namespace NetworkPerformanceSystem.Runtime {
             // the one fact that separates "the patch missed" from "this backend was never used" -
             // a Steam-only server never touches the PlayFab pair, and vice versa, so a blank here
             // is only a fault if it is the backend the server registered on.
-            sb.AppendLine($"  browser shows    {Advertised(PlayerLimit.AdvertisedSteamCapacity)} (Steam lobby)");
+            sb.AppendLine($"  browser shows    {Advertised(PlayerLimit.AdvertisedSteamCapacity)} (Steam listing)");
             sb.AppendLine($"                   {Advertised(PlayerLimit.AdvertisedPlayFabCapacity)} (PlayFab lobby members)");
             sb.AppendLine($"  crossplay net    {Advertised(PlayerLimit.AdvertisedPartyCapacity)} (Party network devices)");
 

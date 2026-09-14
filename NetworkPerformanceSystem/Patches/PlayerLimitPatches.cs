@@ -9,10 +9,17 @@ using System.Runtime.CompilerServices;
 namespace NetworkPerformanceSystem.Patches {
 
     /// <summary>
-    /// M10 - rewrites the four hard-coded 10s that together decide how many players a server
-    /// holds. See <see cref="PlayerLimit"/> for what each site actually controls; only the first
-    /// enforces anything, the second and third are what the server browser prints, and the third
-    /// and fourth are what actually admit and carry a crossplay client.
+    /// M10 - rewrites the four hard-coded capacities that together decide how many players a
+    /// server holds. See <see cref="PlayerLimit"/> for what each site actually controls; only the
+    /// first enforces anything, the second and third are what the server browser prints, and the
+    /// third and fourth are what actually admit and carry a crossplay client.
+    ///
+    /// The game ships as two builds of the same source, and since 1.0.12 they differ at three of
+    /// the four sites. The client build (which is also the listen host) creates a Steam lobby and
+    /// asks PlayFab for 10; the dedicated server build registers a master-server listing instead
+    /// and asks PlayFab for 11, one more for its own membership. A decompile of one build says
+    /// nothing about the other, so every anchor below is written against both, and a miss logs
+    /// the IL it found rather than just the count.
     ///
     /// Host-side by construction: ZNet.RPC_PeerInfo runs the limit check inside its own
     /// <c>m_isServer</c> branch, and the lobbies and the Party network are only ever created by
@@ -98,27 +105,32 @@ namespace NetworkPerformanceSystem.Patches {
             return codes;
         }
 
-        // --- advertised capacity, Steam lobby ---------------------------------------------------
+        // --- advertised capacity, Steam ---------------------------------------------------------
 
         /// <summary>
-        /// <c>SteamMatchmaking.CreateLobby(type, 10)</c> in ZSteamMatchmaking.RegisterServer.
-        /// Cosmetic: this member limit is what the server browser prints after the slash. Steam
-        /// clients read the lobby's data and then connect straight to the host, so nothing is
-        /// gated on it - but leaving it at 10 while the server accepts 30 tells every player
-        /// looking at the list that a server with room is full.
+        /// The player count ZSteamMatchmaking.RegisterServer hands Steam, which is what the server
+        /// browser prints after the slash. The two builds reach it through different calls: a
+        /// client hosting a listen server creates a lobby, <c>SteamMatchmaking.CreateLobby(type,
+        /// 10)</c>, while the dedicated server build registers with the master server,
+        /// <c>SteamGameServer.SetMaxPlayerCount(10)</c>. Same 10, same job, so the anchor accepts
+        /// either call after the constant.
+        ///
+        /// Cosmetic either way: Steam clients read the listing and then connect straight to the
+        /// host, so nothing is gated on it - but leaving it at 10 while the server accepts 30
+        /// tells every player looking at the list that a server with room is full.
         /// </summary>
         [HarmonyPatch(typeof(ZSteamMatchmaking), nameof(ZSteamMatchmaking.RegisterServer))]
         [HarmonyTranspiler]
         private static IEnumerable<CodeInstruction> AdvertiseSteamCapacity(IEnumerable<CodeInstruction> instructions) {
             List<CodeInstruction> codes = new List<CodeInstruction>(instructions);
 
-            MethodInfo capacity = AccessTools.Method(typeof(PlayerLimit), nameof(PlayerLimit.SteamLobbyCapacity));
+            MethodInfo capacity = AccessTools.Method(typeof(PlayerLimit), nameof(PlayerLimit.SteamAdvertisedCapacity));
 
             int site = -1;
             int matches = 0;
             for (int i = 0; i + 1 < codes.Count; i++) {
                 if (!IlMatch.IsInt32Constant(codes[i], PlayerLimit.VanillaLimit)) { continue; }
-                if (!IlMatch.TargetsMemberNamed(codes[i + 1], "CreateLobby")) { continue; }
+                if (!IlMatch.TargetsMemberNamed(codes[i + 1], SteamCapacityCalls)) { continue; }
                 site = i;
                 matches++;
             }
@@ -127,14 +139,21 @@ namespace NetworkPerformanceSystem.Patches {
             // disabling the mechanism - the limit itself is still enforced at the value set.
             if (matches != 1) {
                 Logger.LogWarning($"ZSteamMatchmaking.RegisterServer does not have the expected IL shape (found {matches} " +
-                    $"CreateLobby(.., {PlayerLimit.VanillaLimit}) calls, expected 1). The server browser will keep " +
-                    "advertising a limit of 10. Joining is unaffected - the limit the server enforces is the configured one.");
+                    $"CreateLobby(.., {PlayerLimit.VanillaLimit}) or SetMaxPlayerCount({PlayerLimit.VanillaLimit}) calls, " +
+                    $"expected 1; IL there: {IlMatch.DescribeNeighbours(codes, SteamCapacityCalls)}). The server browser " +
+                    "will keep advertising a limit of 10. Joining is unaffected - the limit the server enforces is the " +
+                    "configured one.");
                 return codes;
             }
 
+            string call = ((MemberInfo)codes[site + 1].operand).Name;
             IlMatch.ReplaceInPlace(codes, site, new CodeInstruction(OpCodes.Call, capacity));
+
+            Logger.LogInfo($"Steam advertised capacity is configurable (ZSteamMatchmaking.RegisterServer rewritten at {call}).");
             return codes;
         }
+
+        private static readonly string[] SteamCapacityCalls = { "CreateLobby", "SetMaxPlayerCount" };
 
         // --- real capacity, PlayFab lobby -------------------------------------------------------
 
@@ -188,10 +207,11 @@ namespace NetworkPerformanceSystem.Patches {
         }
 
         /// <summary>
-        /// <c>request.MaxPlayers = 10U</c> in ZPlayFabMatchmaking.CreateLobby. This one is load
-        /// bearing: crossplay clients join the PlayFab lobby before ZNet ever sees them, and
-        /// PlayFab answers LobbyNotJoinable once it is full, which the client reports as "server
-        /// is full".
+        /// <c>request.MaxPlayers = 10U</c> in ZPlayFabMatchmaking.CreateLobby - <c>11U</c> on the
+        /// dedicated server build since game 1.0.12, which counts the server process as the extra
+        /// member the way <see cref="PlayerLimit.PlayFabMembers"/> does. This one is load bearing:
+        /// crossplay clients join the PlayFab lobby before ZNet ever sees them, and PlayFab answers
+        /// LobbyNotJoinable once it is full, which the client reports as "server is full".
         ///
         /// Matched on the member name alone so this method carries no reference to a PlayFab type
         /// and can be JIT-ed regardless of whether those assemblies loaded.
@@ -202,25 +222,43 @@ namespace NetworkPerformanceSystem.Patches {
             MethodInfo capacity = AccessTools.Method(typeof(PlayerLimit), nameof(PlayerLimit.PlayFabLobbyCapacity));
 
             int site = -1;
+            int vanilla = 0;
             int matches = 0;
             for (int i = 0; i + 1 < codes.Count; i++) {
-                if (!IlMatch.IsInt32Constant(codes[i], PlayerLimit.VanillaLimit)) { continue; }
-                if (!IlMatch.TargetsMemberNamed(codes[i + 1], "MaxPlayers")
-                    && !IlMatch.TargetsMemberNamed(codes[i + 1], "set_MaxPlayers")) { continue; }
+                if (!IsVanillaPlayFabMembers(codes[i], out int value)) { continue; }
+                if (!IlMatch.TargetsMemberNamed(codes[i + 1], PlayFabLobbyMembers)) { continue; }
                 site = i;
+                vanilla = value;
                 matches++;
             }
 
             if (matches != 1) {
                 PlayerLimit.CrossplayCapacityPinned = true;
                 Logger.LogWarning($"ZPlayFabMatchmaking.CreateLobby does not have the expected IL shape (found {matches} " +
-                    $"MaxPlayers = {PlayerLimit.VanillaLimit} assignments, expected 1). The crossplay lobby stays at 10 " +
-                    "members, so crossplay clients will be refused past 10. Steam clients are unaffected.");
+                    $"MaxPlayers = {PlayerLimit.VanillaLimit} or {PlayerLimit.VanillaDedicatedPlayFabMembers} assignments, " +
+                    $"expected 1; IL there: {IlMatch.DescribeNeighbours(codes, PlayFabLobbyMembers)}). The crossplay lobby " +
+                    "stays at 10 members, so crossplay clients will be refused past 10. Steam clients are unaffected.");
                 return codes;
             }
 
             IlMatch.ReplaceInPlace(codes, site, new CodeInstruction(OpCodes.Call, capacity));
+
+            Logger.LogInfo($"Crossplay lobby capacity is configurable (ZPlayFabMatchmaking.CreateLobby rewritten; vanilla asked for {vanilla}).");
             return codes;
+        }
+
+        private static readonly string[] PlayFabLobbyMembers = { "MaxPlayers", "set_MaxPlayers" };
+
+        /// <summary>
+        /// The number vanilla hands PlayFab at both crossplay sites: 10 on the client build, 11 on
+        /// the dedicated server build. Both are accepted regardless of which process this is,
+        /// rather than picking one from <see cref="NpsEnv.IsDedicated"/> at patch time - the
+        /// member name next to it is what pins the site, and a wrong guess here would only turn a
+        /// working anchor into a miss.
+        /// </summary>
+        private static bool IsVanillaPlayFabMembers(CodeInstruction code, out int value) {
+            return IlMatch.TryGetInt32Constant(code, out value)
+                   && (value == PlayerLimit.VanillaLimit || value == PlayerLimit.VanillaDedicatedPlayFabMembers);
         }
 
         // --- real capacity, PlayFab Party network -----------------------------------------------
@@ -244,16 +282,17 @@ namespace NetworkPerformanceSystem.Patches {
         }
 
         /// <summary>
-        /// <c>MaxPlayerCount = 10u</c> in ZPlayFabMatchmaking.CreateAndJoinNetwork. Sizes the
-        /// PlayFab Party network that crossplay peers are carried over - the lowest of M10's four
-        /// ceilings and the only one with no UI at all, so leaving it behind produces a server
-        /// that advertises its real limit, lets crossplay players through the lobby, and then
-        /// cannot carry more than ten of them.
+        /// <c>MaxPlayerCount = 10u</c> in ZPlayFabMatchmaking.CreateAndJoinNetwork - <c>11u</c> on
+        /// the dedicated server build since game 1.0.12, for the same reason as the lobby. Sizes
+        /// the PlayFab Party network that crossplay peers are carried over - the lowest of M10's
+        /// four ceilings and the only one with no UI at all, so leaving it behind produces a
+        /// server that advertises its real limit, lets crossplay players through the lobby, and
+        /// then cannot carry more than ten of them.
         ///
         /// The sibling assignment in this method is
         /// <c>DirectPeerConnectivityOptions = (..)15u</c>, so the constant is not ambiguous, but
-        /// the anchor still pairs the 10 with the member it is assigned to rather than trusting
-        /// that to stay true.
+        /// the anchor still pairs the constant with the member it is assigned to rather than
+        /// trusting that to stay true.
         ///
         /// MaxPlayerCount is a property whose setter rejects anything outside 1..128 by logging
         /// and keeping its own default of 32 - a silent shrink, not a throw - which is why
@@ -266,26 +305,32 @@ namespace NetworkPerformanceSystem.Patches {
             MethodInfo capacity = AccessTools.Method(typeof(PlayerLimit), nameof(PlayerLimit.PartyNetworkCapacity));
 
             int site = -1;
+            int vanilla = 0;
             int matches = 0;
             for (int i = 0; i + 1 < codes.Count; i++) {
-                if (!IlMatch.IsInt32Constant(codes[i], PlayerLimit.VanillaLimit)) { continue; }
-                if (!IlMatch.TargetsMemberNamed(codes[i + 1], "MaxPlayerCount")
-                    && !IlMatch.TargetsMemberNamed(codes[i + 1], "set_MaxPlayerCount")) { continue; }
+                if (!IsVanillaPlayFabMembers(codes[i], out int value)) { continue; }
+                if (!IlMatch.TargetsMemberNamed(codes[i + 1], PartyNetworkMembers)) { continue; }
                 site = i;
+                vanilla = value;
                 matches++;
             }
 
             if (matches != 1) {
                 PlayerLimit.CrossplayNetworkPinned = true;
                 Logger.LogWarning($"ZPlayFabMatchmaking.CreateAndJoinNetwork does not have the expected IL shape (found " +
-                    $"{matches} MaxPlayerCount = {PlayerLimit.VanillaLimit} assignments, expected 1). The crossplay Party " +
-                    "network stays at 10 devices, so crossplay players will be admitted by the lobby and then fail to " +
-                    "connect past 10. Steam clients are unaffected.");
+                    $"{matches} MaxPlayerCount = {PlayerLimit.VanillaLimit} or {PlayerLimit.VanillaDedicatedPlayFabMembers} " +
+                    $"assignments, expected 1; IL there: {IlMatch.DescribeNeighbours(codes, PartyNetworkMembers)}). The " +
+                    "crossplay Party network stays at 10 devices, so crossplay players will be admitted by the lobby and " +
+                    "then fail to connect past 10. Steam clients are unaffected.");
                 return codes;
             }
 
             IlMatch.ReplaceInPlace(codes, site, new CodeInstruction(OpCodes.Call, capacity));
+
+            Logger.LogInfo($"Crossplay Party network capacity is configurable (ZPlayFabMatchmaking.CreateAndJoinNetwork rewritten; vanilla asked for {vanilla}).");
             return codes;
         }
+
+        private static readonly string[] PartyNetworkMembers = { "MaxPlayerCount", "set_MaxPlayerCount" };
     }
 }

@@ -3,12 +3,13 @@ namespace NetworkPerformanceSystem.Runtime {
     /// <summary>
     /// M10 - the configured player limit, and the capacities that have to agree with it.
     ///
-    /// Vanilla hard-codes 10 in four unrelated places and none of them reads the others:
+    /// Vanilla hard-codes the limit in four unrelated places and none of them reads the others:
     /// <list type="bullet">
     /// <item>ZNet.RPC_PeerInfo rejects the 11th peer. This is the only one that actually enforces.</item>
-    /// <item>ZSteamMatchmaking.RegisterServer sizes the Steam lobby, which is purely the "x / y"
-    /// the server browser prints - Steam clients read the lobby's data and then connect straight
-    /// to the host, they never join the lobby itself.</item>
+    /// <item>ZSteamMatchmaking.RegisterServer sizes what Steam advertises - the lobby a listen
+    /// host creates, or the master-server listing a dedicated server registers - which is purely
+    /// the "x / y" the server browser prints. Steam clients read it and then connect straight to
+    /// the host, they never join through it.</item>
     /// <item>ZPlayFabMatchmaking.CreateLobby sizes the PlayFab lobby, and crossplay clients
     /// <i>do</i> join that, so PlayFab refuses the join with LobbyNotJoinable before ZNet ever
     /// sees a peer. Raising the ZNet limit without raising this one moves the wall, it does not
@@ -18,15 +19,28 @@ namespace NetworkPerformanceSystem.Runtime {
     /// and is the lowest ceiling of the four, so a server whose lobby says 60 still stops dead at
     /// 10 connected crossplay devices until this one moves too.</item>
     /// </list>
-    /// Every value here collapses to vanilla's 10 when the mechanism is off, so a failed anchor
-    /// or a disabled config leaves all four sites saying exactly what they said before.
+    /// Every value here collapses to what vanilla passes when the mechanism is off, so a failed
+    /// anchor or a disabled config leaves all four sites saying exactly what they said before.
     /// </summary>
     internal static class PlayerLimit {
 
         /// <summary>What the game hard-codes, and what every accessor here falls back to.</summary>
         internal const int VanillaLimit = 10;
 
-        /// <summary>Steam's own ceiling on lobby members (SteamMatchmaking.CreateLobby).</summary>
+        /// <summary>
+        /// What the dedicated server build hands PlayFab at both crossplay sites since game
+        /// 1.0.12: the limit plus one for the server process, which is a lobby member and a
+        /// network device but not a player. The client build - a listen host, where the host is
+        /// already one of the ten - still passes <see cref="VanillaLimit"/>, and RPC_PeerInfo
+        /// compares against 10 on both. This is the one number that separates the two builds' IL.
+        /// </summary>
+        internal const int VanillaDedicatedPlayFabMembers = VanillaLimit + 1;
+
+        /// <summary>
+        /// Steam's own ceiling on lobby members (SteamMatchmaking.CreateLobby). The master-server
+        /// listing a dedicated server registers has no documented ceiling; the clamp is applied to
+        /// both for want of a reason to advertise more.
+        /// </summary>
         private const int SteamLobbyMemberCeiling = 250;
 
         /// <summary>
@@ -104,16 +118,18 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
-        /// Member capacity for the Steam lobby, which is what the server browser renders as the
-        /// right-hand side of "3 / 10". Display only - nothing joins through it - so this is the
-        /// limit exactly, with no allowance for the server's own lobby membership.
+        /// The player count Steam advertises for the server, which is what the server browser
+        /// renders as the right-hand side of "3 / 10". A listen host passes it as the member limit
+        /// of the lobby it creates; a dedicated server passes it to its master-server listing.
+        /// Display only either way - nothing joins through it - so this is the limit exactly, with
+        /// no allowance for the server's own membership.
         /// </summary>
-        internal static int SteamLobbyCapacity() {
+        internal static int SteamAdvertisedCapacity() {
             int limit = Configured;
             if (limit > SteamLobbyMemberCeiling) {
                 if (!_warnedSteamClamp) {
                     _warnedSteamClamp = true;
-                    Logger.LogWarning($"Max Players is {limit}, above Steam's {SteamLobbyMemberCeiling}-member lobby ceiling. " +
+                    Logger.LogWarning($"Max Players is {limit}, above the {SteamLobbyMemberCeiling} members Steam allows a lobby. " +
                         $"The server browser will advertise {SteamLobbyMemberCeiling}; the limit the server actually enforces is unaffected.");
                 }
                 limit = SteamLobbyMemberCeiling;
@@ -123,7 +139,7 @@ namespace NetworkPerformanceSystem.Runtime {
             // print the configured number, and its absence is the proof it will not.
             if (AdvertisedSteamCapacity != limit) {
                 AdvertisedSteamCapacity = limit;
-                Logger.LogInfo($"Steam lobby registered advertising {limit} player slots in the server browser.");
+                Logger.LogInfo($"Steam server listing registered advertising {limit} player slots in the server browser.");
             }
             return limit;
         }
@@ -178,10 +194,13 @@ namespace NetworkPerformanceSystem.Runtime {
         ///
         /// The server process is itself a member. On a listen host that member is also a player
         /// and is already inside the limit; on a dedicated server it is a member that is not a
-        /// player, so PlayFab needs one slot more than the limit. Vanilla asks for 10 in both
-        /// cases, which is why a dedicated crossplay server fills up at nine players.
+        /// player, so PlayFab needs one slot more than the limit. The game does the same
+        /// arithmetic itself since 1.0.12 - the dedicated build asks for 11, the client build for
+        /// 10 - so with the mechanism off this returns exactly what vanilla passes on either
+        /// build. Before that it asked for 10 on both, which is why a dedicated crossplay server
+        /// used to fill up at nine players.
         /// </summary>
-        private static int PlayFabMembers() {
+        internal static int PlayFabMembers() {
             int members = Configured + (NpsEnv.IsDedicated() ? 1 : 0);
 
             if (members > PlayFabMemberCeiling) {

@@ -55,6 +55,9 @@ namespace NetworkPerformanceSystem {
         // M7 - routed RPC relay filter
         public static ConfigEntry<bool> EnableRoutedRpcFilter;
 
+        // M12 - station item requests delivered to the current owner
+        public static ConfigEntry<bool> EnableStationRpcRouting;
+
         // M9 - per-peer sector scan cache
         public static ConfigEntry<bool> EnableSyncListCache;
         public static ConfigEntry<float> SyncListCacheMs;
@@ -155,15 +158,15 @@ namespace NetworkPerformanceSystem {
             // everyone else sees it via owner->host->viewer. Vanilla grants ownership to the
             // first peer in list order, which is uncorrelated with both engagement and latency.
             EnableOwnershipArbitration = BindServerConfig("Ownership", "Enable Latency-Aware Ownership", true,
-                "Assign ZDO ownership to minimise how stale the object looks to the players who can actually see it, instead of vanilla's first-peer-wins ordering.");
+                "Assign ZDO ownership to minimise how stale the object looks to the players who can actually see it, instead of vanilla's first-peer-wins ordering. Only simulated, moving objects (creatures and other Prioritized ZDOs) are ever moved away from a player who is still present; buildings, containers, crafting stations and pieces keep their owner until that player leaves, exactly as in vanilla.");
             OwnershipAllowHostOwner = BindServerConfig("Ownership", "Allow Host As Owner", true,
                 "Let the host compete for ownership of contested ZDOs in the zones it has loaded. The host is zero hops from everyone, so host-owned is the lowest possible staleness for every viewer, and whenever two or more players share a zone the host has loaded it will win those objects and keep them. A listen host has loaded the zones around its own player; a dedicated server has loaded only the zones around the world origin, so in practice this means a dedicated server owns and simulates the contested objects at the spawn hub whenever players gather there - intended, and worth knowing when budgeting server CPU. Disable to always place on the lowest-latency player present instead.");
             OwnershipMinHoldSeconds = BindServerConfig("Ownership", "Min Hold Seconds", 5f,
-                "Minimum time an owner keeps a ZDO before it can be challenged. Hysteresis against ownership thrash. Applies only when moving a ZDO away from an owner that is still present - a ZDO whose owner has left the area or the session is re-owned immediately, at any setting.", false, 0f, 60f);
+                "Minimum time an owner keeps a ZDO before it can be challenged. Hysteresis against ownership thrash. Applies only when moving a simulated, moving object (a creature or other Prioritized ZDO) away from an owner that is still present - static objects are never moved off a present owner, and a ZDO whose owner has left the area or the session is re-owned immediately, at any setting.", false, 0f, 60f);
             OwnershipChallengeMarginMs = BindServerConfig("Ownership", "Challenge Margin Ms", 25,
                 "A challenger must improve estimated staleness by at least this many milliseconds to take ownership. Prevents ping jitter from ping-ponging ownership between similar peers. Applies only to challenges against a present owner, and also bounds how much the Load Penalty below may shift a decision.", false, 0, 250);
             OwnershipMaxReassignsPerPass = BindServerConfig("Ownership", "Max Reassigns Per Pass", 8,
-                "Minimum cap on latency-driven ownership transfers per arbitration pass. Each transfer costs a ZDO resend, so this bounds the burst when a group arrives in a new area. The effective cap is the larger of this value and the number of connected players, so a full server converges at the same per-player rate as a small group rather than linearly slower. Restoring an owner to a ZDO that has none is never deferred by this: an unowned creature does not move and cannot be damaged.", true, 1, 128);
+                "Minimum cap on latency-driven ownership transfers of moving objects per arbitration pass (static objects - buildings, containers, stations - are never transferred off a present owner). Each transfer costs a ZDO resend, so this bounds the burst when a group arrives in a new area. The effective cap is the larger of this value and the number of connected players, so a full server converges at the same per-player rate as a small group rather than linearly slower. Restoring an owner to a ZDO that has none is never deferred by this: an unowned creature does not move and cannot be damaged.", true, 1, 128);
             OwnershipLoadPenaltyMs = BindServerConfig("Ownership", "Load Penalty Ms", 0.02f,
                 "Cost added per simulated object (creatures, ships - not walls or trees) a candidate already owns nearby, in milliseconds. Spreads simulation and upload load across peers instead of concentrating every contested object on the lowest-ping player. The total handicap is capped at half of Challenge Margin Ms, so load can shade a close decision but can never on its own amount to the staleness difference that justifies a transfer. 0 disables load spreading and places purely by staleness.", true, 0f, 0.5f);
             // Crossplay/PlayFab sockets never report a round-trip time and a Steam peer has none
@@ -196,6 +199,14 @@ namespace NetworkPerformanceSystem {
             // against the same per-peer send window as ZDO updates.
             EnableRoutedRpcFilter = BindServerConfig("Routed RPC", "Enable Relay Filtering", true,
                 "Relay broadcast RPCs (animation triggers, footsteps, damage numbers, object-destroyed notices, building damage and the like) only to the players that can actually use them, instead of to everyone on the server. A receiving client discards these unless it has the object loaded, so nothing visible changes; on a busy server this removes most of the host's relay traffic and stops it from crowding out ZDO updates. Global messages (chat, pings, events, sleep, server messages) are never filtered.");
+
+            // --- M12: station item requests delivered to the current owner ------------------
+            // Fermenters, smelters, cooking stations, fireplaces, shield generators and ballistas
+            // take the item out of the inventory and then ask "the owner" to account for it - the
+            // owner as the sender's copy of the world names it, with no acknowledgement and no
+            // rollback when the receiver is not in fact the owner. The host always knows who is.
+            EnableStationRpcRouting = BindServerConfig("Routed RPC", "Route Station Requests To Owner", true,
+                "Deliver fermenter, smelter, cooking station, fireplace, shield generator and ballista item requests (add item / ore / fuel / ammo, tap, empty) to whoever owns the object right now, rather than to whoever the player's copy of the world still says owns it. The game removes the item from your inventory before sending, and the receiver silently discards the request unless it is the owner - so any moment the two disagree loses the item: the player who owned the station just walked away or logged off, or ownership has only just been handed over. If nobody present owns the object, ownership is handed to the requesting player first. Host-side only; players do not need the mod for it.");
 
             // --- M9: per-peer sector scan cache --------------------------------------------
             // ZDOMan.CreateSyncList runs FindSectorObjects - a (2*activeArea+1)^2 bucket walk plus
@@ -239,7 +250,7 @@ namespace NetworkPerformanceSystem {
             // full for console players only, or one that admits console players and then drops
             // them.
             EnablePlayerLimitOverride = BindServerConfig("Player Limit", "Enable Player Limit Override", true,
-                "Let this mod decide how many players the server accepts, instead of the game's hard-coded 10. Max Players below ships at 10, so enabling this on its own changes nothing - it only makes the number reachable. Applies on the host; a client has no say in it.");
+                "Let this mod decide how many players the server accepts, instead of the game's hard-coded 10. Max Players below ships at 10, so enabling this on its own changes nothing - it only makes the number reachable. Applies on the host; a client has no say in it. Has no effect when Valheim Plus is installed - V+ sets the limit itself, and its maxPlayers setting is the one in force.");
             MaxPlayers = BindServerConfig("Player Limit", "Max Players", 60,
                 "How many players the server accepts. 10 is vanilla. This counts the same players the game counts: on a player-hosted game the host is one of them, on a dedicated server it is not. The number is enforced the moment it changes, but the limit shown in the server browser - and the crossplay capacity, which is a real ceiling rather than a label - are set when the server registers, so lower it live if you must and restart to raise it cleanly. Nothing about raising it makes the traffic free: every player added costs the host upload and CPU against every other player, so treat the rest of this config (Send Scheduler's frame budget, Steam Transport's rate ceiling) as the things that decide whether a larger number is actually playable. Crossplay servers cannot exceed 128 whatever is set here - PlayFab's lobbies do not go higher.",
                 false, 1, 255);

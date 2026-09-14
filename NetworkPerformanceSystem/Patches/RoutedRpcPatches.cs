@@ -45,7 +45,11 @@ namespace NetworkPerformanceSystem.Patches {
 
         [HarmonyPatch(typeof(ZRoutedRpc), "RouteRPC")]
         [HarmonyPrefix]
-        private static bool FilterRelay(ZRoutedRpc __instance, ZRoutedRpc.RoutedRPCData rpcData) {
+        private static bool FilterRelay(ZRoutedRpc __instance, ZRoutedRpc.RoutedRPCData rpcData, bool __runOriginal) {
+            // StationRpcPatches.RouteOutgoing runs ahead of this on the same method and may
+            // already have delivered the message; Harmony still runs the remaining prefixes, so
+            // honour its verdict rather than relay a second copy.
+            if (!__runOriginal) { return false; }
             EnsureOverlappingModCheck();
             // true  -> vanilla RouteRPC runs (targeted, client side, global, unknown, or stood down)
             // false -> the filtered relay already happened

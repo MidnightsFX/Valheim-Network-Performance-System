@@ -16,9 +16,13 @@ namespace NetworkPerformanceSystem.Runtime {
     /// both engagement and latency, and for a geographically spread group it is close to the worst
     /// available choice.
     ///
-    /// This replaces the tie-break with an explicit cost function. Note what it does NOT do: it
-    /// never moves a Player, Ship or tamed creature away from a healthy owner, because authority
-    /// must follow direct control - that is the failure mode behind ship-helm stutter.
+    /// This replaces the tie-break with an explicit cost function. Note what it does NOT do. It
+    /// never moves a non-Prioritized ZDO - a building, container, station or piece - away from a
+    /// present owner: there is no staleness to win on something that does not move, and the move
+    /// races the game's owner-targeted item RPCs (see ArbitrateZone), so static objects follow
+    /// vanilla exactly. And it never moves a Player, Ship, ridden tame or attached cart away from a
+    /// healthy owner, because authority must follow direct control - that is the failure mode
+    /// behind ship-helm stutter.
     ///
     /// A pass does two things, and keeping them apart is load-bearing:
     ///
@@ -26,9 +30,9 @@ namespace NetworkPerformanceSystem.Runtime {
     ///     nothing simulating it at all. Vanilla restores these unbudgeted on the pass that finds
     ///     them, and creatures have no other recovery path (nothing in BaseAI, MonsterAI or
     ///     Character ever calls ClaimOwnership). This is correctness, so it is uncapped.
-    ///   * OPTIMISATION - moving a ZDO from a healthy, present owner to a lower-latency one. This
-    ///     is a preference, so it carries the per-pass cap, the per-target cap, the min-hold
-    ///     hysteresis and the challenge margin.
+    ///   * OPTIMISATION - moving a Prioritized ZDO from a healthy, present owner to a lower-latency
+    ///     one. This is a preference, so it carries the Prioritized gate, the per-pass cap, the
+    ///     per-target cap, the min-hold hysteresis and the challenge margin.
     ///
     /// Routing rescues through the optimisation budget is what froze creatures mid-animation and
     /// made them immune to damage: an unowned Character drops every RPC_Damage at its IsOwner
@@ -144,11 +148,12 @@ namespace NetworkPerformanceSystem.Runtime {
         /// arbiter assignment instead of being challengeable on the very next pass.
         ///
         /// Only ZDOs that are actually contested are recorded - the decision loop consults the
-        /// history after every cheaper early-out has passed. A ZDO whose owner is already the best
-        /// choice never needs a hold timestamp; when a better candidate later appears, its first
-        /// sight in the table counts as a change and it gets one hold-width of grace before it can
-        /// move. That is deliberately conservative, and it keeps the table proportional to the
-        /// contested set rather than to the whole nearby world.
+        /// history after every cheaper early-out has passed, the Prioritized gate included, so the
+        /// table scales with the creatures nearby rather than the buildings. A ZDO whose owner is
+        /// already the best choice never needs a hold timestamp; when a better candidate later
+        /// appears, its first sight in the table counts as a change and it gets one hold-width of
+        /// grace before it can move. That is deliberately conservative, and it keeps the table
+        /// proportional to the contested set rather than to the whole nearby world.
         /// </summary>
         private struct OwnershipRecord {
             internal long Owner;
@@ -172,6 +177,7 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static int LastPassReleased;
         internal static int LastPassOptimised;
         internal static int LastPassDeferred;      // optimisations only; rescues are never deferred
+        internal static int LastPassStaticHeld;    // present, not-best owner kept because the ZDO does not move
         internal static int LastPassCap;           // effective per-pass transfer cap after auto-scaling
         internal static long TotalRescued;
         internal static long TotalOptimised;
@@ -227,12 +233,13 @@ namespace NetworkPerformanceSystem.Runtime {
             _verdictsInUse = 0;
             Pending.Clear();
 
-            // Rescues and releases are applied inside the zone loops rather than queued, so the
-            // counters are reset here instead of in ApplyUpgrades.
+            // Rescues, releases and the static-object hold are applied inside the zone loops
+            // rather than queued, so their counters are reset here instead of in ApplyUpgrades.
             LastPassConsidered = 0;
             LastPassUnownedOnEntry = 0;
             LastPassRescued = 0;
             LastPassReleased = 0;
+            LastPassStaticHeld = 0;
 
             long sessionId = zdoMan.m_sessionID;
 
@@ -274,7 +281,7 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             if (Logger.Level >= BepInEx.Logging.LogLevel.Debug) {
-                Logger.LogDebug($"Ownership pass: considered {LastPassConsidered} ({LastPassUnownedOnEntry} unowned) over {ZonesToScan.Count} zones, rescued {LastPassRescued}, released {LastPassReleased}, optimised {LastPassOptimised}, deferred {LastPassDeferred}, history {OwnerHistory.Count}, {LastPassMs:F1}ms.");
+                Logger.LogDebug($"Ownership pass: considered {LastPassConsidered} ({LastPassUnownedOnEntry} unowned) over {ZonesToScan.Count} zones, rescued {LastPassRescued}, released {LastPassReleased}, optimised {LastPassOptimised}, deferred {LastPassDeferred}, static held {LastPassStaticHeld}, history {OwnerHistory.Count}, {LastPassMs:F1}ms.");
             }
         }
 
@@ -677,6 +684,34 @@ namespace NetworkPerformanceSystem.Runtime {
                 // classifying every uncontested ZDO's prefab first was pure overhead.
                 if (verdict.BestUid == currentOwner) { continue; }
 
+                // Only a Prioritized ZDO - the type ZNetView.m_type stamps on things that are
+                // simulated and move (creatures, carts, physics props; ZDOMan.ServerSortSendZDOS
+                // and TallyOwnedLoad above both read it as "costs its owner simulation time") - is
+                // ever moved off a present owner. Everything else keeps vanilla's rule: first to
+                // arrive owns it, re-owned only when that owner leaves. Three reasons, each
+                // sufficient alone:
+                //
+                //   * Nothing to gain. Staleness needs something that changes between sends; a
+                //     fermenter's ZDO changes once per brew.
+                //   * Every move opens a window - one send tick plus one-way latency per peer,
+                //     longer under backpressure - in which every other peer's copy of the owner id
+                //     is stale. ZNetView.InvokeRPC(string, ...) targets m_zdo.GetOwner(), the
+                //     SENDER's copy, and Fermenter.RPC_AddItem, Smelter.RPC_AddOre/RPC_AddFuel,
+                //     Fireplace.RPC_AddFuel and CookingStation.RPC_AddFuel all begin
+                //     "if (m_nview.IsOwner())" and otherwise return silently - after the caller has
+                //     already removed the item from the inventory. Vanilla never changes the owner
+                //     of a ZDO whose owner is present, so in vanilla that id is never stale; this
+                //     path was the only thing that made it so.
+                //   * A host-side SetOwner bumps OwnerRevision only. A write the old owner already
+                //     had on the wire carries (data+1, oldOwnerRev, oldOwner); ZDOMan.RPC_ZDOData
+                //     applies it in full because the data revision is higher and drags owner and
+                //     OwnerRevision back, while the old owner has already applied the new owner
+                //     and - revisions now equal - is never re-sent. Active stations write their
+                //     ZDO continuously, so a move often ended with nobody simulating the object.
+                //
+                // A flag read, so it sits ahead of the prefab classification below.
+                if (zdo.Type != ZDO.ObjectType.Prioritized) { LastPassStaticHeld++; continue; }
+
                 // Directly-controlled objects follow their controller, never the cost function.
                 // This is what stops us yanking a ship out from under its helmsman.
                 if (OwnershipPolicy.IsDirectlyControlled(zdo)) { continue; }
@@ -768,9 +803,9 @@ namespace NetworkPerformanceSystem.Runtime {
         /// capped pass does the reassignments that matter most rather than whichever happened to
         /// be enumerated first, and anything skipped is simply reconsidered next pass.
         ///
-        /// Only latency-driven moves off a healthy, present owner reach here. Restoring an owner
-        /// to a ZDO that has none is correctness, not placement, and is applied unbudgeted in
-        /// RunPass - so every improvement below is finite and the sort is meaningful.
+        /// Only latency-driven moves of Prioritized ZDOs off a healthy, present owner reach here.
+        /// Restoring an owner to a ZDO that has none is correctness, not placement, and is applied
+        /// unbudgeted in RunPass - so every improvement below is finite and the sort is meaningful.
         /// </summary>
         private static void ApplyUpgrades(float now) {
             LastPassOptimised = 0;
@@ -846,6 +881,7 @@ namespace NetworkPerformanceSystem.Runtime {
             LastPassReleased = 0;
             LastPassOptimised = 0;
             LastPassDeferred = 0;
+            LastPassStaticHeld = 0;
             LastPassCap = 0;
             TotalRescued = 0;
             TotalOptimised = 0;

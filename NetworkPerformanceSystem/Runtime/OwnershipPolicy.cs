@@ -33,6 +33,10 @@ namespace NetworkPerformanceSystem.Runtime {
         /// consults this at all. That ordering is what stops a stale s_user - a rider id left
         /// behind by a disconnected player - from reading as "controlled" forever and excluding
         /// the mount from recovery permanently.
+        ///
+        /// Also only reached for Prioritized ZDOs - the arbiter never moves anything else off a
+        /// present owner - so a Player, Ship or cart that somehow carried the Default type would
+        /// simply never move, which is the stricter outcome.
         /// </summary>
         internal static bool IsDirectlyControlled(ZDO zdo) {
             switch (Classify(zdo)) {
@@ -52,7 +56,12 @@ namespace NetworkPerformanceSystem.Runtime {
                     // to the puller and sets s_attachJointHash until detach. While attached,
                     // the cart's physics are the puller's input loop - moving it is the same
                     // failure mode as taking a ship from its helmsman.
-                    return zdo.GetBool(ZDOVars.s_attachJointHash, false);
+                    //
+                    // An open cargo chest is the same thing: Container.RPC_RequestOpen hands the
+                    // opener ownership and OnContainerChanged only saves on the owner, so a move
+                    // mid-use drops whatever they just put in. Container writes s_inUse as 0/1.
+                    return zdo.GetBool(ZDOVars.s_attachJointHash, false)
+                        || zdo.GetInt(ZDOVars.s_inUse, 0) == 1;
                 default:
                     return false;
             }

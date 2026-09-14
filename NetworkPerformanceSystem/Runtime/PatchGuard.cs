@@ -20,6 +20,7 @@ namespace NetworkPerformanceSystem.Runtime {
         SyncListCache,  // M9     - ZDOMan.CreateSyncList per-peer sector scan reuse
         PlayerLimit,    // M10    - ZNet.RPC_PeerInfo configurable player cap
         ConnectionTimeout, // M11 - ZRpc.SetLongTimeout + Steam TimeoutInitial/TimeoutConnected
+        StationRpcRouting, // M12 - ZRoutedRpc.RPC_RoutedRPC delivery of station item requests to the current owner
     }
 
     /// <summary>
@@ -38,6 +39,11 @@ namespace NetworkPerformanceSystem.Runtime {
         /// present rather than layering on top of them.</summary>
         internal const string BetterZeeRouterGUID = "redseiko.valheim.betterzeerouter";
         internal const string EnRouteGUID = "redseiko.valheim.enroute";
+
+        /// <summary>Valheim Plus has its own player limit and transpiles the same sites M10 does.
+        /// Unlike the checks above this one has to be answered at patch time, so the plugin
+        /// declares a soft dependency on it to be sure it is already in PluginInfos by then.</summary>
+        internal const string ValheimPlusGUID = "org.bepinex.plugins.valheim_plus";
 
         private static readonly HashSet<Mechanism> Disabled = new HashSet<Mechanism>();
         private static readonly Dictionary<Mechanism, string> DisableReasons = new Dictionary<Mechanism, string>();

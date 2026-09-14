@@ -133,6 +133,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendScheduler(sb);
             AppendSyncListCache(sb);
             AppendRoutedRpc(sb);
+            AppendStationRpc(sb);
             AppendOwnership(sb);
             AppendExtrapolation(sb);
 
@@ -170,6 +171,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.SteamTransport: return ValConfig.EnableSteamTransportTuning.Value;
                 case Mechanism.SyncListCache: return ValConfig.EnableSyncListCache.Value;
                 case Mechanism.ConnectionTimeout: return ValConfig.EnableConnectionTimeoutTuning.Value;
+                case Mechanism.StationRpcRouting: return ValConfig.EnableStationRpcRouting.Value;
                 default: return true;
             }
         }
@@ -342,7 +344,9 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine();
             sb.AppendLine("Player limit:");
             if (!PlayerLimit.Active) {
-                sb.AppendLine($"  vanilla ({PlayerLimit.VanillaLimit} players)");
+                sb.AppendLine(PlayerLimit.DeferredToValheimPlus
+                    ? $"  set by Valheim Plus ({ZNet.instance.GetNrOfPlayers()} connected)"
+                    : $"  vanilla ({PlayerLimit.VanillaLimit} players)");
                 string reason = PatchGuard.GetDisableReason(Mechanism.PlayerLimit);
                 if (reason != null) { sb.AppendLine($"  stood down: {reason}"); }
                 return;
@@ -450,6 +454,31 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  {Pad(label, 13)} {events} events, {sent} sent, {suppressed} suppressed ({saved})");
         }
 
+        /// <summary>What the station router had to correct. "Re-targeted" and "claimed" are the
+        /// requests vanilla would have lost outright - each one is an item that stayed in the
+        /// world. "Held" is the cost of doing it safely: how often the new owner had not yet been
+        /// told, and the longest anyone waited for that.</summary>
+        private static void AppendStationRpc(StringBuilder sb) {
+            if (!NpsEnv.IsHost()) { return; }
+
+            sb.AppendLine();
+            sb.AppendLine("Station requests (since start):");
+            if (!PatchGuard.IsActive(Mechanism.StationRpcRouting) || !ValConfig.EnableStationRpcRouting.Value) {
+                sb.AppendLine("  vanilla (delivered to whoever the sender's copy names as owner)");
+                return;
+            }
+
+            sb.AppendLine($"  {Pad("seen", 13)} {StationRpcRouter.Seen} owner-addressed requests (add item/ore/fuel/ammo, tap, empty)");
+            sb.AppendLine($"  {Pad("re-targeted", 13)} {StationRpcRouter.Retargeted} (sender named a stale owner - delivered to the current one)");
+            sb.AppendLine($"  {Pad("claimed", 13)} {StationRpcRouter.Claimed} (no present owner - handed to the requesting player first)");
+            sb.AppendLine($"  {Pad("held", 13)} {StationRpcRouter.HeldCount} (waited for the owner to be sent its ownership; longest {StationRpcRouter.MaxHoldMs:F0}ms)");
+            sb.AppendLine($"  {Pad("expired", 13)} {StationRpcRouter.Expired} (owner not synced within {StationRpcRouter.HoldTimeoutSeconds:F0}s - forwarded regardless)");
+            sb.AppendLine($"  {Pad("dropped", 13)} {StationRpcRouter.Dropped} (object or player gone while waiting)");
+            if (StationRpcRouter.Waiting > 0) {
+                sb.AppendLine($"  {Pad("waiting", 13)} {StationRpcRouter.Waiting}");
+            }
+        }
+
         private static void AppendOwnership(StringBuilder sb) {
             if (!NpsEnv.IsHost()) { return; }
 
@@ -463,6 +492,7 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  rescued     {OwnershipArbiter.LastPassRescued} (had no present owner - never capped)");
             sb.AppendLine($"  released    {OwnershipArbiter.LastPassReleased} (no eligible owner in range)");
             sb.AppendLine($"  optimised   {OwnershipArbiter.LastPassOptimised} (moved to a lower-latency owner)");
+            sb.AppendLine($"  static held {OwnershipArbiter.LastPassStaticHeld} (present owner is not the lowest-latency one; kept because the object does not move)");
             sb.AppendLine($"  deferred    {OwnershipArbiter.LastPassDeferred} (optimisations only, hit the per-pass cap of {OwnershipArbiter.LastPassCap})");
             sb.AppendLine($"  pass time   {OwnershipArbiter.LastPassMs:F1}ms");
             sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued}, optimised {OwnershipArbiter.TotalOptimised}");

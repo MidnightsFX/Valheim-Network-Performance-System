@@ -8,6 +8,8 @@ namespace NetworkPerformanceSystem
 {
     [BepInPlugin(PluginGUID, PluginName, PluginVersion)]
     [BepInDependency(Jotunn.Main.ModGuid)]
+    // Load order only for Valheim Plus, to prevent transpilers colliding
+    [BepInDependency(PatchGuard.ValheimPlusGUID, BepInDependency.DependencyFlags.SoftDependency)]
 
     // Networking mods that collide head-on with our patch sites. Each of these either
     // rewrites the same ZDOMan.SendZDOs constants, replaces SendZDOToPeers2, or runs a
@@ -28,11 +30,12 @@ namespace NetworkPerformanceSystem
     //   redseiko.valheim.betterzeerouter   (ZRoutedRpc only)
     //   redseiko.valheim.scenic            (ZNetScene.RemoveObjects only)
     //   redseiko.valheim.returntosender    (it overrides SendSchedulerPatch, allowed)
+    //   org.bepinex.plugins.valheim_plus   (owns the player limit, see PlayerLimitPatches)
     internal class NetworkPerformanceSystem : BaseUnityPlugin
     {
         public const string PluginGUID = "MidnightsFX.NetworkPerformanceSystem";
         public const string PluginName = "NetworkPerformanceSystem";
-        public const string PluginVersion = "1.3.0";
+        public const string PluginVersion = "1.4.0";
 
         internal static ManualLogSource Log;
         internal static Harmony HarmonyInstance;
@@ -56,11 +59,6 @@ namespace NetworkPerformanceSystem
             ValConfig.SaveOnSet(true);
         }
 
-        /// <summary>
-        /// M4's tuning overlay. Latency compensation is the only mechanism here whose failure mode
-        /// is visual rather than a number in nps_stats, so picking a strength needs live feedback
-        /// on how far it is actually shifting things and whether the clamp is firing.
-        /// </summary>
         public void OnGUI() {
             if (ValConfig.EnableDebugOverlay == null || !ValConfig.EnableDebugOverlay.Value) { return; }
             if (!NpsEnv.NetReady() || NpsEnv.IsDedicated()) { return; }

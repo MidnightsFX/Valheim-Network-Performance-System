@@ -35,18 +35,19 @@ someone who did not have a problem.
 | | |
 |---|---|
 | **Per-peer send window** | Sized from measured RTT (bandwidth-delay product) instead of a fixed 10 KB. Applies in both directions, so a distant player's *uploads* stop being throttled too. |
-| **Latency-aware ownership** | Assigns each object to whoever minimises perceived staleness, with hysteresis so ownership cannot thrash. Never takes an object somebody is actively driving. |
+| **Latency-aware ownership** | Assigns each **moving** object (creatures, physics props) to whoever minimises perceived staleness, with hysteresis so ownership cannot thrash. Never takes an object somebody is actively driving, and never moves a stationary object — buildings, containers, stations — away from a player who is still there: those follow vanilla's rules, since moving them gains nothing and races the RPCs that put items into them. |
 | **Send scheduler fix** | Vanilla services one peer per rendered frame, so the advertised 20Hz silently becomes ~5.5Hz at ten players. This sends to everyone each tick. |
 | **Live position reporting** | Vanilla reports your position to the server only every 2 seconds, and the server uses it to decide both what to send you and who owns what. A 12-byte side channel keeps it current. |
 | **Latency compensation** | Draws other players' creatures where they *are*, not where they were when the packet left. This is the one you feel. |
 | **Relay filtering** | Vanilla relays every footstep, swing, damage number and destroyed object to every player on the server, who then discards it unless they can see it. The host now relays only to the players who can. Nothing visible changes; on a busy server this is most of the relay traffic. |
+| **Station requests reach the owner** | Putting an item into a fermenter, smelter, cooking station, fireplace, shield generator or ballista removes it from your inventory and then asks *the owner* to account for it — the owner as your copy of the world names it, with no acknowledgement if that player has walked off, logged out, or just lost ownership. The host now delivers the request to whoever owns the object right now, hands ownership to you first if nobody present does, and waits for the new owner to be told before forwarding. No item is lost to a stale owner, and players do not need the mod for it. |
 | **Configurable player limit** | Vanilla is hard-wired to 10. Set your own — and it is set in all four places the game keeps the number: the check that enforces it, the Steam and crossplay lobbies the server browser reads its `x / y` from, and the crossplay Party network, which has no UI at all and is the lowest ceiling of the four. |
 | **Configurable timeouts** | Vanilla gives up on a quiet connection after 30 seconds, which is not enough for a slow link mid-join. Raise it — in both places the game times out, since the shorter one is what actually fires. |
 | **`nps_stats`** | Per-peer RTT, window size, and how often peers are being starved. Open to anyone. Run `nps_stats_collect` (needs `devcommands`, since sampling costs a Steam call per peer per tick), play, then `nps_stats`. |
 
 ## Installing
 
-**Server-only works.** Vanilla clients get the send window, ownership, and scheduler fixes with
+**Server-only works.** Vanilla clients get the send window, ownership, scheduler and station-request fixes with
 nothing installed on their end.
 
 **Installing on clients too** adds latency compensation and live position reporting for those
@@ -64,6 +65,11 @@ Works on dedicated servers and on player-hosted games.
   simulates them. That is intended and is a CPU cost to plan for on a busy spawn hub; set
   `Allow Host As Owner` to false to place purely on players. The server never takes ownership of
   zones it has not loaded, because owning something it is not simulating would freeze it.
+- Ownership arbitration only ever re-places creatures and other simulated, moving objects. Stationary
+  objects — pieces, containers, fermenters, smelters, cooking stations — follow vanilla exactly: owned by
+  whoever arrived first, re-owned only when that player leaves. This is deliberate. A stationary object's
+  owner is where the game sends item-insert RPCs, and the game removes the item from your inventory
+  before sending; moving the owner while a player is mid-insert loses the item.
 - Latency compensation is dead reckoning: an entity that stops abruptly will overshoot slightly and
   settle back. Lower `LatencyCompensationStrength` if you find it distracting; `0` disables it.
 - Requires the Steam backend. Crossplay/PlayFab connections do not report round-trip time, and
@@ -111,6 +117,8 @@ out at.
 fine too — it already fixes the scheduler, so that one mechanism stands down and the rest keeps
 working. EnRoute and BetterZeeRouter are fine in the same way: both rework the routed-RPC relay, so
 the relay-filtering mechanism stands down when either is present and everything else keeps working.
+Valheim Plus is fine too: it has its own player limit, so this mod's `Player Limit` settings are
+ignored when it is installed and V+'s `maxPlayers` is the one in force.
 
 ## Changelog
 

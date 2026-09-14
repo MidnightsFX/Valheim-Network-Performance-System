@@ -1,5 +1,11 @@
 # Changelog
 
+**1.4.0**
+- Fixes items vanishing when inserted into a fermenter, smelter, cooking station, fireplace or similar in multiplayer. This is a vanilla bug made worse with more players.
+	- Station item requests are now delivered to the object's current owner. This is best paired with the Valheim Community Patch, which addresses the other half of this.
+- `nps_stats` ownership block gains a `static held` line: objects left with a present but not lowest-latency owner because they do not move.
+- Valheim Plus compatibility: when V+ is installed its player limit is the one in force and this mod's `Player Limit` settings stand down instead of fighting over the same patch sites.
+
 **1.3.0**
 - Removes admin requirement from server commands
 	-  nps_stats_collect requires devcommands

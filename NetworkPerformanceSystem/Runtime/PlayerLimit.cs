@@ -55,6 +55,13 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static bool CrossplayNetworkPinned;
 
         /// <summary>
+        /// Set when Valheim Plus is installed and none of the four sites were patched. The limit
+        /// in force is then V+'s, not vanilla's 10, so nps_stats has to say whose it is rather
+        /// than report the fallback.
+        /// </summary>
+        internal static bool DeferredToValheimPlus;
+
+        /// <summary>
         /// What each advertise-side site actually returned when the game called it, or 0 if it
         /// never did. These are the only direct evidence that a transpiler's replacement call is
         /// live: an anchor can match, the patch can apply, and the site can still never run

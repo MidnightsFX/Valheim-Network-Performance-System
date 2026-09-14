@@ -21,6 +21,41 @@ namespace NetworkPerformanceSystem.Patches {
     [HarmonyPatch]
     internal static class PlayerLimitPatches {
 
+        // --- Valheim Plus -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Skips the two attribute-driven sites below when Valheim Plus owns the player limit. The
+        /// PlayFab pair is applied by hand and checks the same thing in
+        /// <see cref="ApplyPlayFabCapacityPatch"/>.
+        /// </summary>
+        [HarmonyPrepare]
+        private static bool Prepare() {
+            return !DeferToValheimPlus();
+        }
+
+        /// <summary>
+        /// Valheim Plus transpiles ZNet.RPC_PeerInfo, ZPlayFabMatchmaking.CreateLobby and
+        /// CreateAndJoinNetwork for its own <c>maxPlayers</c>, and the two cannot share them. Its
+        /// RPC_PeerInfo transpiler overwrites whatever operand follows GetNrOfPlayers without
+        /// looking at the opcode: running after ours it turns our call into a call with an int
+        /// operand, which is invalid IL. Running before ours it leaves an int where Ldc_I4_S
+        /// carries an sbyte, our anchor misses, and M10 stands down anyway - but with a warning
+        /// that blames a game update.
+        ///
+        /// So M10 stands down up front and says why. The Steam lobby site is skipped with the rest
+        /// even though V+ leaves it alone: with M10 off it could only return vanilla's 10, which is
+        /// what the unpatched method already passes.
+        /// </summary>
+        private static bool DeferToValheimPlus() {
+            if (!PatchGuard.IsPluginLoaded(PatchGuard.ValheimPlusGUID)) { return false; }
+
+            PlayerLimit.DeferredToValheimPlus = true;
+            PatchGuard.Disable(Mechanism.PlayerLimit,
+                "Valheim Plus is installed and sets the player limit itself. Its maxPlayers setting ([Server] in " +
+                "valheim_plus.cfg) is the one in force; this mod's Player Limit settings are ignored.");
+            return true;
+        }
+
         // --- enforcement ----------------------------------------------------------------------
 
         /// <summary>
@@ -110,6 +145,8 @@ namespace NetworkPerformanceSystem.Patches {
         /// Called from Awake after PatchAll for exactly that reason.
         /// </summary>
         internal static void ApplyPlayFabCapacityPatch(Harmony harmony) {
+            if (DeferToValheimPlus()) { return; }
+
             try {
                 PatchPlayFabLobby(harmony);
             } catch (Exception ex) {

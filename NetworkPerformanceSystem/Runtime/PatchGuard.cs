@@ -23,6 +23,11 @@ namespace NetworkPerformanceSystem.Runtime {
         StationRpcRouting, // M12 - ZRoutedRpc.RPC_RoutedRPC delivery of station item requests to the current owner
         JotunnQueueLimit,  // M13 - Jotunn.Entities.CustomRPC.MaximumSendQueueSize kept above the M2 window ceiling
         QueueDrain,        // M14 - ZDOMan.SendZDOs periodic queue drain for mods with a fixed send queue threshold
+        DeserializeAlloc,  // M15 - ZDO.Deserialize field read without the fourteen per-ZDO delegates
+        PacketReadAlloc,   // M16 - ZPackage.ReadPackage(ref) straight into the target buffer
+        SendPacketReuse,   // M17 - ZDOMan.SendZDOs reuses its two packages instead of rebuilding them
+        RpcInvokeFastPath, // M18 - ZRpc.RpcMethod<T>.Invoke typed dispatch instead of DynamicInvoke
+        RelaySendReuse,    // M19 - ZRoutedRpc.RouteRPC relay written once per message instead of once per recipient
     }
 
     /// <summary>
@@ -37,8 +42,8 @@ namespace NetworkPerformanceSystem.Runtime {
         internal const string ReturnToSenderGUID = "redseiko.valheim.returntosender";
 
         /// <summary>Both rework ZRoutedRpc's relay path. Two systems deciding who receives a
-        /// routed RPC is a race by construction, so the relay filter stands down when either is
-        /// present rather than layering on top of them.</summary>
+        /// routed RPC is a race by construction, so the relay filter and the relay send reuse that
+        /// shares its hook stand down when either is present rather than layering on top of them.</summary>
         internal const string BetterZeeRouterGUID = "redseiko.valheim.betterzeerouter";
         internal const string EnRouteGUID = "redseiko.valheim.enroute";
 

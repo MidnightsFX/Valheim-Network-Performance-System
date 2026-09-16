@@ -137,6 +137,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendStationRpc(sb);
             AppendOwnership(sb);
             AppendExtrapolation(sb);
+            AppendAllocationRelief(sb);
 
             if (!Collecting) {
                 sb.AppendLine();
@@ -175,6 +176,11 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.StationRpcRouting: return ValConfig.EnableStationRpcRouting.Value;
                 case Mechanism.JotunnQueueLimit: return ValConfig.EnableSendWindowSizing.Value;
                 case Mechanism.QueueDrain: return ValConfig.EnableSendWindowSizing.Value && ValConfig.QueueDrainIntervalSeconds.Value > 0f;
+                case Mechanism.DeserializeAlloc: return AllocationRelief.DeserializeWanted;
+                case Mechanism.PacketReadAlloc: return AllocationRelief.PacketReadWanted;
+                case Mechanism.SendPacketReuse: return AllocationRelief.SendPackageReuseWanted;
+                case Mechanism.RpcInvokeFastPath: return AllocationRelief.RpcInvokeWanted;
+                case Mechanism.RelaySendReuse: return AllocationRelief.RelaySendWanted;
                 default: return true;
             }
         }
@@ -499,10 +505,25 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             AppendRelayRow(sb, "ZDO-targeted", RoutedRpcFilter.TargetedEvents, RoutedRpcFilter.TargetedSent, RoutedRpcFilter.TargetedSuppressed);
+            AppendOutOfRangeRow(sb);
             AppendRelayRow(sb, "DestroyZDO", RoutedRpcFilter.DestroyEvents, RoutedRpcFilter.DestroySent, RoutedRpcFilter.DestroySuppressed);
             AppendRelayRow(sb, "positional", RoutedRpcFilter.PositionalEvents, RoutedRpcFilter.PositionalSent, RoutedRpcFilter.PositionalSuppressed);
             sb.AppendLine($"  {Pad("global", 13)} {RoutedRpcFilter.GlobalEvents} events (relayed to everyone, by design)");
             sb.AppendLine($"  last second   sent {RoutedRpcFilter.SentLastSecond} msgs, suppressed {RoutedRpcFilter.SuppressedLastSecond} msgs");
+        }
+
+        /// <summary>The ZDO-targeted deliveries that went (or would have gone) to a peer holding the
+        /// object but too far away to have it loaded. With the limit off this is the answer to
+        /// "is Limit Relay By Distance worth turning on" - a share of what was actually sent.</summary>
+        private static void AppendOutOfRangeRow(StringBuilder sb) {
+            long outOfRange = RoutedRpcFilter.TargetedOutOfRange;
+            if (ValConfig.LimitTargetedRelayByDistance.Value) {
+                sb.AppendLine($"  {Pad("", 13)} of those suppressed, {outOfRange} were out of range (distance limit on)");
+                return;
+            }
+            long sent = RoutedRpcFilter.TargetedSent;
+            string share = sent > 0 ? $"{100f * outOfRange / sent:F0}% of sent" : "-";
+            sb.AppendLine($"  {Pad("", 13)} {outOfRange} of those sent were out of range ({share}; Limit Relay By Distance is off)");
         }
 
         private static void AppendRelayRow(StringBuilder sb, string label, long events, long sent, long suppressed) {
@@ -586,6 +607,57 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  mean correction     {NpsExtrapolate.MeanDisplacement:F2}m");
             sb.AppendLine($"  peak correction     {NpsExtrapolate.MaxDisplacement:F2}m");
             sb.AppendLine($"  clamp hits (total)  {NpsExtrapolate.ClampHits}");
+        }
+
+        /// <summary>
+        /// M15-M19. Counts of operations taken on the fast path, monotonic since startup, with
+        /// vanilla's own per-second ZDO counters above them as the denominator - "1.2M deserialise
+        /// fast" means nothing without knowing how many ZDOs are arriving, and nothing else on a
+        /// server reports those two numbers at all.
+        ///
+        /// Deliberately counts rather than bytes. Byte figures would be estimates dressed up as
+        /// measurements, and the thing the collector responds to is how many objects appear, not
+        /// how large they were.
+        /// </summary>
+        private static void AppendAllocationRelief(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Allocation relief (totals since start):");
+
+            if (AllocationRelief.TryGetZdoRates(out int sent, out int recv)) {
+                sb.AppendLine($"  ZDO throughput   {recv} received/s, {sent} sent/s (the game's own counters)");
+            }
+
+            sb.AppendLine($"  {Pad("deserializeFast", 16)} {AllocationRelief.DeserializeFast} " +
+                          $"received ZDOs read without the 14 delegates{State(Mechanism.DeserializeAlloc, AllocationRelief.DeserializeWanted, AllocationRelief.DeserializeHookInstalled)}");
+            sb.AppendLine($"  {Pad("packetReadFast", 16)} {AllocationRelief.PacketReadFast} " +
+                          $"payload reads without the intermediate array{State(Mechanism.PacketReadAlloc, AllocationRelief.PacketReadWanted, AllocationRelief.PacketReadHookInstalled)}");
+            sb.AppendLine($"  {Pad("sendPkgReused", 16)} {AllocationRelief.SendPackagesReused} " +
+                          $"send ticks using the reused packets{State(Mechanism.SendPacketReuse, AllocationRelief.SendPackageReuseWanted, true)}");
+            sb.AppendLine($"  {Pad("rpcFastPath", 16)} {AllocationRelief.RpcFastPath} " +
+                          $"inbound RPCs dispatched without reflection{State(Mechanism.RpcInvokeFastPath, AllocationRelief.RpcInvokeWanted, AllocationRelief.RpcInvokeHookInstalled)}");
+            if (NpsEnv.IsHost()) {
+                sb.AppendLine($"  {Pad("relaySendReused", 16)} {AllocationRelief.RelaySendsReused} " +
+                              $"relay deliveries sent from the reused frame{State(Mechanism.RelaySendReuse, AllocationRelief.RelaySendWanted, true)}");
+            }
+
+            sb.AppendLine("  These cut how OFTEN the collector runs, not how much is live at once. On a very large");
+            sb.AppendLine("  world the live object count is what the memory ceiling is a function of, and no mod");
+            sb.AppendLine("  changes that - expect longer between incidents and less CPU spent collecting, not immunity.");
+        }
+
+        /// <summary>
+        /// The suffix on each counter line. Three things can be true and they are not the same
+        /// thing: the mechanism stood down at patch time, the admin has not asked for it, or the
+        /// admin asked for it after startup and the hook that would serve it was never installed.
+        /// That last one is the whole reason this says anything at all - the counter would
+        /// otherwise sit at zero with the setting reading "true" and no explanation anywhere.
+        /// </summary>
+        private static string State(Mechanism mechanism, bool wanted, bool installed) {
+            string reason = PatchGuard.GetDisableReason(mechanism);
+            if (reason != null) { return $"  [stood down: {reason}]"; }
+            if (!wanted) { return "  [off]"; }
+            if (!installed) { return "  [on in config, but not installed this session - restart to apply]"; }
+            return "";
         }
 
         internal static string BuildOverlay() {

@@ -92,6 +92,26 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
+        /// Whether a peer centred on peerZone could have an instance of a ZDO in zdoZone - the
+        /// question a ZDO-targeted RPC's receiver asks, since ZRoutedRpc.HandleRoutedRPC drops the
+        /// message unless ZNetScene has one.
+        ///
+        /// ZNetScene instantiates exactly what ZDOMan.FindSectorObjects returns around the peer and
+        /// destroys everything else: every ZDO within the near distance, and Distant-flagged ZDOs
+        /// out to the total distance. Both loops step outward in Chebyshev rings and the circular
+        /// ZonesWithinRadius test inside them only ever removes zones, so the square is a strict
+        /// upper bound. The extra zone is slack for the host's copy of the peer's position (up to
+        /// two seconds old from a vanilla client) and of the ZDO's, and for the one round trip in
+        /// which a peer that has just changed its simulation distance and the host disagree.
+        ///
+        /// Pure, so the offline harness can check it against the loops directly.
+        /// </summary>
+        internal static bool ZdoInstancePossible(Vector2s peerZone, Vector2s zdoZone, bool distant, SimulationDistance distance) {
+            int reach = distant ? distance.TotalSimulationDistance : distance.NearSimulationDistance;
+            return InActiveArea(zdoZone, peerZone, Mathf.Max(1, reach) + 1);
+        }
+
+        /// <summary>
         /// A zone's live sector list, or null when the zone holds nothing.
         ///
         /// Mirrors ZDOMan.FindObjects: the index is clamped rather than bounds-checked, with

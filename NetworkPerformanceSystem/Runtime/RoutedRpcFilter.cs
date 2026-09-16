@@ -26,6 +26,14 @@ namespace NetworkPerformanceSystem.Runtime {
     ///     "has an instance". Relaying only to those peers is lossless by construction, for
     ///     vanilla and for any mod RPC that goes through ZNetView.
     ///
+    ///     That superset can be loose. A peer's entry is only dropped when the object changes
+    ///     zone while the peer is away, or is destroyed, so a building piece or ward stays held
+    ///     by everyone who has ever stood near it. Instances are also bounded by distance - see
+    ///     ZoneCompat.ZdoInstancePossible - so holders beyond that are counted, and with Limit
+    ///     Relay By Distance on they are suppressed too. The idea comes from EnRoute's nearby
+    ///     routing; measuring from the object and each peer's own simulation distance, rather
+    ///     than from the sender at a fixed radius, is what keeps it lossless.
+    ///
     ///   * DestroyZDO. The right recipients are the peers that hold a copy of the ZDO - not the
     ///     peers near it: a client that visited an area and left still has the ZDO, and on
     ///     return would instantiate a ghost if it never heard the destroy. ZDOPeer.m_zdos is
@@ -41,11 +49,11 @@ namespace NetworkPerformanceSystem.Runtime {
     ///     reference position is within the active area plus a zone of it.
     ///
     /// Everything else - chat, map pings, server messages, sleep, random events, global keys,
-    /// and any RPC this code does not recognise - is left to vanilla's relay untouched.
+    /// and any RPC this code does not recognise - is relayed to everyone as vanilla does. The
+    /// deliveries this class does make go through RelaySend, which is vanilla's Invoke unless
+    /// Relay Send Reuse (M19) is on.
     /// </summary>
     internal static class RoutedRpcFilter {
-
-        private const string RoutedRpcMethod = "RoutedRPC";
 
         private static readonly int DestroyZdoHash = "DestroyZDO".GetStableHashCode();
         private static readonly int DamageTextHash = "RPC_DamageText".GetStableHashCode();
@@ -70,6 +78,10 @@ namespace NetworkPerformanceSystem.Runtime {
         // deliveries, which is what the network actually pays for.
 
         internal static long TargetedEvents, TargetedSent, TargetedSuppressed;
+        /// <summary>Deliveries to peers that hold the ZDO but are too far away to have it loaded.
+        /// Counted whether or not the distance limit is on; when it is, they are part of
+        /// TargetedSuppressed as well.</summary>
+        internal static long TargetedOutOfRange;
         internal static long DestroyEvents, DestroySent, DestroySuppressed;
         internal static long PositionalEvents, PositionalSent, PositionalSuppressed;
         internal static long GlobalEvents;
@@ -81,7 +93,8 @@ namespace NetworkPerformanceSystem.Runtime {
 
         /// <summary>
         /// Called from the prefix on ZRoutedRpc.RouteRPC. Returns true when the relay has been
-        /// performed here and vanilla must not run; false to let vanilla relay as it always has.
+        /// performed here and vanilla must not run; false to relay to everyone as vanilla does
+        /// (through RelaySend when M19 is on, otherwise vanilla itself).
         /// Never throws: anything unexpected about a message means "vanilla broadcast".
         /// </summary>
         internal static bool TryRelay(ZRoutedRpc router, ZRoutedRpc.RoutedRPCData data) {
@@ -118,9 +131,18 @@ namespace NetworkPerformanceSystem.Runtime {
             // (AddPeer/RemovePeer are called together), and only this one knows what each peer
             // has been sent. A peer with no ZDOPeer cannot hold the ZDO either way.
             List<ZDOMan.ZDOPeer> peers = zdoMan.m_peers;
-            ZPackage pkg = null;
+            RelaySend.RelayMessage message = new RelaySend.RelayMessage(data);
             int sent = 0;
             int suppressed = 0;
+            int outOfRange = 0;
+
+            // The host's own copy of the object, for the distance test. A host that does not have
+            // it cannot say where it is, and the holder test alone decides - as it always has.
+            ZDO zdo = zdoMan.GetZDO(data.m_targetZDO);
+            bool located = zdo != null;
+            Vector2s zdoZone = located ? zdo.GetSector() : default;
+            bool distant = located && zdo.Distant;
+            bool limitByDistance = located && ValConfig.LimitTargetedRelayByDistance.Value;
 
             for (int i = 0; i < peers.Count; i++) {
                 ZDOMan.ZDOPeer zdoPeer = peers[i];
@@ -129,14 +151,19 @@ namespace NetworkPerformanceSystem.Runtime {
 
                 if (!zdoPeer.m_zdos.ContainsKey(data.m_targetZDO)) { suppressed++; continue; }
 
-                if (pkg == null) { pkg = new ZPackage(); data.Serialize(pkg); }   // serialize once, and only if someone gets it
-                peer.m_rpc.Invoke(RoutedRpcMethod, pkg);
+                if (located && !ZoneCompat.ZdoInstancePossible(ZoneSystem.GetZone(peer.GetRefPos()), zdoZone, distant, ZoneCompat.For(peer))) {
+                    outOfRange++;
+                    if (limitByDistance) { suppressed++; continue; }
+                }
+
+                message.Send(peer);                                           // serialized once, and only if someone gets it
                 sent++;
             }
 
             TargetedEvents++;
             TargetedSent += sent;
             TargetedSuppressed += suppressed;
+            TargetedOutOfRange += outOfRange;
             Record(sent, suppressed);
             return true;
         }
@@ -191,7 +218,7 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             List<ZNetPeer> peers = router.m_peers;
-            ZPackage pkg = null;
+            RelaySend.RelayMessage message = new RelaySend.RelayMessage(data);
             int sent = 0;
             int suppressed = 0;
 
@@ -201,8 +228,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
                 if (!DestroyHolders.Contains(peer.m_uid)) { suppressed++; continue; }
 
-                if (pkg == null) { pkg = new ZPackage(); data.Serialize(pkg); }
-                peer.m_rpc.Invoke(RoutedRpcMethod, pkg);
+                message.Send(peer);
                 sent++;
             }
 
@@ -254,7 +280,7 @@ namespace NetworkPerformanceSystem.Runtime {
             Vector2s zone = ZoneSystem.GetZone(pos);
 
             List<ZNetPeer> peers = router.m_peers;
-            ZPackage pkg = null;
+            RelaySend.RelayMessage message = new RelaySend.RelayMessage(data);
             int sent = 0;
             int suppressed = 0;
 
@@ -272,8 +298,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     continue;
                 }
 
-                if (pkg == null) { pkg = new ZPackage(); data.Serialize(pkg); }
-                peer.m_rpc.Invoke(RoutedRpcMethod, pkg);
+                message.Send(peer);
                 sent++;
             }
 
@@ -328,7 +353,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
         internal static void Reset() {
             ClearDestroySnapshot();
-            TargetedEvents = 0; TargetedSent = 0; TargetedSuppressed = 0;
+            TargetedEvents = 0; TargetedSent = 0; TargetedSuppressed = 0; TargetedOutOfRange = 0;
             DestroyEvents = 0; DestroySent = 0; DestroySuppressed = 0;
             PositionalEvents = 0; PositionalSent = 0; PositionalSuppressed = 0;
             GlobalEvents = 0;

@@ -54,6 +54,7 @@ namespace NetworkPerformanceSystem {
 
         // M7 - routed RPC relay filter
         public static ConfigEntry<bool> EnableRoutedRpcFilter;
+        public static ConfigEntry<bool> LimitTargetedRelayByDistance;
 
         // M12 - station item requests delivered to the current owner
         public static ConfigEntry<bool> EnableStationRpcRouting;
@@ -81,6 +82,15 @@ namespace NetworkPerformanceSystem {
         // M14 - periodic queue drain for mods that wait on a fixed send queue threshold
         public static ConfigEntry<float> QueueDrainIntervalSeconds;
         public static ConfigEntry<int> QueueDrainFloorBytes;
+
+        // M15-M18 - allocation removals on the ZDO network path. All four are byte-identical on
+        // the wire; each is opt-in for its first release.
+        public static ConfigEntry<bool> EnableDeserializeFastPath;
+        public static ConfigEntry<bool> EnablePacketReadFastPath;
+        public static ConfigEntry<bool> EnableSendPackageReuse;
+        public static ConfigEntry<bool> EnableRpcInvokeFastPath;
+        // M19 - routed RPC relay written once per message
+        public static ConfigEntry<bool> EnableRelaySendReuse;
 
         public const string cfgFolder = "NetworkPerformanceSystem";
 
@@ -148,7 +158,7 @@ namespace NetworkPerformanceSystem {
             // that has nothing to do with the network.
             EnableSchedulerFix = BindServerConfig("Send Scheduler", "Enable Scheduler Fix", true,
                 "Send to every peer each tick instead of one peer per rendered frame. Without this the effective per-peer send rate degrades linearly with player count.");
-            SendIntervalSeconds = BindServerConfig("Send Scheduler", "Send Interval Seconds", 0.05f,
+            SendIntervalSeconds = BindServerConfig("Send Scheduler", "Send Interval Seconds", 0.033f,
                 "Seconds between ZDO send rounds. Vanilla is 0.05 (20Hz).", true, 0.02f, 0.2f);
             // Vanilla's one-peer-per-frame is accidentally self-limiting on CPU; servicing every
             // peer per interval is not, and on a large server the send path can eat the whole
@@ -203,6 +213,17 @@ namespace NetworkPerformanceSystem {
             // against the same per-peer send window as ZDO updates.
             EnableRoutedRpcFilter = BindServerConfig("Routed RPC", "Enable Relay Filtering", true,
                 "Relay broadcast RPCs (animation triggers, footsteps, damage numbers, object-destroyed notices, building damage and the like) only to the players that can actually use them, instead of to everyone on the server. A receiving client discards these unless it has the object loaded, so nothing visible changes; on a busy server this removes most of the host's relay traffic and stops it from crowding out ZDO updates. Global messages (chat, pings, events, sleep, server messages) are never filtered.");
+
+            // The filter above sends a ZDO-targeted RPC to every peer that has been sent that ZDO.
+            // The host only forgets that when the object moves to another zone or is destroyed, so
+            // a building piece or ward stays "held" by every player who has ever been near it,
+            // and its RPCs follow them across the map for the rest of the session. A client can
+            // only act on one inside the area it has loaded, which is bounded by its negotiated
+            // simulation distance; one zone of slack covers the host's copy of its position being
+            // up to two seconds old. Counted either way, so nps_stats shows what this would save
+            // before anyone turns it on.
+            LimitTargetedRelayByDistance = BindServerConfig("Routed RPC", "Limit Relay By Distance", true,
+                "Also stop relaying object RPCs (building damage and fragments, ward flashes, animation triggers, footsteps) to players who are too far away to have that object loaded, even if they visited it earlier in the session. The distance used is each player's own simulation distance plus one zone of slack. nps_stats counts how many deliveries this would remove while it is off, so you can see whether it is worth it first. Needs Enable Relay Filtering. A client-side mod that loads more of the world than the server agreed to could miss effects at the edge of its view. Applies immediately.");
 
             // --- M12: station item requests delivered to the current owner ------------------
             // Fermenters, smelters, cooking stations, fireplaces, shield generators and ballistas
@@ -293,6 +314,80 @@ namespace NetworkPerformanceSystem {
             QueueDrainFloorBytes = BindServerConfig("Compatibility", "Queue Drain Floor Bytes", 8192,
                 "Queue level a drain brings the peer down to, in bytes. Must sit below the lowest threshold any installed mod waits for - older ServerSync copies use 10000, current ones and ConditionalConfigSync 20000 - with room for one ZDO of overshoot. Raising it shortens each drain; lowering it makes the dip more certain to be seen.",
                 true, 2048, 20000);
+
+            // ================================================================================
+            // M15-M18: allocation removals on the ZDO network path
+            //
+            // Four separate changes that share one property: none of them alters a single byte on
+            // the wire, a single value in a ZDO, or a single decision the game makes. Each one
+            // removes short-lived objects the game creates and immediately drops on the paths it
+            // runs most often.
+            //
+            // What that buys, stated honestly, because the temptation is to oversell it: Mono's
+            // collector runs more often the faster objects are created. These make it run less
+            // often, which is less CPU spent collecting and a longer interval between the memory
+            // incidents a very large world eventually hits. They do NOT reduce how much is live at
+            // once, which is what that ceiling is actually a function of - that is decided by how
+            // much world has been generated, and no mod changes it. Expect smoother, not immune.
+            //
+            // All four ship OFF. They are byte-identical by construction, but they are IL-level
+            // changes to the hottest paths in the game and they deserve an opt-in soak before
+            // anyone runs them unattended. Turning one on needs a restart for the three that are
+            // wrappers (the mod does not install a hook on a method this hot for a server that
+            // asked for none of it); turning one off applies immediately.
+            // ================================================================================
+
+            // --- M15: ZDO.Deserialize without the per-ZDO delegates -------------------------
+            // ZDO.Deserialize hands seven typed read/write pairs to a generic helper, and
+            // constructs all fourteen delegates before the helper looks at whether that type is
+            // even present in the packet - so a ZDO carrying one float pays for all fourteen.
+            // This is the largest of the four by volume, and a CLIENT feels it more than a server:
+            // a client receives the server's whole stream, a server receives each peer's much
+            // smaller delta.
+            EnableDeserializeFastPath = BindServerConfig("Allocation", "Enable ZDO Deserialize Fast Path", true,
+                "Read a received ZDO's fields directly instead of through the fourteen delegates the game allocates for every single one, whether or not the packet contains that field type. Identical result: the same fields land in the same tables with the same reserved capacities. This is the biggest of the four allocation settings and the one clients benefit from most. Needs a restart to turn on; turns off immediately.");
+
+            // --- M16: ZPackage.ReadPackage(ref) straight into the target --------------------
+            // Reads a fresh byte[] and then copies it into the target's stream. One throwaway
+            // array and one redundant copy, at the single call site in ZDOMan.RPC_ZDOData - which
+            // is once per received ZDO, the same rate as M15.
+            EnablePacketReadFastPath = BindServerConfig("Allocation", "Enable Packet Read Fast Path", true,
+                "Read each incoming ZDO's payload straight into the buffer that is about to hold it, instead of into a temporary array that is copied across and thrown away. Same bytes, same length, same read position - one array and one copy fewer per received ZDO. Pairs with the ZDO Deserialize setting above; both sit in the same method. Needs a restart to turn on; turns off immediately.");
+
+            // --- M17: reuse the two packages ZDOMan.SendZDOs builds -------------------------
+            // A ZPackage is a MemoryStream, a BinaryWriter and a BinaryReader, and the outer one
+            // then grows to packet size by doubling - so two per call is roughly twenty objects,
+            // most of them discarded buffers. Both are fully copied out before the call returns
+            // (into ZRpc's own package, then again into the socket's send queue), so nothing
+            // downstream can see that the instance was reused.
+            //
+            // The one assumption in the whole set lives here: that no other mod hooks ZRpc.Invoke
+            // and keeps the package for a later frame. Nothing known does, and it is an odd thing
+            // to do, but it is why this one is separately switchable.
+            EnableSendPackageReuse = BindServerConfig("Allocation", "Enable Send Package Reuse", true,
+                "Reuse the two packet buffers the send path builds, instead of constructing and discarding both on every send to every peer. The bytes sent are identical - both buffers are copied out before the send returns. Turn this off if another networking mod holds on to an outgoing packet past the frame it was sent in; nothing known does. Applies immediately, no restart needed.");
+
+            // --- M18: typed RPC dispatch instead of DynamicInvoke ---------------------------
+            // Every inbound RPC is delivered through DynamicInvoke, which walks the signature
+            // reflectively and boxes its arguments, after GetParameters() has allocated a fresh
+            // array and the argument list has been built and copied. The common shape by a wide
+            // margin - ZDOData, RoutedRPC and most mod RPCs - is (ZRpc, ZPackage), which can be
+            // called directly. Anything else falls through to the game's own path untouched.
+            //
+            // This is the widest of the four: it is on the delivery path of every RPC handler in
+            // the game, including ones registered by Jotunn and by other mods. It is also the
+            // largest CPU saving of the four, since a reflective invoke is not cheap.
+            EnableRpcInvokeFastPath = BindServerConfig("Allocation", "Enable RPC Invoke Fast Path", true,
+                "Call an incoming RPC's handler directly when its signature is the common one, instead of going through reflection for every message. Handlers with any other shape are untouched and keep using the game's own path. Handler exceptions are still reported exactly as before. This is the widest-reaching of the four settings - it is on the delivery path of every RPC in the game, mods' included - and also the largest CPU saving. Needs a restart to turn on; turns off immediately.");
+
+            // --- M19: routed RPC relay written once per message -----------------------------
+            // The host relays every broadcast RPC by building a fresh package for the message and
+            // then calling ZRpc.Invoke per recipient, which copies the whole message again for each
+            // one before the socket takes its own copy. The frame Invoke builds is identical for
+            // every recipient, so it is written once and handed to each socket. The cost scales
+            // with events x players, the same as the relay traffic the filter above is about.
+            EnableRelaySendReuse = BindServerConfig("Allocation", "Enable Relay Send Reuse", true,
+                "Write each relayed RPC (footsteps, hits, damage numbers, chat and the rest) once and hand the same bytes to every player it goes to, instead of rebuilding and re-copying the whole message for each one. The bytes sent are identical. Host-side only. Relayed messages no longer pass through ZRpc.Invoke, so a mod that watches Invoke to count traffic will not see them; nothing known does. Stands down alongside EnRoute or BetterZeeRouter. Applies immediately, no restart needed.");
 
             // Steam's networking config is process-global and re-writable at any time, so these
             // four take effect on edit rather than needing a restart. The two Send Window entries

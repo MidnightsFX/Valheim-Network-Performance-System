@@ -54,6 +54,47 @@ namespace NetworkPerformanceSystem.Patches {
         }
 
         /// <summary>
+        /// Name-only match on a parameterless construction. Same contract as TargetsMemberNamed -
+        /// the declaring type is matched by name, not by reference - because a ctor's own name is
+        /// always ".ctor" and says nothing about what is being built. Arity is part of the anchor:
+        /// ZPackage has five constructors and only the empty one is the allocation we replace.
+        /// </summary>
+        internal static bool IsNewObj(CodeInstruction code, string declaringTypeName, int argumentCount) {
+            return code.opcode == OpCodes.Newobj
+                   && code.operand is ConstructorInfo ctor
+                   && ctor.DeclaringType != null
+                   && ctor.DeclaringType.Name == declaringTypeName
+                   && ctor.GetParameters().Length == argumentCount;
+        }
+
+        internal static int CountNewObj(List<CodeInstruction> codes, string declaringTypeName, int argumentCount) {
+            int count = 0;
+            for (int i = 0; i < codes.Count; i++) {
+                if (IsNewObj(codes[i], declaringTypeName, argumentCount)) { count++; }
+            }
+            return count;
+        }
+
+        /// <summary>
+        /// DescribeNeighbours for construction anchors. Every constructor of the named type,
+        /// whatever its arity, paired with the instruction AFTER it - for a newobj that is the
+        /// store telling us which local the new object became, which is the fact that identifies
+        /// the site. Arity is printed because a count that came out wrong is usually a constructor
+        /// overload changing, not the site moving.
+        /// </summary>
+        internal static string DescribeNewObj(List<CodeInstruction> codes, string declaringTypeName) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < codes.Count; i++) {
+                if (!(codes[i].operand is ConstructorInfo ctor) || codes[i].opcode != OpCodes.Newobj) { continue; }
+                if (ctor.DeclaringType == null || ctor.DeclaringType.Name != declaringTypeName) { continue; }
+                if (sb.Length > 0) { sb.Append("; "); }
+                sb.Append($"newobj {ctor.DeclaringType.Name}..ctor/{ctor.GetParameters().Length}");
+                if (i + 1 < codes.Count) { sb.Append(" -> ").Append(Describe(codes[i + 1])); }
+            }
+            return sb.Length > 0 ? sb.ToString() : "no construction of " + declaringTypeName + " in the method";
+        }
+
+        /// <summary>
         /// One entry per reference to any of the named members, each paired with the instruction
         /// before it - the operand the anchors expect to be a constant. Logged when an anchor
         /// misses: "found 0" says nothing about what the game actually has there, and that is the

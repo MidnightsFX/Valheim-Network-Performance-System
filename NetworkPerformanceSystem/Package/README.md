@@ -39,10 +39,11 @@ someone who did not have a problem.
 | **Send scheduler fix** | Vanilla services one peer per rendered frame, so the advertised 20Hz silently becomes ~5.5Hz at ten players. This sends to everyone each tick. |
 | **Live position reporting** | Vanilla reports your position to the server only every 2 seconds, and the server uses it to decide both what to send you and who owns what. A 12-byte side channel keeps it current. |
 | **Latency compensation** | Draws other players' creatures where they *are*, not where they were when the packet left. This is the one you feel. |
-| **Relay filtering** | Vanilla relays every footstep, swing, damage number and destroyed object to every player on the server, who then discards it unless they can see it. The host now relays only to the players who can. Nothing visible changes; on a busy server this is most of the relay traffic. |
+| **Relay filtering** | Vanilla relays every footstep, swing, damage number and destroyed object to every player on the server, who then discards it unless they can see it. The host now relays only to the players who can. Nothing visible changes; on a busy server this is most of the relay traffic. The opt-in `Limit Relay By Distance` goes further for objects a player walked past earlier in the session — the host otherwise keeps relaying a base's building damage to everyone who ever visited it — and `nps_stats` counts what it would save before you turn it on. |
 | **Station requests reach the owner** | Putting an item into a fermenter, smelter, cooking station, fireplace, shield generator or ballista removes it from your inventory and then asks *the owner* to account for it — the owner as your copy of the world names it, with no acknowledgement if that player has walked off, logged out, or just lost ownership. The host now delivers the request to whoever owns the object right now, hands ownership to you first if nobody present does, and waits for the new owner to be told before forwarding. No item is lost to a stale owner, and players do not need the mod for it. |
 | **Configurable player limit** | Vanilla is hard-wired to 10. Set your own — and it is set in all four places the game keeps the number: the check that enforces it, the Steam listing and the crossplay lobby the server browser reads its `x / y` from, and the crossplay Party network, which has no UI at all and is the lowest ceiling of the four. |
 | **Configurable timeouts** | Vanilla gives up on a quiet connection after 30 seconds, which is not enough for a slow link mid-join. Raise it — in both places the game times out, since the shorter one is what actually fires. |
+| **Allocation relief** *(opt-in)* | Five changes that remove short-lived objects from the network path. None of them alters a byte on the wire or a value in a ZDO; what they reduce is how often the garbage collector has to run.<br>• **ZDO Deserialize** — reads a received ZDO's fields directly, instead of through the fourteen delegates the game allocates for every one whether the packet contains that field type or not. The largest of the four, and clients gain more than servers.<br>• **Packet Read** — reads each incoming payload straight into the buffer about to hold it, not into a temporary array that is copied across and thrown away.<br>• **Send Package Reuse** — reuses the two packet buffers the send path builds, rather than constructing and discarding both on every send to every peer.<br>• **RPC Invoke** — calls an incoming RPC's handler directly when its signature is the common one, instead of going through reflection for every message. The largest CPU saving of the four ZDO-path changes.<br>• **Relay Send Reuse** — the host writes each relayed RPC once and hands the same bytes to every player it goes to, instead of rebuilding and re-copying the whole message for each one. Host-only; applies without a restart.<br>All five ship **off** — see "Known limitations" for what they are and are not worth. |
 | **`nps_stats`** | Per-peer RTT, window size, and how often peers are being starved. Open to anyone. Run `nps_stats_collect` (needs `devcommands`, since sampling costs a Steam call per peer per tick), play, then `nps_stats`. |
 
 ## Installing
@@ -112,6 +113,26 @@ Works on dedicated servers and on player-hosted games.
   `Queue Drain Interval Seconds` - a few percent of throughput, only while that peer is backlogged. If
   a mod with its own threshold still times out, lower `Queue Drain Floor Bytes` or the interval;
   `nps_stats` shows both limits and how often the drain ran.
+- The `Allocation` settings are **churn reductions, not a fix for running out of memory**, and it is
+  worth being precise about the difference. Mono's collector runs more often the faster objects are
+  created, so removing allocations from the ZDO path means fewer collections and less CPU spent on
+  each one. It does **not** reduce how much is live at any moment - on a very large world that is
+  millions of field tables, one or two per ZDO, and it is a function of how much world has been
+  generated. No mod changes that, and it is what the ceiling is actually set by. If your server is
+  hitting a memory wall, these lengthen the interval between incidents and make the server cheaper
+  to run in between; they do not remove the wall. Reducing generated world area is what does that.
+- All five `Allocation` settings ship **off**. They are byte-identical to vanilla by construction -
+  same values, same wire format, same order - but they are IL-level changes to the hottest paths in
+  the game, so they are opt-in for their first release: enable them one at a time and soak each.
+  Three of them need a **restart** to turn on, because the mod refuses to install a hook on a method
+  called for every replicated object in every packet unless someone has asked for it; turning any of
+  them off applies immediately. `nps_stats` says which are running, and tells you plainly when one is
+  switched on in the config but was not installed this session.
+- `Limit Relay By Distance` ships **off**. It judges "too far to have the object loaded" from each
+  player's negotiated simulation distance plus one zone of slack, so it is lossless for players whose
+  game loads what the server agreed to. A client-side mod that loads more of the world than that
+  could miss building damage or effects at the very edge of its view. Leave it off and read the
+  "out of range" line in `nps_stats` first: if that number is small, it is not worth turning on.
 
 ## Incompatible with
 
@@ -125,7 +146,8 @@ out at.
 **Verified compatible** (different layers, no overlap): LeanNet, Compress, Scenic. ReturnToSender is
 fine too — it already fixes the scheduler, so that one mechanism stands down and the rest keeps
 working. EnRoute and BetterZeeRouter are fine in the same way: both rework the routed-RPC relay, so
-the relay-filtering mechanism stands down when either is present and everything else keeps working.
+relay filtering and relay send reuse stand down when either is present and everything else keeps
+working.
 Valheim Plus is fine too: it has its own player limit, so this mod's `Player Limit` settings are
 ignored when it is installed and V+'s `maxPlayers` is the one in force.
 

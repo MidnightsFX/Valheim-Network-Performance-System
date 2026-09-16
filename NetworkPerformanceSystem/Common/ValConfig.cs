@@ -78,6 +78,10 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<int> ConnectionTimeoutSeconds;
         public static ConfigEntry<int> LoadingTimeoutSeconds;
 
+        // M14 - periodic queue drain for mods that wait on a fixed send queue threshold
+        public static ConfigEntry<float> QueueDrainIntervalSeconds;
+        public static ConfigEntry<int> QueueDrainFloorBytes;
+
         public const string cfgFolder = "NetworkPerformanceSystem";
 
         public ValConfig(ConfigFile cf) {
@@ -273,6 +277,23 @@ namespace NetworkPerformanceSystem {
                 "The longer allowance the game already gives itself while a crossplay peer is joining and the world is being transferred, in seconds. 90 is vanilla. A slow client can spend minutes here on a large world, and this is the timeout that ends the join when it does. Never applied below 'Connection Timeout Seconds' - a loading peer is not given less slack than an idle one, whatever this is set to.",
                 true, 30, 900);
 
+            // --- M13/M14: fixed third-party send queue thresholds ---------------------------
+            // Jotunn's CustomRPC, ServerSync and every mod bundling it, ConditionalConfigSync and
+            // others all wait, before sending, for the peer's socket send queue to fall under a
+            // fixed 10000-20000 bytes, and disconnect the peer after 30 seconds if it never does.
+            // That was sized against vanilla, which never lets the queue past ~10 KB. On a Steam
+            // socket the queue figure includes bytes in flight, so the M2 window IS the standing
+            // queue for a backlogged peer, and past ~100ms RTT it sits above their threshold for
+            // as long as the backlog lasts. Jotunn's threshold is a static field and is raised to
+            // sit above the window (JotunnSendQueue); the others have theirs compiled in, so for
+            // them the queue is periodically brought under it instead.
+            QueueDrainIntervalSeconds = BindServerConfig("Compatibility", "Queue Drain Interval Seconds", 8f,
+                "Some mods (ServerSync and every mod bundling it, ConditionalConfigSync) wait for a peer's socket send queue to fall under a fixed 10000-20000 bytes before sending, and disconnect that peer after 30 seconds if it never does. A latency-sized send window can legitimately keep more than that in flight, so every this-many seconds a peer whose queue has stayed above 'Queue Drain Floor Bytes' has its ZDO sends held at that floor for a fraction of a second - long enough for those mods to get their packet out. Costs a few percent of throughput, and only while a peer is backlogged; an idle peer is never touched. Must stay well under 30. 0 disables the drain. Jotunn's own limit is handled separately and needs no drain.",
+                false, 0f, 25f);
+            QueueDrainFloorBytes = BindServerConfig("Compatibility", "Queue Drain Floor Bytes", 8192,
+                "Queue level a drain brings the peer down to, in bytes. Must sit below the lowest threshold any installed mod waits for - older ServerSync copies use 10000, current ones and ConditionalConfigSync 20000 - with room for one ZDO of overshoot. Raising it shortens each drain; lowering it makes the dip more certain to be seen.",
+                true, 2048, 20000);
+
             // Steam's networking config is process-global and re-writable at any time, so these
             // four take effect on edit rather than needing a restart. The two Send Window entries
             // are here as well because the coupling warning compares them against the transport
@@ -292,10 +313,19 @@ namespace NetworkPerformanceSystem {
             ConnectTimeoutSeconds.SettingChanged += OnConnectionTimeoutSettingChanged;
             ConnectionTimeoutSeconds.SettingChanged += OnConnectionTimeoutSettingChanged;
             LoadingTimeoutSeconds.SettingChanged += OnConnectionTimeoutSettingChanged;
+
+            // Jotunn's CustomRPC limit is derived from the window ceiling, so it follows these two
+            // - including the edit Jotunn makes on a client when the server's values arrive at join.
+            EnableSendWindowSizing.SettingChanged += OnJotunnQueueSettingChanged;
+            SendWindowMaxBytes.SettingChanged += OnJotunnQueueSettingChanged;
         }
 
         private static void OnSteamTransportSettingChanged(object sender, EventArgs e) {
             Runtime.SteamTransport.OnConfigChanged();
+        }
+
+        private static void OnJotunnQueueSettingChanged(object sender, EventArgs e) {
+            Runtime.JotunnSendQueue.OnConfigChanged();
         }
 
         private static void OnConnectionTimeoutSettingChanged(object sender, EventArgs e) {

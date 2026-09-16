@@ -130,6 +130,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendLinkPressure(sb);
             AppendTransport(sb);
             AppendTimeouts(sb);
+            AppendThirdPartyThresholds(sb);
             AppendScheduler(sb);
             AppendSyncListCache(sb);
             AppendRoutedRpc(sb);
@@ -172,6 +173,8 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.SyncListCache: return ValConfig.EnableSyncListCache.Value;
                 case Mechanism.ConnectionTimeout: return ValConfig.EnableConnectionTimeoutTuning.Value;
                 case Mechanism.StationRpcRouting: return ValConfig.EnableStationRpcRouting.Value;
+                case Mechanism.JotunnQueueLimit: return ValConfig.EnableSendWindowSizing.Value;
+                case Mechanism.QueueDrain: return ValConfig.EnableSendWindowSizing.Value && ValConfig.QueueDrainIntervalSeconds.Value > 0f;
                 default: return true;
             }
         }
@@ -326,6 +329,60 @@ namespace NetworkPerformanceSystem.Runtime {
             } else if (NpsEnv.IsHost() && ValConfig.ConnectionTimeoutSeconds.Value > ConnectionTimeout.VanillaRpcTimeoutSeconds) {
                 sb.AppendLine("  note: a peer that is genuinely gone holds its slot, and ownership of everything it was");
                 sb.AppendLine("  simulating, for that long. Objects an absent owner holds do not move.");
+            }
+        }
+
+        /// <summary>
+        /// M13/M14 - the two answers to mods that wait on a fixed send queue size. Jotunn's limit
+        /// is printed as read back from its field, so a Jotunn update that renamed it shows here
+        /// as "not applied" rather than as a mystery 30-second disconnect. The drain rows are the
+        /// cost side: how often a backlogged peer was briefly held, and for how long.
+        /// </summary>
+        private static void AppendThirdPartyThresholds(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Third-party send queue thresholds:");
+
+            if (JotunnSendQueue.Active) {
+                string derivation = ValConfig.EnableSendWindowSizing.Value
+                    ? $"Max Window Bytes {ValConfig.SendWindowMaxBytes.Value} + {JotunnSendQueue.HeadroomBytes} headroom"
+                    : "send window sizing is off; Jotunn's own value";
+                sb.AppendLine($"  Jotunn CustomRPC   {JotunnSendQueue.EffectiveLimit} bytes (Jotunn default {JotunnSendQueue.JotunnDefault}; {derivation})");
+            } else {
+                string reason = PatchGuard.GetDisableReason(Mechanism.JotunnQueueLimit);
+                sb.AppendLine($"  Jotunn CustomRPC   not applied: {reason ?? "not started"}");
+            }
+
+            if (!QueueDrain.Enabled) {
+                string drainReason = PatchGuard.GetDisableReason(Mechanism.QueueDrain);
+                bool sizing = PatchGuard.IsActive(Mechanism.SendWindow) && ValConfig.EnableSendWindowSizing.Value;
+                if (drainReason != null) {
+                    sb.AppendLine($"  queue drain        stood down: {drainReason}");
+                } else {
+                    sb.AppendLine(sizing
+                        ? "  queue drain        off (Queue Drain Interval Seconds is 0)"
+                        : "  queue drain        off (vanilla window - nothing to drain)");
+                }
+                return;
+            }
+
+            sb.AppendLine($"  queue drain        every {ValConfig.QueueDrainIntervalSeconds.Value:F0}s to {QueueDrain.FloorBytes / 1024f:F1}KB, for mods with the threshold compiled in (ServerSync, ConditionalConfigSync)");
+
+            List<ZNetPeer> peers = ZNet.instance.GetPeers();
+            bool any = false;
+            for (int i = 0; i < peers.Count; i++) {
+                long uid = peers[i].m_uid;
+                if (!QueueDrain.TryGetState(uid, out QueueDrain.State state)) { continue; }
+                if (!any) {
+                    sb.AppendLine("  name                 drains  held ticks  aborted  last drain");
+                    any = true;
+                }
+                string name = string.IsNullOrEmpty(peers[i].m_playerName) ? "(connecting)" : peers[i].m_playerName;
+                string last = state.Drains > 0 && state.LastDrainSeconds > 0f ? $"{state.LastDrainSeconds:F2}s" : "-";
+                string now = state.Draining ? " (draining)" : "";
+                sb.AppendLine($"  {Pad(name, 20)} {Pad(state.Drains.ToString(), 7)} {Pad(state.HeldTicks.ToString(), 11)} {Pad(state.Aborted.ToString(), 8)} {last}{now}");
+            }
+            if (!any) {
+                sb.AppendLine("  (no peer has held a window above vanilla yet - nothing to drain)");
             }
         }
 

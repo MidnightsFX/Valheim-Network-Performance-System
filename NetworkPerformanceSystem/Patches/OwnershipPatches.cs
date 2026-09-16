@@ -49,6 +49,7 @@ namespace NetworkPerformanceSystem.Patches {
             OwnershipArbiter.Reset();
             OwnershipPolicy.Reset();
             SendWindow.Reset();
+            QueueDrain.Reset();
             SendSchedulerPatches.Reset();
             RoutedRpcFilter.Reset();
             StationRpcRouter.Reset();

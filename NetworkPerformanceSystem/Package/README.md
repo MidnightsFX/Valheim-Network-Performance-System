@@ -103,6 +103,15 @@ Works on dedicated servers and on player-hosted games.
   host upload and CPU against every other player. `Frame Budget Ms` and the Steam transport
   ceiling below are what decide whether a bigger number is actually playable - read the two
   bullets above before setting one.
+- Some mods wait for a peer's socket send queue to fall under a fixed byte count before they send
+  (Jotunn's `CustomRPC`, ServerSync and every mod bundling it, ConditionalConfigSync) and disconnect
+  the peer after 30 seconds if it never does. That number was sized against vanilla; a latency-sized
+  window legitimately keeps more in flight past ~100 ms RTT. Jotunn's limit is a field, and it is
+  raised automatically to `Max Window Bytes` plus 20000 on both ends. The others have theirs compiled
+  in, so the `Compatibility` settings briefly bring a backlogged peer's queue under it every
+  `Queue Drain Interval Seconds` - a few percent of throughput, only while that peer is backlogged. If
+  a mod with its own threshold still times out, lower `Queue Drain Floor Bytes` or the interval;
+  `nps_stats` shows both limits and how often the drain ran.
 
 ## Incompatible with
 

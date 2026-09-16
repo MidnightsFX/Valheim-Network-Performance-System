@@ -65,6 +65,11 @@ namespace NetworkPerformanceSystem.Runtime {
                 Mathf.Max(VanillaWindowBytes, ValConfig.SendWindowMaxBytes.Value));
 
             LastWindow[uid] = window;
+
+            // M14 - a drain in progress caps this peer at the compatibility floor. Read-only here:
+            // QueueDrain.Observe, in a prefix on the same method, is what moves the state. The
+            // undrained window is what was stored above, so the peer table keeps showing it.
+            if (QueueDrain.IsDraining(uid)) { return Mathf.Min(window, QueueDrain.FloorBytes); }
             return window;
         }
 

@@ -21,6 +21,8 @@ namespace NetworkPerformanceSystem.Runtime {
         PlayerLimit,    // M10    - ZNet.RPC_PeerInfo configurable player cap
         ConnectionTimeout, // M11 - ZRpc.SetLongTimeout + Steam TimeoutInitial/TimeoutConnected
         StationRpcRouting, // M12 - ZRoutedRpc.RPC_RoutedRPC delivery of station item requests to the current owner
+        JotunnQueueLimit,  // M13 - Jotunn.Entities.CustomRPC.MaximumSendQueueSize kept above the M2 window ceiling
+        QueueDrain,        // M14 - ZDOMan.SendZDOs periodic queue drain for mods with a fixed send queue threshold
     }
 
     /// <summary>

@@ -1,5 +1,10 @@
 # Changelog
 
+**1.4.2**
+- Fixes Jotunn-based mods (Jotunn's own config sync included) disconnecting a peer with a 30 second "sending timeout" on higher-latency links (#3)
+- New `Compatibility` section for mods with that threshold compiled in (ServerSync and mods bundling it, ConditionalConfigSync): a peer in sustained backlog has its queue briefly brought under the threshold every `Queue Drain Interval Seconds` so they can get their packet out.
+	- `nps_stats` gains a "Third-party send queue thresholds" block showing Jotunn's limit as read back from Jotunn and the drain counters per peer.
+
 **1.4.1**
 - Fixes the player limit not applying to crossplay on dedicated servers.
 - The Steam server browser now shows the configured limit for dedicated servers.

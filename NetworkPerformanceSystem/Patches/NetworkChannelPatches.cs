@@ -181,6 +181,7 @@ namespace NetworkPerformanceSystem.Patches {
             if (netPeer == null) { return; }
             LatencyRegistry.ForgetPeer(netPeer.m_uid);
             SendWindow.Forget(netPeer.m_uid);
+            QueueDrain.Forget(netPeer.m_uid);
             NetworkStats.ForgetPeer(netPeer.m_uid);
             SyncListCache.ForgetPeer(netPeer.m_uid);
         }

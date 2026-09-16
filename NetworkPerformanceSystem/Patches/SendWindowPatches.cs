@@ -13,6 +13,12 @@ namespace NetworkPerformanceSystem.Patches {
     /// direction, against the same fixed window. A distant client's uploads are throttled by
     /// exactly the same mechanism, and when it saturates they send nothing at all - their own
     /// character and every creature they own freeze for everybody else.
+    ///
+    /// M14 rides on the same method. The queue size SendZDOs reads on its first line is handed
+    /// to QueueDrain.Observe before either window site runs, so the drain sees every send attempt
+    /// - vanilla SendZDOToPeers2, our scheduler, ReturnToSender's loop, clients - without a second
+    /// Steam status call per peer per tick, which is the cost this mod's own diagnostics prefix
+    /// goes out of its way not to pay.
     /// </summary>
     [HarmonyPatch]
     internal static class SendWindowPatches {
@@ -22,6 +28,9 @@ namespace NetworkPerformanceSystem.Patches {
 
         private const int ExpectedWindowConstants = 2;
         private const int ExpectedMinPackageConstants = 1;
+        private const int ExpectedQueueReads = 1;
+
+        private const string QueueReadName = "GetSendQueueSize";
 
         [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.SendZDOs))]
         [HarmonyTranspiler]
@@ -39,13 +48,26 @@ namespace NetworkPerformanceSystem.Patches {
                     $"ZDOMan.SendZDOs does not have the expected IL shape (found {windowConstants} x {VanillaWindowConstant} " +
                     $"and {minPackageConstants} x {VanillaMinPackageConstant}, expected {ExpectedWindowConstants} and {ExpectedMinPackageConstants}). " +
                     "Either the game updated or another mod rewrote this method first. Send windows stay at vanilla.");
+                PatchGuard.Disable(Mechanism.QueueDrain, "the send window is not applied, so there is no widened queue to drain.");
                 return codes;
+            }
+
+            // M14's anchor is checked on its own: a missing queue read stands the drain down and
+            // leaves the window alone, because the window does not depend on it.
+            int queueReads = CountQueueReads(codes);
+            bool observeQueue = queueReads == ExpectedQueueReads;
+            if (!observeQueue) {
+                PatchGuard.Disable(Mechanism.QueueDrain,
+                    $"ZDOMan.SendZDOs reads the send queue {queueReads} times, expected {ExpectedQueueReads}. " +
+                    "The periodic queue drain has nowhere to observe from and stays off; the send window itself is unaffected.");
             }
 
             System.Reflection.MethodInfo windowFor =
                 AccessTools.Method(typeof(SendWindow), nameof(SendWindow.For));
+            System.Reflection.MethodInfo observe =
+                AccessTools.Method(typeof(QueueDrain), nameof(QueueDrain.Observe));
 
-            List<CodeInstruction> patched = new List<CodeInstruction>(codes.Count + ExpectedWindowConstants);
+            List<CodeInstruction> patched = new List<CodeInstruction>(codes.Count + ExpectedWindowConstants + 4);
             int rewritten = 0;
 
             foreach (CodeInstruction code in codes) {
@@ -61,13 +83,37 @@ namespace NetworkPerformanceSystem.Patches {
                     patched.Add(loadPeer);
                     patched.Add(new CodeInstruction(OpCodes.Call, windowFor));
                     rewritten++;
+                } else if (observeQueue && IsQueueRead(code)) {
+                    // Keep the read, then hand a copy of its result to the drain before the method
+                    // stores it: `dup; ldarg.1; ldarg.2; call QueueDrain.Observe(queue, peer, flush)`.
+                    // Stack-neutral, so the stloc that follows sees exactly what it did before, and
+                    // nothing goes in front of the call, so its labels stay where they were.
+                    patched.Add(code);
+                    patched.Add(new CodeInstruction(OpCodes.Dup));
+                    patched.Add(new CodeInstruction(OpCodes.Ldarg_1));
+                    patched.Add(new CodeInstruction(OpCodes.Ldarg_2));
+                    patched.Add(new CodeInstruction(OpCodes.Call, observe));
                 } else {
                     patched.Add(code);
                 }
             }
 
-            Logger.LogInfo($"Send window sizing active ({rewritten} sites rewritten in ZDOMan.SendZDOs).");
+            Logger.LogInfo($"Send window sizing active ({rewritten} sites rewritten in ZDOMan.SendZDOs" +
+                           (observeQueue ? ", queue drain observing)." : ")."));
             return patched;
+        }
+
+        private static bool IsQueueRead(CodeInstruction code) {
+            return (code.opcode == OpCodes.Callvirt || code.opcode == OpCodes.Call)
+                   && IlMatch.TargetsMemberNamed(code, QueueReadName);
+        }
+
+        private static int CountQueueReads(List<CodeInstruction> codes) {
+            int count = 0;
+            for (int i = 0; i < codes.Count; i++) {
+                if (IsQueueRead(codes[i])) { count++; }
+            }
+            return count;
         }
     }
 }

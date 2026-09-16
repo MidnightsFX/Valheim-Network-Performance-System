@@ -35,7 +35,7 @@ namespace NetworkPerformanceSystem
     {
         public const string PluginGUID = "MidnightsFX.NetworkPerformanceSystem";
         public const string PluginName = "NetworkPerformanceSystem";
-        public const string PluginVersion = "1.4.1";
+        public const string PluginVersion = "1.4.2";
 
         internal static ManualLogSource Log;
         internal static Harmony HarmonyInstance;
@@ -52,6 +52,10 @@ namespace NetworkPerformanceSystem
             // loads the PlayFab assemblies, and a failure there inside PatchAll would take the
             // rest of the assembly's patches with it. See PlayerLimitPatches.
             Patches.PlayerLimitPatches.ApplyPlayFabCapacityPatch(HarmonyInstance);
+            // M13 is a reflection write into Jotunn rather than a patch, but the value it writes
+            // depends on whether M2 survived PatchAll - so it goes after Harmony and before the
+            // summary, where a stand-down is listed with the rest.
+            JotunnSendQueue.OnStartup();
             PatchGuard.VerifyAfterPatching();
 
             // Configs are not written until after they are all wired up, they exist in memory before this.
@@ -67,6 +71,7 @@ namespace NetworkPerformanceSystem
         }
 
         public void OnDestroy() {
+            JotunnSendQueue.Restore();
             HarmonyInstance?.UnpatchSelf();
         }
     }

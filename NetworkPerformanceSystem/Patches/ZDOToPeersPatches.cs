@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Reflection.Emit;
 using HarmonyLib;
+using NetworkPerformanceSystem.Common;
 
 namespace NetworkPerformanceSystem.Patches;
 
@@ -42,7 +43,7 @@ internal static class ZDOToPeersPatches
         zdoManager.m_sendTimer = 0f;
         List<ZDOMan.ZDOPeer> peers = zdoManager.m_peers;
         int currentPeer = Math.Max(zdoManager.m_nextSendPeer, 0);
-        int stopAtPeer = Math.Min(currentPeer + NetworkTweaks.Instance.PeersPerUpdate.Value, count);
+        int stopAtPeer = Math.Min(currentPeer + ValConfig.PeersPerUpdate.Value, count);
         for (int i = currentPeer; i < stopAtPeer; i++)
         {
             zdoManager.SendZDOs(peers[i], flush: false);

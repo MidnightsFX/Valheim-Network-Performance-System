@@ -27,6 +27,9 @@ namespace NetworkPerformanceSystem {
 
         // Add Server synced config entries under here
 
+        // number of peers to send data to per update
+        public static ConfigEntry<int> PeersPerUpdate; 
+
         // M2/M2c - bandwidth-delay-product send window
         public static ConfigEntry<bool> EnableSendWindowSizing;
         public static ConfigEntry<int> SendWindowTargetRateKBps;
@@ -134,6 +137,13 @@ namespace NetworkPerformanceSystem {
             EnableDebugOverlay = Config.Bind("Client config", "EnableDebugOverlay", false,
                 new ConfigDescription("Show the per-entity latency compensation overlay (owner, estimated staleness, applied displacement).", null,
                 new ConfigurationManagerAttributes { IsAdvanced = true }));
+
+            // --- ReturnToSender Number of Peers Per Update (synced with server) -------------
+            PeersPerUpdate = BindServerConfig(
+                "ZDO Peers", "Peers Per Update", 10, 
+                "Number of peers to sync data to each update tick. Vanilla default is 1. The higher this is the more data needs to be transferred each update tick.",
+                valMin: 1, valMax: 50
+            );
 
             // --- M2/M2c: bandwidth-delay-product send window -------------------------------
             // Vanilla allows a fixed 10240 bytes of in-flight reliable ZDO data per peer.

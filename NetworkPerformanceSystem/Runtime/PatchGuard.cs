@@ -28,6 +28,9 @@ namespace NetworkPerformanceSystem.Runtime {
         SendPacketReuse,   // M17 - ZDOMan.SendZDOs reuses its two packages instead of rebuilding them
         RpcInvokeFastPath, // M18 - ZRpc.RpcMethod<T>.Invoke typed dispatch instead of DynamicInvoke
         RelaySendReuse,    // M19 - ZRoutedRpc.RouteRPC relay written once per message instead of once per recipient
+        ShipHelmOwnership, // M20 - ShipControlls.RPC_RequestControl / Ship.UpdateOwner hand a ship to its helmsman
+        PeerLiveness,      // M21 - per-peer ghost detection from Steam link state plus a stall-aware silence timer
+        GhostWatchdog,     // M22 - client leaves cleanly when the server stops answering
     }
 
     /// <summary>
@@ -51,6 +54,17 @@ namespace NetworkPerformanceSystem.Runtime {
         /// Unlike the checks above this one has to be answered at patch time, so the plugin
         /// declares a soft dependency on it to be sure it is already in PluginInfos by then.</summary>
         internal const string ValheimPlusGUID = "org.bepinex.plugins.valheim_plus";
+
+        /// <summary>
+        /// ClientGhostWatchdog, whose idea M21/M22 build on, does the client half itself - and it
+        /// does it against a timeout of its own (30s by default) rather than against the one in
+        /// force. With M11 raising ZRpc.m_timeout, that means it would log the player out at its
+        /// own number and silently defeat the admin's setting. Two watchdogs on one connection is
+        /// a race with no upside either way, so M22 stands down and leaves the player with the
+        /// behaviour they explicitly installed. M21 - the host half, which that mod does not do -
+        /// is unaffected and keeps running.
+        /// </summary>
+        internal const string ClientGhostWatchdogGUID = "dreamwraith.ClientGhostWatchdog";
 
         private static readonly HashSet<Mechanism> Disabled = new HashSet<Mechanism>();
         private static readonly Dictionary<Mechanism, string> DisableReasons = new Dictionary<Mechanism, string>();

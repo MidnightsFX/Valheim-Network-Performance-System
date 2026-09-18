@@ -130,12 +130,14 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendLinkPressure(sb);
             AppendTransport(sb);
             AppendTimeouts(sb);
+            AppendPeerLiveness(sb);
             AppendThirdPartyThresholds(sb);
             AppendScheduler(sb);
             AppendSyncListCache(sb);
             AppendRoutedRpc(sb);
             AppendStationRpc(sb);
             AppendOwnership(sb);
+            AppendShipHelm(sb);
             AppendExtrapolation(sb);
             AppendAllocationRelief(sb);
 
@@ -181,6 +183,11 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.SendPacketReuse: return AllocationRelief.SendPackageReuseWanted;
                 case Mechanism.RpcInvokeFastPath: return AllocationRelief.RpcInvokeWanted;
                 case Mechanism.RelaySendReuse: return AllocationRelief.RelaySendWanted;
+                case Mechanism.ShipHelmOwnership: return ValConfig.ShipOwnershipFollowsHelmsman.Value;
+                // No toggle of its own: it is the measurement, like RttSampling. What the two
+                // consumers do with it is what the config controls.
+                case Mechanism.PeerLiveness: return true;
+                case Mechanism.GhostWatchdog: return ValConfig.EnableGhostWatchdog.Value;
                 default: return true;
             }
         }
@@ -332,9 +339,60 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  loading phase    {ConnectionTimeout.EffectiveLoadingTimeoutSeconds}s (crossplay joins and world transfer)");
             if (!ConnectionTimeout.Active) {
                 sb.AppendLine("  vanilla (timeout tuning is off)");
-            } else if (NpsEnv.IsHost() && ValConfig.ConnectionTimeoutSeconds.Value > ConnectionTimeout.VanillaRpcTimeoutSeconds) {
+            } else if (NpsEnv.IsHost()
+                       && ValConfig.ConnectionTimeoutSeconds.Value > ConnectionTimeout.VanillaRpcTimeoutSeconds
+                       && !GhostEvictionOn) {
                 sb.AppendLine("  note: a peer that is genuinely gone holds its slot, and ownership of everything it was");
-                sb.AppendLine("  simulating, for that long. Objects an absent owner holds do not move.");
+                sb.AppendLine("  simulating, for that long. Objects an absent owner holds do not move. Turning on");
+                sb.AppendLine("  'Evict Ghost Owners' separates the two, so only the slot is held that long.");
+            }
+        }
+
+        private static bool GhostEvictionOn =>
+            PatchGuard.IsActive(Mechanism.PeerLiveness) && ValConfig.EvictGhostOwners.Value;
+
+        /// <summary>
+        /// M21/M22 - who has stopped answering, and what is being done about it. Printed for both
+        /// roles because the two halves are the same measurement read from opposite ends: a host
+        /// sees which peers went quiet, a client sees whether the server did.
+        /// </summary>
+        private static void AppendPeerLiveness(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Peer liveness:");
+
+            string standDown = PatchGuard.GetDisableReason(Mechanism.PeerLiveness);
+            if (standDown != null) {
+                sb.AppendLine($"  stood down: {standDown}");
+                return;
+            }
+
+            if (NpsEnv.IsHost()) {
+                sb.AppendLine(GhostEvictionOn
+                    ? $"  ghost owners     evicted after {ValConfig.GhostOwnerEvictSeconds.Value:F0}s of silence, or at once on a dead transport"
+                    : "  ghost owners     not evicted (Evict Ghost Owners is off) - an absent owner holds its objects until it is disconnected");
+                sb.AppendLine($"  quiet now        {PeerLiveness.GhostsNow} of {ZNet.instance.GetPeers().Count} peers"
+                              + (PeerLiveness.LocalFaultSuspected ? "  [ALL QUIET - eviction suspended, fault looks local]" : ""));
+                sb.AppendLine($"  session totals   {PeerLiveness.TotalGhosted} went quiet, {PeerLiveness.TotalRecovered} came back, {OwnershipArbiter.TotalGhostsExcluded} ownership exclusions");
+            } else {
+                ZNetPeer server = ZNet.instance.GetServerPeer();
+                long uid = server != null ? server.m_uid : 0L;
+                sb.AppendLine($"  server silence   {PeerLiveness.SilenceSeconds(uid):F1}s (transport says {PeerLiveness.LinkStateOf(uid)})");
+
+                string watchdogDown = PatchGuard.GetDisableReason(Mechanism.GhostWatchdog);
+                if (watchdogDown != null) {
+                    sb.AppendLine($"  watchdog         stood down: {watchdogDown}");
+                } else if (!ValConfig.EnableGhostWatchdog.Value) {
+                    sb.AppendLine("  watchdog         off (EnableGhostWatchdog)");
+                } else {
+                    float deadline = ConnectionTimeout.EffectiveRpcTimeoutSeconds;
+                    sb.AppendLine($"  watchdog         warns at {deadline * 0.5f:F0}s, leaves at {deadline:F0}s{(GhostWatchdog.Warning ? "  [WARNING ACTIVE]" : "")}");
+                    sb.AppendLine($"  session totals   {GhostWatchdog.TotalWarnings} warnings, {GhostWatchdog.TotalTrips} disconnects");
+                }
+            }
+
+            if (PeerLiveness.TotalStallsIgnored > 0) {
+                sb.AppendLine($"  note: {PeerLiveness.TotalStallsIgnored} main-thread stalls were discounted from the silence timers");
+                sb.AppendLine("  rather than counted as peers going quiet.");
             }
         }
 
@@ -569,11 +627,23 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  unowned     {OwnershipArbiter.LastPassUnownedOnEntry} on entry");
             sb.AppendLine($"  rescued     {OwnershipArbiter.LastPassRescued} (had no present owner - never capped)");
             sb.AppendLine($"  released    {OwnershipArbiter.LastPassReleased} (no eligible owner in range)");
-            sb.AppendLine($"  optimised   {OwnershipArbiter.LastPassOptimised} (moved to a lower-latency owner)");
+            sb.AppendLine($"  optimised   {OwnershipArbiter.LastPassOptimised} (moving objects, given to a lower-latency owner)");
+            sb.AppendLine($"  deferred    {OwnershipArbiter.LastPassDeferred} (moving objects only, hit the per-pass cap of {OwnershipArbiter.LastPassCap})");
+
+            // Tier 2 prints a "vanilla" line when it is off rather than nothing at all: a silently
+            // missing mechanism is the worst failure mode for a performance mod, and this block is
+            // where somebody looks to find out whether it is running.
+            if (ValConfig.EnableInteractiveOwnership.Value) {
+                sb.AppendLine($"  interactive {OwnershipArbiter.LastPassInteractiveOptimised} (bushes, rocks, trees given to the nearest player; {OwnershipArbiter.LastPassInteractiveDeferred} deferred, cap {OwnershipArbiter.LastPassInteractiveCap})");
+                sb.AppendLine($"  int. held   {OwnershipArbiter.LastPassInteractiveHeld} (interactable, a nearer player exists, kept by the hold)");
+                sb.AppendLine($"  by distance {OwnershipArbiter.LastPassNearestRescued} of {OwnershipArbiter.LastPassRescued} rescues placed on the nearest player rather than the lowest-latency one");
+            } else {
+                sb.AppendLine("  interactive vanilla (pickables, rocks and trees keep their owner until that player leaves)");
+            }
+
             sb.AppendLine($"  static held {OwnershipArbiter.LastPassStaticHeld} (present owner is not the lowest-latency one; kept because the object does not move)");
-            sb.AppendLine($"  deferred    {OwnershipArbiter.LastPassDeferred} (optimisations only, hit the per-pass cap of {OwnershipArbiter.LastPassCap})");
             sb.AppendLine($"  pass time   {OwnershipArbiter.LastPassMs:F1}ms");
-            sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued}, optimised {OwnershipArbiter.TotalOptimised}");
+            sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued}, optimised {OwnershipArbiter.TotalOptimised}, interactive {OwnershipArbiter.TotalInteractiveOptimised}");
 
             // The failure this split exists to make visible: a growing backlog of ZDOs with no
             // simulator is frozen creatures that cannot be damaged, and it is otherwise invisible
@@ -581,6 +651,23 @@ namespace NetworkPerformanceSystem.Runtime {
             if (OwnershipArbiter.LastPassUnownedOnEntry > OwnershipArbiter.LastPassRescued
                 && OwnershipArbiter.LastPassUnownedOnEntry * 4 > OwnershipArbiter.LastPassConsidered) {
                 sb.AppendLine("  WARNING: unowned backlog exceeds what this pass restored.");
+            }
+        }
+
+        /// <summary>M20. Shown on every role, because a handoff is made by whichever machine owned
+        /// the ship: a client counts its own, and the host's count does not include them. Helm
+        /// rescues are the host's arbitration pass and need it to be running.</summary>
+        private static void AppendShipHelm(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Ship helm (since start):");
+            if (!ShipHelmOwnership.Enabled) {
+                sb.AppendLine("  vanilla (a ship stays with its owner while that player is aboard, whoever is steering)");
+                return;
+            }
+
+            sb.AppendLine($"  {Pad("handed off", 13)} {ShipHelmOwnership.HandedOff} (ships this machine owned, given to the player who took the helm)");
+            if (NpsEnv.IsHost() && PatchGuard.IsActive(Mechanism.Ownership) && ValConfig.EnableOwnershipArbitration.Value) {
+                sb.AppendLine($"  {Pad("helm rescues", 13)} {OwnershipArbiter.TotalHelmRescued} (abandoned ship given to the player at its helm)");
             }
         }
 

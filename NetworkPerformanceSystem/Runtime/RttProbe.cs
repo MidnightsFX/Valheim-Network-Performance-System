@@ -251,6 +251,128 @@ namespace NetworkPerformanceSystem.Runtime {
             return true;
         }
 
+        // -- transport liveness ------------------------------------------------------------
+
+        /// <summary>
+        /// What the transport thinks of a connection, with Steam's ten states collapsed to the
+        /// only distinction a caller can act on.
+        /// </summary>
+        internal enum LinkState {
+            /// <summary>Not a Steam socket, or no interface in this process will answer for it.
+            /// Never evidence of anything - the caller must fall back to its timer.</summary>
+            Unknown,
+            /// <summary>Connecting, finding a route, or connected. All three mean Steam has not
+            /// given up on the link.</summary>
+            Alive,
+            /// <summary>Steam has given up: the peer closed it, a local problem was detected, or
+            /// the handle is in one of the post-mortem states. Authoritative.</summary>
+            Dead,
+        }
+
+        /// <summary>Latched when neither interface will report a connection's state, for the same
+        /// reason _statusUnavailable is: which interfaces this build has cannot change, and a
+        /// liveness read runs per peer per ping.</summary>
+        private static bool _stateUnavailable;
+        private static int _consecutiveStateFailures;
+        private const int MaxConsecutiveStateFailures = 20;
+
+        /// <summary>
+        /// Steam's own verdict on whether a connection is still alive. Never throws.
+        ///
+        /// This exists because the game has no such test. ZSteamSocket.IsConnected answers
+        /// "m_con != Invalid" - whether anyone has called Close(), not whether the link works -
+        /// and ZPlayFabSocket.IsConnected reports true for CONNECTING as well as CONNECTED. So
+        /// vanilla's only real liveness signal is ZRpc's ping timer, which is a static shared
+        /// deadline (see ConnectionTimeout) and cannot be read per peer. Steam has known the
+        /// answer the whole time; nothing asked it.
+        ///
+        /// Read at the ZRpc ping cadence, so this costs one Steam call per peer per second -
+        /// the same order as the RTT probe alongside it.
+        /// </summary>
+        internal static LinkState GetLinkState(ISocket socket) {
+            if (socket == null || _stateUnavailable) { return LinkState.Unknown; }
+            if (!PatchGuard.IsActive(Mechanism.RttSampling)) { return LinkState.Unknown; }
+
+            // PlayFab and anything we cannot see through: no transport verdict is available, and
+            // saying so is the honest answer. PeerLiveness then runs on its silence timer alone,
+            // which is exactly the crossplay case that needs it most.
+            if (!(Unwrap(socket) is ZSteamSocket steam)) { return LinkState.Unknown; }
+
+            // m_con invalid means the socket has already been closed - by Steam's own
+            // OnStatusChanged callback, by ZRpc's ping timeout, or by us shutting down. Vanilla's
+            // UpdatePeers acts on that next frame anyway, so reporting Dead here only ever agrees
+            // with the disconnect already in flight.
+            if (!steam.IsConnected()) { return LinkState.Dead; }
+
+            SteamApi first = _resolved != SteamApi.Unresolved
+                ? _resolved
+                : (NpsEnv.IsDedicated() ? SteamApi.GameServer : SteamApi.Client);
+            SteamApi other = first == SteamApi.Client ? SteamApi.GameServer : SteamApi.Client;
+
+            if (TryState(first, steam, out LinkState state) || TryState(other, steam, out state)) {
+                _consecutiveStateFailures = 0;
+                return state;
+            }
+
+            if (++_consecutiveStateFailures >= MaxConsecutiveStateFailures) {
+                _stateUnavailable = true;
+                Logger.LogInfo("Transport liveness is unavailable on this build - neither Steamworks sockets "
+                               + "interface reports connection state. Ghost detection falls back to its silence "
+                               + "timer alone, which is slower but still correct.");
+            }
+            return LinkState.Unknown;
+        }
+
+        private static bool TryState(SteamApi api, ZSteamSocket steam, out LinkState state) {
+            state = LinkState.Unknown;
+            try {
+                SteamNetConnectionRealTimeStatus_t raw = default;
+                bool ok = api == SteamApi.GameServer
+                    ? StateGameServer(steam, ref raw)
+                    : StateClient(steam, ref raw);
+                if (!ok) { return false; }
+                state = Classify(raw.m_eState);
+                return true;
+            } catch (Exception) {
+                // The interface this process does not have, or a type-load failure. Not counted
+                // against the RTT sampler: this is a liveness read and must never be able to
+                // stand down the mechanisms that carry traffic.
+                return false;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static bool StateGameServer(ZSteamSocket steam, ref SteamNetConnectionRealTimeStatus_t raw) {
+            SteamNetConnectionRealTimeLaneStatus_t lanes = default;
+            return SteamGameServerNetworkingSockets.GetConnectionRealTimeStatus(steam.m_con, ref raw, 0, ref lanes) == EResult.k_EResultOK;
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static bool StateClient(ZSteamSocket steam, ref SteamNetConnectionRealTimeStatus_t raw) {
+            SteamNetConnectionRealTimeLaneStatus_t lanes = default;
+            return SteamNetworkingSockets.GetConnectionRealTimeStatus(steam.m_con, ref raw, 0, ref lanes) == EResult.k_EResultOK;
+        }
+
+        /// <summary>
+        /// Steam's connection states, split into "given up" and "has not given up".
+        ///
+        /// Connecting and FindingRoute are alive on purpose: a link renegotiating its route is
+        /// exactly the case a ghost check must not shoot, and it is also the state a crossplay
+        /// peer sits in legitimately. The negative-valued states (Dead, Linger, FinWait) are the
+        /// post-mortem handles Steam keeps until the app closes them, and None means Steam has no
+        /// record of this handle at all - which, for a handle we hold, is itself terminal.
+        /// </summary>
+        private static LinkState Classify(ESteamNetworkingConnectionState state) {
+            switch (state) {
+                case ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_Connected:
+                case ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_Connecting:
+                case ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_FindingRoute:
+                    return LinkState.Alive;
+                default:
+                    return LinkState.Dead;
+            }
+        }
+
         private static void Fill(SteamNetConnectionRealTimeStatus_t raw, ref LinkStatus status) {
             // Both pending classes are standing queue, so they are summed: unreliable pending is
             // rarer here (Valheim's ZDO traffic is reliable) but it delays the reliable stream
@@ -289,6 +411,7 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static void Reset() {
             _consecutiveDirectFailures = 0;
             _consecutiveStatusFailures = 0;
+            _consecutiveStateFailures = 0;
         }
     }
 }

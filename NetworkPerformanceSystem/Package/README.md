@@ -35,7 +35,9 @@ someone who did not have a problem.
 | | |
 |---|---|
 | **Per-peer send window** | Sized from measured RTT (bandwidth-delay product) instead of a fixed 10 KB. Applies in both directions, so a distant player's *uploads* stop being throttled too. |
-| **Latency-aware ownership** | Assigns each **moving** object (creatures, physics props) to whoever minimises perceived staleness, with hysteresis so ownership cannot thrash. Never takes an object somebody is actively driving, and never moves a stationary object — buildings, containers, stations — away from a player who is still there: those follow vanilla's rules, since moving them gains nothing and races the RPCs that put items into them. |
+| **Latency-aware ownership** | Assigns each **moving** object (creatures, physics props) to whoever minimises perceived staleness, with hysteresis so ownership cannot thrash. Never takes an object somebody is actively driving, and never moves a building, container, crafting station, piece or portal away from a player who is still there: those follow vanilla's rules, since moving them gains nothing and races the RPCs that put items into them. |
+| **Interactables follow the player** | Picking a berry does not happen on your machine — it asks whoever *owns* the bush to do it, and if that is another player the request goes you → server → them and the result comes back the same way. Four network legs for one keypress, which is why a shared berry patch feels sluggish and why the same bush sometimes needs a second press. The same is true of every swing at an ore vein, a rock or a tree. Pickables, ore deposits, rocks, trees, logs and destructibles are now placed on whoever is standing **nearest** them — by distance, not by ping, because nothing about a bush changes between interactions and the only thing that matters is whether the person about to touch it is the one simulating it. An object is never taken from an owner still within reach of it, and never from more than a short distance away, so a patch nobody is near is left alone. Players do not need the mod for it. |
+| **Ships follow the helm** | Vanilla hands a saddle or a cart to whoever takes control of it, but never a ship: whoever owned it keeps simulating it while they are aboard, and the person steering rides relayed motion — choppy, with every throttle change a round trip. Taking the helm now hands the ship to you, the same way the game hands over saddles and carts, and an abandoned ship goes to the player at its helm first. |
 | **Send scheduler fix** | Vanilla services one peer per rendered frame, so the advertised 20Hz silently becomes ~5.5Hz at ten players. This sends to everyone each tick. |
 | **Live position reporting** | Vanilla reports your position to the server only every 2 seconds, and the server uses it to decide both what to send you and who owns what. A 12-byte side channel keeps it current. |
 | **Latency compensation** | Draws other players' creatures where they *are*, not where they were when the packet left. This is the one you feel. |
@@ -43,6 +45,8 @@ someone who did not have a problem.
 | **Station requests reach the owner** | Putting an item into a fermenter, smelter, cooking station, fireplace, shield generator or ballista removes it from your inventory and then asks *the owner* to account for it — the owner as your copy of the world names it, with no acknowledgement if that player has walked off, logged out, or just lost ownership. The host now delivers the request to whoever owns the object right now, hands ownership to you first if nobody present does, and waits for the new owner to be told before forwarding. No item is lost to a stale owner, and players do not need the mod for it. |
 | **Configurable player limit** | Vanilla is hard-wired to 10. Set your own — and it is set in all four places the game keeps the number: the check that enforces it, the Steam listing and the crossplay lobby the server browser reads its `x / y` from, and the crossplay Party network, which has no UI at all and is the lowest ceiling of the four. |
 | **Configurable timeouts** | Vanilla gives up on a quiet connection after 30 seconds, which is not enough for a slow link mid-join. Raise it — in both places the game times out, since the shorter one is what actually fires. |
+| **Ghost peers stop holding the world** | Raising the timeout above used to cost something: a player who is *actually* gone keeps their slot for the whole window, and everything they were simulating stands frozen and unkillable until it expires. Those are two different questions and only one of them should wait 30+ seconds. A peer that stops answering now loses its objects to the players who are actually there after ten seconds — or immediately, if the transport reports the connection dead — while still keeping its slot for the full timeout in case it comes back. Nothing is disconnected any sooner; raising the timeout is simply free now. Host-side; players do not need the mod for it. |
+| **Clean exit from a dead session** | If the server stops answering, you are told at the halfway mark with a countdown, and returned to the menu once it is certain — instead of playing on in a world the server is no longer part of and losing everything you did there. It follows whatever timeout is actually in force rather than adding one of its own, which matters more than it sounds: `ZRpc`'s timeout is a process-wide static that the game itself raises to 90 seconds the moment one crossplay socket is accepted. Client-side, and the one part of this table that needs the mod on *your* machine. |
 | **Allocation relief** *(opt-in)* | Five changes that remove short-lived objects from the network path. None of them alters a byte on the wire or a value in a ZDO; what they reduce is how often the garbage collector has to run.<br>• **ZDO Deserialize** — reads a received ZDO's fields directly, instead of through the fourteen delegates the game allocates for every one whether the packet contains that field type or not. The largest of the four, and clients gain more than servers.<br>• **Packet Read** — reads each incoming payload straight into the buffer about to hold it, not into a temporary array that is copied across and thrown away.<br>• **Send Package Reuse** — reuses the two packet buffers the send path builds, rather than constructing and discarding both on every send to every peer.<br>• **RPC Invoke** — calls an incoming RPC's handler directly when its signature is the common one, instead of going through reflection for every message. The largest CPU saving of the four ZDO-path changes.<br>• **Relay Send Reuse** — the host writes each relayed RPC once and hands the same bytes to every player it goes to, instead of rebuilding and re-copying the whole message for each one. Host-only; applies without a restart.<br>All five ship **off** — see "Known limitations" for what they are and are not worth. |
 | **`nps_stats`** | Per-peer RTT, window size, and how often peers are being starved. Open to anyone. Run `nps_stats_collect` (needs `devcommands`, since sampling costs a Steam call per peer per tick), play, then `nps_stats`. |
 
@@ -51,8 +55,9 @@ someone who did not have a problem.
 **Server-only works.** Vanilla clients get the send window, ownership, scheduler and station-request fixes with
 nothing installed on their end.
 
-**Installing on clients too** adds latency compensation and live position reporting for those
-clients. Mixed groups are fine — benefits are per-player, and a client without the mod behaves
+**Installing on clients too** adds latency compensation, live position reporting and the clean exit
+from a dead session for those clients, and lets a ship they own pass to whoever takes its helm.
+Mixed groups are fine — benefits are per-player, and a client without the mod behaves
 exactly as vanilla. There is **no version lock**: nobody gets kicked for not having it.
 
 Works on dedicated servers and on player-hosted games.
@@ -66,11 +71,32 @@ Works on dedicated servers and on player-hosted games.
   simulates them. That is intended and is a CPU cost to plan for on a busy spawn hub; set
   `Allow Host As Owner` to false to place purely on players. The server never takes ownership of
   zones it has not loaded, because owning something it is not simulating would freeze it.
-- Ownership arbitration only ever re-places creatures and other simulated, moving objects. Stationary
-  objects — pieces, containers, fermenters, smelters, cooking stations — follow vanilla exactly: owned by
-  whoever arrived first, re-owned only when that player leaves. This is deliberate. A stationary object's
-  owner is where the game sends item-insert RPCs, and the game removes the item from your inventory
-  before sending; moving the owner while a player is mid-insert loses the item.
+- Ownership arbitration re-places two kinds of object, by two different rules: creatures and other
+  simulated, moving things go to whoever minimises staleness for everyone watching, and interactables
+  that do not move — pickables, ore deposits, rocks, trees, logs, destructibles — go to whoever is
+  nearest. Everything else — building pieces, containers, fermenters, smelters, cooking stations,
+  portals — follows vanilla exactly: owned by whoever arrived first, re-owned only when that player
+  leaves. That exclusion is deliberate. A station's owner is where the game sends item-insert RPCs,
+  and the game removes the item from your inventory *before* sending, so moving the owner while a
+  player is mid-insert loses the item outright. An interactable spends nothing before its RPC and
+  keeps all its state in the object, so the worst a mistimed move can cost is one keypress.
+- Moving an interactable opens a brief window — one send tick — in which two players' copies of the
+  world disagree about who owns it. If both happen to hit the *same* bush or rock inside that window,
+  it can be picked or damaged twice. Two things make that very unlikely: an object is never taken from
+  an owner standing within reach of it, so for anything picked or hit in melee only one of the two can
+  be interacting at all; and every move is pushed to the players nearby at the front of the next send.
+  Ranged damage into a destructible from well outside that reach is the case not covered. Set
+  `Interactive Object Ownership` to false to keep vanilla's rule for these objects.
+- Requests for these objects are not re-addressed the way station requests are (see above), so a
+  pick or a swing sent to an owner that has just changed still goes nowhere and needs a second press.
+  That matches vanilla's behaviour whenever an owner walks away; extending the re-addressing to cover
+  them is a later change.
+- A ship is handed to its helmsman by the machine that currently owns it, so that machine needs the
+  mod: a listen host, a dedicated server, or a client with it installed. A ship owned by a player
+  without the mod stays with them, as in vanilla. The host never takes a moving ship from its owner
+  itself, because the owner's updates already on their way would drag ownership back. It does give
+  an abandoned ship to the player at its helm. The throttle press that takes the helm can be lost
+  if the ship's former owner receives it just after the handoff; press again.
 - Latency compensation is dead reckoning: an entity that stops abruptly will overshoot slightly and
   settle back. Lower `LatencyCompensationStrength` if you find it distracting; `0` disables it.
 - Requires the Steam backend. Crossplay/PlayFab connections do not report round-trip time, and
@@ -95,11 +121,17 @@ Works on dedicated servers and on player-hosted games.
   and rendered at vanilla by other clients.
 - `Connection Timeout Seconds` is for players who get dropped mid-join or during a hitch on a weak
   link. It does not make a slow connection faster — it stops both ends declaring it dead while it is
-  still working — and it is not free: a player who is genuinely gone now holds their slot, and keeps
-  ownership of everything they were simulating, for that long instead of 30 seconds, and objects an
-  absent owner holds do not move. Size it to the worst connection you actually want to keep. The one
-  timeout a server cannot set for a client is `Connect Timeout Seconds`, which covers the handshake
-  before anything has been synced — whoever cannot get connected has to raise that one themselves.
+  still working. Its old cost, that a player who is genuinely gone kept ownership of everything they
+  were simulating for the whole window, is what `Evict Ghost Owners` now removes: the slot is still
+  held, the objects are not. What remains is the slot itself, so on a full server a long timeout
+  still means a departed player's place takes that long to free up. The one timeout a server cannot
+  set for a client is `Connect Timeout Seconds`, which covers the handshake before anything has been
+  synced — whoever cannot get connected has to raise that one themselves.
+- Ghost detection is at its sharpest on Steam sockets, where the transport is asked directly and
+  answers immediately. Crossplay (PlayFab) peers report nothing, so they are judged on silence alone
+  — correct, just up to `Ghost Owner Evict Seconds` slower. If every peer goes quiet at once, that is
+  read as a fault at the host's end rather than as everybody leaving, and nobody is evicted until one
+  of them answers.
 - Raising `Max Players` is not free and nothing here makes it free: each added player costs the
   host upload and CPU against every other player. `Frame Budget Ms` and the Steam transport
   ceiling below are what decide whether a bigger number is actually playable - read the two
@@ -150,6 +182,20 @@ relay filtering and relay send reuse stand down when either is present and every
 working.
 Valheim Plus is fine too: it has its own player limit, so this mod's `Player Limit` settings are
 ignored when it is installed and V+'s `maxPlayers` is the one in force.
+ClientGhostWatchdog is fine as well: it does the client-side half of the ghost handling itself and
+against its own timeout, so this mod's client watchdog stands down and leaves that mod's behaviour
+in charge. The host-side half — evicting a ghost from ownership, which that mod does not do — keeps
+running either way.
+
+## Credits
+
+The ghost handling started from **[ClientGhostWatchdog](https://github.com/dreamwraith/Valheim-ClientGhostWatchdog)
+by DreamWraith**, which spotted that a disconnected client keeps playing into a world that is no
+longer there, and settled on warning at the halfway mark and leaving cleanly at the deadline. No
+code is shared, and the two halves here differ in what they ask — the transport's own verdict rather
+than the game's ping timer, and a host-side question that a client-only mod could not reach — but the
+observation that the game needs a second, independent opinion on whether a peer is still there is
+theirs.
 
 ## Changelog
 

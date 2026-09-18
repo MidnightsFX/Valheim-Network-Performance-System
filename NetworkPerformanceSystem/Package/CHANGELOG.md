@@ -1,5 +1,29 @@
 # Changelog
 
+**1.6.0**
+- A player who has stopped answering no longer freezes everything they were simulating. New `Connection Timeout` setting **Evict Ghost Owners** (default on), with **Ghost Owner Evict Seconds** (default 10).
+	- "Stop trusting this peer to simulate" is a different question and is now asked separately. A peer that goes quiet loses its objects to the players who are actually there, while keeping its slot for the full timeout so it can come back. Nothing is disconnected any sooner, and if it returns it competes for ownership again on the next pass.
+	- Detection asks Steam directly - `SteamNetConnectionRealTimeStatus_t.m_eState`, which reports a dead link before anything closes the socket - and falls back to a silence timer for crossplay peers, which report no state. The timer discounts main-thread stalls rather than counting a frozen frame as the peers going quiet.
+	- If every peer goes quiet at once, that is treated as a fault at the host's end and nobody is evicted until one answers.
+	- This is what makes raising `Connection Timeout Seconds` safe: the wait now costs only the slot.
+- Clients are no longer left playing a world the server has dropped them from. New `Client config` setting **EnableGhostWatchdog** (default on).
+	- A warning with a countdown appears halfway to the timeout actually in force and clears itself if the connection comes back; at the deadline, or as soon as the transport calls the link dead, the character is saved and the game returns to the menu with an explanation rather than the generic "disconnected".
+	- No timeout of its own - it follows the same deadline the game is using, so it cannot disagree with the server's setting.
+	- Stands down automatically when ClientGhostWatchdog is installed.
+- `nps_stats` gains a "Peer liveness" block: who is quiet, for how long, what the transport says, and the eviction and watchdog counters.
+- Credit: the ghost handling started from [ClientGhostWatchdog](https://github.com/dreamwraith/Valheim-ClientGhostWatchdog) by DreamWraith. No code is shared; the observation that the game needs a second opinion on whether a peer is still there is theirs.
+- Picking berries, mining ore and chopping trees no longer lag when another player owns the object. Ownership arbitration is now tiered: moving objects are placed by latency as before, and interactable-but-stationary ones by distance. New `Ownership` setting **Interactive Object Ownership** (default on).
+	- Pickables, ore deposits, rocks, trees, logs and destructibles go to whoever is standing nearest them. These ask their owner to do the work and every handler checks it is the owner, so an object owned by another player costs four network legs per keypress - and placing by ping rather than by distance would not have helped, because nothing about a berry bush changes between interactions.
+	- Building pieces, containers, crafting stations and portals are still never moved off a player who is present, which is what keeps the fermenter and smelter fix above intact.
+	- An object is never taken from an owner still within reach of it, never taken for a player further away than `Interactive Claim Radius`, and each move is pushed to nearby players immediately.
+	- An unowned patch - one nobody has visited - now goes to the nearest player rather than the lowest-ping one, on the first pass and with no delay.
+	- Tuning: `Interactive Claim Radius`, `Interactive Challenge Margin`, `Interactive Min Hold Seconds`, `Interactive Max Reassigns Per Pass`. The tier has its own budget so a zone full of creatures cannot starve it, or be starved by it.
+	- `nps_stats` gains per-tier ownership counters.
+- Ships are now simulated by the player at the helm, so steering is no longer choppy when someone else on board owned the ship. New `Ownership` setting **Ship Ownership Follows Helmsman** (default on).
+	- The ship's current owner hands it over when the helm is taken, the same way the game already hands over saddles and carts. This needs the mod on whichever machine owns the ship; a ship owned by a player without it behaves as in vanilla.
+	- The host gives an abandoned ship (its owner left or disconnected) to the player at its helm first.
+	- `nps_stats` gains a "Ship helm" block with the handoff and helm rescue counts.
+
 **1.5.0**
 - Updates default send timing to prevent alternating delays from the dedicated server
 - New `Allocation` section: four opt-in changes that remove short-lived objects from the ZDO network path, reducing how often the garbage collector runs. None of them alters a byte on the wire or a value in a ZDO.

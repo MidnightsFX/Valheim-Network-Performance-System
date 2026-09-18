@@ -25,6 +25,11 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<float> LatencyCompensationMaxMeters;
         public static ConfigEntry<bool> EnableDebugOverlay;
 
+        // M22 - client ghost watchdog. Client-local because it decides when to take THIS player
+        // out of a dead session, which is not the server's call to make - and on a server that has
+        // already stopped answering, could not be pushed down anyway.
+        public static ConfigEntry<bool> EnableGhostWatchdog;
+
         // Add Server synced config entries under here
 
         // M2/M2c - bandwidth-delay-product send window
@@ -46,6 +51,16 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<int> OwnershipMaxReassignsPerPass;
         public static ConfigEntry<float> OwnershipLoadPenaltyMs;
         public static ConfigEntry<int> OwnershipUnmeasuredRttMs;
+
+        // M3 tier 2 - interactable-but-stationary objects follow the nearest player
+        public static ConfigEntry<bool> EnableInteractiveOwnership;
+        public static ConfigEntry<float> OwnershipInteractiveClaimRadius;
+        public static ConfigEntry<float> OwnershipInteractiveChallengeMargin;
+        public static ConfigEntry<float> OwnershipInteractiveMinHoldSeconds;
+        public static ConfigEntry<int> OwnershipInteractiveMaxReassignsPerPass;
+
+        // M20 - ship ownership follows the helmsman
+        public static ConfigEntry<bool> ShipOwnershipFollowsHelmsman;
 
         // M6 - fast reference position channel
         public static ConfigEntry<bool> EnableFastRefPos;
@@ -78,6 +93,10 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<int> ConnectTimeoutSeconds;
         public static ConfigEntry<int> ConnectionTimeoutSeconds;
         public static ConfigEntry<int> LoadingTimeoutSeconds;
+
+        // M21 - ghost peers stop being trusted to simulate long before they are hung up on
+        public static ConfigEntry<bool> EvictGhostOwners;
+        public static ConfigEntry<float> GhostOwnerEvictSeconds;
 
         // M14 - periodic queue drain for mods that wait on a fixed send queue threshold
         public static ConfigEntry<float> QueueDrainIntervalSeconds;
@@ -135,6 +154,15 @@ namespace NetworkPerformanceSystem {
                 new ConfigDescription("Show the per-entity latency compensation overlay (owner, estimated staleness, applied displacement).", null,
                 new ConfigurationManagerAttributes { IsAdvanced = true }));
 
+            // --- M22: client ghost watchdog (client-local) ---------------------------------
+            // The game already leaves a dead session, but only once ZRpc's ping timeout closes the
+            // socket - and that timeout is a process-wide static that one accepted crossplay
+            // socket raises to 90 seconds, and that this mod's own Connection Timeout setting can
+            // raise further. That is the right allowance for a join that is still working and the
+            // wrong one for "how long may I keep playing a world that is gone".
+            EnableGhostWatchdog = Config.Bind("Client config", "EnableGhostWatchdog", true,
+                new ConfigDescription("Warn when the server stops answering, and return to the menu once it is certain rather than leaving you playing a world the server is no longer part of. The warning appears halfway to the timeout actually in force, and clears itself if the connection comes back. No new timeout of its own: it follows the same deadline the game is using, so it cannot disagree with the server's setting. Stands down automatically if ClientGhostWatchdog is installed, which does the same job."));
+
             // --- M2/M2c: bandwidth-delay-product send window -------------------------------
             // Vanilla allows a fixed 10240 bytes of in-flight reliable ZDO data per peer.
             // Throughput through a fixed window is window/RTT, so vanilla is correctly sized
@@ -172,15 +200,15 @@ namespace NetworkPerformanceSystem {
             // everyone else sees it via owner->host->viewer. Vanilla grants ownership to the
             // first peer in list order, which is uncorrelated with both engagement and latency.
             EnableOwnershipArbitration = BindServerConfig("Ownership", "Enable Latency-Aware Ownership", true,
-                "Assign ZDO ownership to minimise how stale the object looks to the players who can actually see it, instead of vanilla's first-peer-wins ordering. Only simulated, moving objects (creatures and other Prioritized ZDOs) are ever moved away from a player who is still present; buildings, containers, crafting stations and pieces keep their owner until that player leaves, exactly as in vanilla.");
+                "Assign ZDO ownership to minimise how stale the object looks to the players who can actually see it, instead of vanilla's first-peer-wins ordering. Simulated, moving objects (creatures and other Prioritized ZDOs) are placed on whoever minimises staleness for everyone watching; buildings, containers, crafting stations, pieces and portals keep their owner until that player leaves, exactly as in vanilla. Pickables, ore deposits, rocks and trees are handled separately and by a different rule - see Interactive Object Ownership below.");
             OwnershipAllowHostOwner = BindServerConfig("Ownership", "Allow Host As Owner", true,
                 "Let the host compete for ownership of contested ZDOs in the zones it has loaded. The host is zero hops from everyone, so host-owned is the lowest possible staleness for every viewer, and whenever two or more players share a zone the host has loaded it will win those objects and keep them. A listen host has loaded the zones around its own player; a dedicated server has loaded only the zones around the world origin, so in practice this means a dedicated server owns and simulates the contested objects at the spawn hub whenever players gather there - intended, and worth knowing when budgeting server CPU. Disable to always place on the lowest-latency player present instead.");
             OwnershipMinHoldSeconds = BindServerConfig("Ownership", "Min Hold Seconds", 5f,
-                "Minimum time an owner keeps a ZDO before it can be challenged. Hysteresis against ownership thrash. Applies only when moving a simulated, moving object (a creature or other Prioritized ZDO) away from an owner that is still present - static objects are never moved off a present owner, and a ZDO whose owner has left the area or the session is re-owned immediately, at any setting.", false, 0f, 60f);
+                "Minimum time an owner keeps a ZDO before it can be challenged. Hysteresis against ownership thrash. Applies only when moving a simulated, moving object (a creature or other Prioritized ZDO) away from an owner that is still present - buildings, containers, stations and pieces are never moved off a present owner, interactables have their own hold below, and a ZDO whose owner has left the area or the session is re-owned immediately, at any setting.", false, 0f, 60f);
             OwnershipChallengeMarginMs = BindServerConfig("Ownership", "Challenge Margin Ms", 25,
                 "A challenger must improve estimated staleness by at least this many milliseconds to take ownership. Prevents ping jitter from ping-ponging ownership between similar peers. Applies only to challenges against a present owner, and also bounds how much the Load Penalty below may shift a decision.", false, 0, 250);
             OwnershipMaxReassignsPerPass = BindServerConfig("Ownership", "Max Reassigns Per Pass", 8,
-                "Minimum cap on latency-driven ownership transfers of moving objects per arbitration pass (static objects - buildings, containers, stations - are never transferred off a present owner). Each transfer costs a ZDO resend, so this bounds the burst when a group arrives in a new area. The effective cap is the larger of this value and the number of connected players, so a full server converges at the same per-player rate as a small group rather than linearly slower. Restoring an owner to a ZDO that has none is never deferred by this: an unowned creature does not move and cannot be damaged.", true, 1, 128);
+                "Minimum cap on latency-driven ownership transfers of moving objects per arbitration pass (buildings, containers, stations and pieces are never transferred off a present owner; interactables have their own budget below). Each transfer costs a ZDO resend, so this bounds the burst when a group arrives in a new area. The effective cap is the larger of this value and the number of connected players, so a full server converges at the same per-player rate as a small group rather than linearly slower. Restoring an owner to a ZDO that has none is never deferred by this: an unowned creature does not move and cannot be damaged.", true, 1, 128);
             OwnershipLoadPenaltyMs = BindServerConfig("Ownership", "Load Penalty Ms", 0.02f,
                 "Cost added per simulated object (creatures, ships - not walls or trees) a candidate already owns nearby, in milliseconds. Spreads simulation and upload load across peers instead of concentrating every contested object on the lowest-ping player. The total handicap is capped at half of Challenge Margin Ms, so load can shade a close decision but can never on its own amount to the staleness difference that justifies a transfer. 0 disables load spreading and places purely by staleness.", true, 0f, 0.5f);
             // Crossplay/PlayFab sockets never report a round-trip time and a Steam peer has none
@@ -190,6 +218,32 @@ namespace NetworkPerformanceSystem {
             // (which it wins at any RTT).
             OwnershipUnmeasuredRttMs = BindServerConfig("Ownership", "Unmeasured Peer RTT Ms", 150,
                 "Round-trip time assumed for a peer the host has no measurement for - crossplay/PlayFab connections never report one, and every Steam peer is unmeasured for its first seconds. Such a peer still wins objects only it can see, but loses contested ones to any measured peer with a lower ping. Treating unmeasured as 0ms instead would hand them everything in range.", true, 0, 1000);
+
+            // --- M3 tier 2: interactable-but-stationary objects -----------------------------
+            // Picking a berry or swinging at an ore vein asks the object's OWNER to do the work -
+            // ZNetView.InvokeRPC(string, ...) addresses m_zdo.GetOwner() - and every handler begins
+            // with an IsOwner check. Clients only ever peer with the host, so an object owned by
+            // another player costs four network legs per keypress. Staleness is meaningless for
+            // these (their ZDO changes only when somebody touches them), so they are placed by
+            // distance instead: whoever is nearest is whoever is about to touch it.
+            EnableInteractiveOwnership = BindServerConfig("Ownership", "Interactive Object Ownership", true,
+                "Also place interactable-but-stationary objects - berry bushes and other pickables, ore deposits, rocks, trees, logs and destructibles - on whoever is standing nearest them, instead of leaving them with whoever happened to touch one first. Picking a berry or swinging at a rock asks the object's owner to do the work, and if that owner is another player the request travels from you to the server to them, and the result comes back the same way: four network legs for one keypress, which is what makes a shared berry patch or mine feel sluggish. Placement here is by distance rather than by ping, because nothing about a berry bush changes between interactions - the only thing that matters is whether the person about to touch it is the one simulating it. Buildings, containers, crafting stations, pieces and anything a player has open are still never moved off a player who is present.");
+            OwnershipInteractiveClaimRadius = BindServerConfig("Ownership", "Interactive Claim Radius", 32f,
+                "How close a player has to be, in metres, before an interactable object is placed on them. Objects further than this from everybody are left exactly where they are - nobody is about to touch them, so moving them would cost a network update and buy nothing. The default is half a zone: far enough that ownership has usually settled before you walk into range and start picking, close enough that walking past somebody's base does not churn every bush, rock and tree around it.", false, 4f, 64f);
+            OwnershipInteractiveChallengeMargin = BindServerConfig("Ownership", "Interactive Challenge Margin", 4f,
+                "How much nearer, in metres, a player must be than the current owner before an interactable object moves to them. This is the distance equivalent of Challenge Margin Ms and it does the same job: without it, two players drifting around the same berry patch would trade every bush in it back and forth. Note that an object is never taken from an owner standing within reach of it, whatever this is set to - that owner may be mid-swing, and the moment their copy of the owner id goes stale is the moment a swing can be lost.", false, 0f, 32f);
+            OwnershipInteractiveMinHoldSeconds = BindServerConfig("Ownership", "Interactive Min Hold Seconds", 15f,
+                "Minimum time before an interactable object that has already been moved can move again. Unlike Min Hold Seconds above, this is measured from the last move rather than from when the owner was first seen: nothing in the game hands these objects over by itself, so there is no player-initiated claim to wait out, and charging a wait would mean the first berry you pick after walking into a patch is still the slow one. So the first placement is immediate and only repeat moves are damped. Raise it if a busy shared base shows a lot of ownership churn in nps_stats.", false, 0f, 120f);
+            OwnershipInteractiveMaxReassignsPerPass = BindServerConfig("Ownership", "Interactive Max Reassigns Per Pass", 16,
+                "Minimum cap on how many interactable objects may be placed on a nearer player per arbitration pass. It is a separate budget from Max Reassigns Per Pass on purpose, so a zone full of contested creatures cannot starve the handful of moves that make a berry patch local, or be starved by them. The nearest objects are done first, so walking into a patch converts the bushes you are about to reach before the ones at its far edge. As with Max Reassigns Per Pass the effective cap is the larger of this value and the number of connected players. Each move costs one small object update to each player nearby: raise it to convert a large patch or ore face in a single pass, lower it on a bandwidth-constrained host.", true, 1, 256);
+
+            // --- M20: ship ownership follows the helmsman -----------------------------------
+            // Vanilla hands a saddle or a cart to whoever takes control of it, but never a ship:
+            // the helm only records who is steering, and the ship stays with whoever owned it
+            // while that player is aboard. The helmsman then steers a ship simulated on someone
+            // else's machine and rides its relayed motion, which is the choppiness.
+            ShipOwnershipFollowsHelmsman = BindServerConfig("Ownership", "Ship Ownership Follows Helmsman", true,
+                "Hand a ship to whoever takes its helm, so the player steering simulates it on their own machine instead of watching it relayed through the host from another player. The handoff is made by the machine that currently owns the ship, the same way the game already hands over saddles and carts, so it happens wherever that machine runs this mod - a listen host, a dedicated server, or a client with the mod. A ship owned by a player without the mod behaves as in vanilla. The ship stays with that player while they remain aboard after letting go of the helm. The host also gives an abandoned ship - its owner left or disconnected - to the player at its helm first.");
 
             // --- M6: fast reference position channel ---------------------------------------
             // ZNet.SendPeriodicData gates client reference positions behind a single 2 second
@@ -297,6 +351,18 @@ namespace NetworkPerformanceSystem {
             LoadingTimeoutSeconds = BindServerConfig("Connection Timeout", "Loading Timeout Seconds", 90,
                 "The longer allowance the game already gives itself while a crossplay peer is joining and the world is being transferred, in seconds. 90 is vanilla. A slow client can spend minutes here on a large world, and this is the timeout that ends the join when it does. Never applied below 'Connection Timeout Seconds' - a loading peer is not given less slack than an idle one, whatever this is set to.",
                 true, 30, 900);
+
+            // --- M21: ghost owners ----------------------------------------------------------
+            // "Stop trusting this peer to simulate" and "give up on this peer entirely" are
+            // different questions, and vanilla only ever asks the second one. That is what made
+            // the setting above a trade: a peer that is gone keeps ownership of everything it was
+            // simulating for the whole timeout, and objects an absent owner holds do not move.
+            // They do not have to be the same number.
+            EvictGhostOwners = BindServerConfig("Connection Timeout", "Evict Ghost Owners", true,
+                "Stop giving objects to a player who has stopped answering, without disconnecting them. A peer that goes quiet keeps its slot for the full 'Connection Timeout Seconds' so it can come back, but the things it was simulating - creatures especially - are handed to players who are actually there, instead of standing frozen and unkillable until the timeout expires. This is what makes raising the timeout above safe: the wait costs the absent player nothing and no longer costs everyone else a frozen world. Applies on the host; players do not need the mod for it.");
+            GhostOwnerEvictSeconds = BindServerConfig("Connection Timeout", "Ghost Owner Evict Seconds", 10f,
+                "How long a player may be silent before their objects are given to someone else, in seconds. The game pings every peer once a second, so ten seconds is ten missed replies - well past any ordinary hitch and well short of the timeout that actually disconnects them. Independent of that timeout and always held below it, since evicting a peer the game has already hung up on would be answering a question nobody is still asking. When the transport reports the connection dead outright, that is acted on immediately and this value is not consulted.",
+                true, 3f, 60f);
 
             // --- M13/M14: fixed third-party send queue thresholds ---------------------------
             // Jotunn's CustomRPC, ServerSync and every mod bundling it, ConditionalConfigSync and

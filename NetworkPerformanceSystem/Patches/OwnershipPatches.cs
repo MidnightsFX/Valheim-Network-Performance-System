@@ -48,6 +48,7 @@ namespace NetworkPerformanceSystem.Patches {
         private static void OnStopAll() {
             OwnershipArbiter.Reset();
             OwnershipPolicy.Reset();
+            ShipHelmOwnership.Reset();
             SendWindow.Reset();
             QueueDrain.Reset();
             SendSchedulerPatches.Reset();

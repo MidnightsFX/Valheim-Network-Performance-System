@@ -4,14 +4,24 @@ using UnityEngine;
 namespace NetworkPerformanceSystem.Runtime {
 
     /// <summary>
-    /// Which ZDOs are off-limits to the arbiter.
+    /// What kind of thing a ZDO is, for the two questions the arbiter asks about it: may it be moved
+    /// off a present owner at all, and if so, by which tier's rules.
     ///
-    /// The rule is "authority follows direct control". An object a player is actively driving must
-    /// stay on that player's machine no matter what the latency maths says, because moving it
+    /// The first rule is "authority follows direct control". An object a player is actively driving
+    /// must stay on that player's machine no matter what the latency maths says, because moving it
     /// makes their own input round-trip through someone else. This is a well-attested failure mode
     /// rather than a theoretical one: valheim-serverside issue #42 is the server taking ship
     /// ownership and the helmsman stuttering, VBNetTweaks explicitly hands ships to whoever takes
     /// the helm, and SkadiNet ships a hard-coded AllowShipOwnership = false.
+    ///
+    /// The second is the tier-2 rule, and it is the same principle one step weaker: an object
+    /// nobody is driving but somebody is about to touch should be on the machine of whoever is
+    /// about to touch it. See OwnershipArbiter's tier-2 section for why that is a different
+    /// question from tier 1's staleness cost, and ShouldPlaceInteractive below for the geometry.
+    ///
+    /// One prefab classification answers both, which is the reason the tier-2 values live in this
+    /// enum rather than in a cache of their own: the arbiter pays a single dictionary probe per
+    /// contested ZDO and gets "may I move it" and "by which rule" together.
     /// </summary>
     internal static class OwnershipPolicy {
 
@@ -21,9 +31,40 @@ namespace NetworkPerformanceSystem.Runtime {
             Ship = 2,
             Mount = 3,
             Cart = 4,
+
+            /// <summary>A store somebody can have open. Ranked ahead of Interactive so that a chest
+            /// with a Destructible on it is a chest, not an interactable: Container.RPC_RequestOpen
+            /// hands the opener ownership and OnContainerChanged only saves on the owner, so a move
+            /// mid-use drops whatever they just put in.</summary>
+            Container = 5,
+
+            /// <summary>Stationary, but its whole purpose is to be touched: a pickable, an ore
+            /// vein, a rock, a tree, a log, a destructible. Every one of these routes its
+            /// interaction through ZNetView.InvokeRPC(string, ...), which addresses
+            /// m_zdo.GetOwner() - so whether the person about to touch it is the one simulating it
+            /// is the entire latency story for these objects.</summary>
+            Interactive = 6,
         }
 
         private static readonly Dictionary<int, PrefabClass> ClassCache = new Dictionary<int, PrefabClass>();
+
+        /// <summary>
+        /// How far an incumbent owner must be from an object before tier 2 will take it away.
+        ///
+        /// Not a preference, so not a config entry: it is Player.m_maxInteractDistance (5f,
+        /// Player.cs:173) plus slack for the host's copy of a reference position being up to a send
+        /// interval old. Same standing as ZoneCompat.ActiveZoneRadius - a constant with a citation.
+        ///
+        /// This is the strongest of the three things holding the duplication window shut. Vanilla
+        /// only ever changes one of these objects' owners while that owner is ABSENT, so it has no
+        /// instance and cannot be interacting; tier 2 moves objects between two peers who both hold
+        /// one. For the window in which their copies of the owner id disagree, two RPC_Pick calls -
+        /// one to the old owner, one to the new - can each pass their own IsOwner gate and each run
+        /// the drop loop. Refusing to take an object from an owner still within reach of it means
+        /// only one end of that window is ever live for a pick or a melee swing, which is the case
+        /// that matters. It does not close ranged damage into a Destructible from forty metres.
+        /// </summary>
+        internal const float InteractionStandOffMetres = 8f;
 
         /// <summary>
         /// True when this ZDO represents something a player is or could be directly driving.
@@ -34,9 +75,10 @@ namespace NetworkPerformanceSystem.Runtime {
         /// behind by a disconnected player - from reading as "controlled" forever and excluding
         /// the mount from recovery permanently.
         ///
-        /// Also only reached for Prioritized ZDOs - the arbiter never moves anything else off a
-        /// present owner - so a Player, Ship or cart that somehow carried the Default type would
-        /// simply never move, which is the stricter outcome.
+        /// Also only reached for Prioritized ZDOs - tier 1 is the only path that consults this, and
+        /// tier 2 does not need to, because Classify ranks every class below ahead of Interactive
+        /// and so a prefab that is both (a cart with a destructible hull, a chest with one) never
+        /// reads as interactable at all.
         /// </summary>
         internal static bool IsDirectlyControlled(ZDO zdo) {
             switch (Classify(zdo)) {
@@ -62,9 +104,53 @@ namespace NetworkPerformanceSystem.Runtime {
                     // mid-use drops whatever they just put in. Container writes s_inUse as 0/1.
                     return zdo.GetBool(ZDOVars.s_attachJointHash, false)
                         || zdo.GetInt(ZDOVars.s_inUse, 0) == 1;
+                case PrefabClass.Container:
+                    // The cargo-hold rule above, for a chest that is not part of a cart. A strict
+                    // tightening: a Container-bearing prefab that is Prioritized and neither a
+                    // Vagon nor a Ship does not exist in vanilla, so tier 1 cannot notice this.
+                    return zdo.GetInt(ZDOVars.s_inUse, 0) == 1;
                 default:
                     return false;
             }
+        }
+
+        /// <summary>
+        /// True when this ZDO is a stationary object whose only interesting operation is an
+        /// owner-addressed interaction - tier 2's population.
+        ///
+        /// Deliberately NOT a state test. Unlike a mount or a cart there is no "idle" concession to
+        /// make here: a berry bush is a berry bush whether or not anyone is standing at it, so one
+        /// cached classification answers it outright.
+        /// </summary>
+        internal static bool IsInteractive(ZDO zdo) {
+            return Classify(zdo) == PrefabClass.Interactive;
+        }
+
+        /// <summary>
+        /// The player id recorded at this ship's helm, or 0 when the ZDO is not a ship or nobody
+        /// is steering it. ShipControlls shares the ship's ZNetView, so s_user is on the ship's
+        /// own ZDO. The value can be stale - a helmsman who disconnected is never cleared when
+        /// nobody owns the ship - so callers must confirm the player is actually present.
+        /// </summary>
+        internal static long HelmsmanPlayerId(ZDO zdo) {
+            if (Classify(zdo) != PrefabClass.Ship) { return 0L; }
+            return zdo.GetLong(ZDOVars.s_user, 0L);
+        }
+
+        /// <summary>
+        /// Tier 2's placement rule, with the geometry factored out so the offline harness can table
+        /// it against the thresholds directly. Pure - same reason ZoneCompat.ZdoInstancePossible is.
+        ///
+        ///   * nobody within the claim radius   -> nothing to win, so do not spend an update on it
+        ///   * incumbent still within reach     -> it may be mid-swing; see InteractionStandOffMetres
+        ///   * challenger not ahead by a margin -> hysteresis, or two players drifting around one
+        ///                                         patch trade every bush in it back and forth
+        /// </summary>
+        internal static bool ShouldPlaceInteractive(float ownerMetres, float nearestMetres,
+                                                    float claimRadiusMetres, float marginMetres) {
+            if (nearestMetres > claimRadiusMetres) { return false; }
+            if (ownerMetres < InteractionStandOffMetres) { return false; }
+            return ownerMetres - nearestMetres >= marginMetres;
         }
 
         private static PrefabClass Classify(ZDO zdo) {
@@ -75,10 +161,16 @@ namespace NetworkPerformanceSystem.Runtime {
             if (ZNetScene.instance != null) {
                 GameObject go = ZNetScene.instance.GetPrefab(prefab);
                 if (go != null) {
+                    // The first four keep the precedence they have always had, so nothing this
+                    // classified before is classified differently now. The two new cases sit
+                    // strictly below them: a cart's cargo hold is already covered by Cart, and
+                    // anything a player drives is never merely interactable.
                     if (go.GetComponent<Player>() != null) { result = PrefabClass.Player; }
                     else if (go.GetComponent<Ship>() != null) { result = PrefabClass.Ship; }
                     else if (go.GetComponent<Vagon>() != null) { result = PrefabClass.Cart; }
                     else if (go.GetComponent<Tameable>() != null) { result = PrefabClass.Mount; }
+                    else if (go.GetComponent<Container>() != null) { result = PrefabClass.Container; }
+                    else if (IsInteractable(go)) { result = PrefabClass.Interactive; }
                 } else {
                     // Unknown prefab (content mod not loaded here, or a stale ZDO). Do not cache a
                     // verdict we cannot justify - treat it as ordinary this time and look again
@@ -91,6 +183,35 @@ namespace NetworkPerformanceSystem.Runtime {
 
             ClassCache[prefab] = result;
             return result;
+        }
+
+        /// <summary>
+        /// Does this prefab carry one of the components whose interaction is owner-addressed?
+        /// Answered from the prefab rather than the name, the same way StationRpcRouter.IsStation
+        /// is, so content mods that build on the vanilla components are covered.
+        ///
+        /// WearNTear - and Piece, which it always accompanies - excludes the prefab outright, and
+        /// that exclusion is the structural safety rule. WearNTear is what makes an object part of
+        /// a building: UpdateSupport writes s_support only on the owner (WearNTear.cs:529, :915),
+        /// and a collapsing piece addresses RPC_ClearCachedSupport at a NEIGHBOURING piece's
+        /// GetZDO().GetOwner() (WearNTear.cs:889) - an owner-addressed call across two different
+        /// ZDOs, which is a strictly harder stale-owner problem than anything tier 2 accepts.
+        /// Nothing in the seven components below belongs on a player-built piece, so the exclusion
+        /// costs nothing and keeps every support network out of a tier that moves owners between
+        /// two present peers. It is also what keeps portals (TeleportWorld + Piece + WearNTear) on
+        /// vanilla's rule.
+        /// </summary>
+        private static bool IsInteractable(GameObject go) {
+            if (go.GetComponent<WearNTear>() != null) { return false; }
+            if (go.GetComponent<Piece>() != null) { return false; }
+
+            return go.GetComponent<Pickable>() != null
+                || go.GetComponent<PickableItem>() != null
+                || go.GetComponent<MineRock>() != null
+                || go.GetComponent<MineRock5>() != null
+                || go.GetComponent<Destructible>() != null
+                || go.GetComponent<TreeBase>() != null
+                || go.GetComponent<TreeLog>() != null;
         }
 
         internal static void Reset() {

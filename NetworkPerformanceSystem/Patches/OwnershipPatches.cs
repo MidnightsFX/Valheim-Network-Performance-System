@@ -25,8 +25,13 @@ namespace NetworkPerformanceSystem.Patches {
         [HarmonyPatch(typeof(ZDOMan), "ReleaseZDOS")]
         [HarmonyPrefix]
         private static bool ArbitrateByLatency(ZDOMan __instance, float dt) {
-            if (!PatchGuard.IsActive(Mechanism.Ownership)) { return true; }
-            if (!ValConfig.EnableOwnershipArbitration.Value) { return true; }
+            if (!PatchGuard.IsActive(Mechanism.Ownership) || !ValConfig.EnableOwnershipArbitration.Value) {
+                // Vanilla's pass is about to run instead. With monitoring on, say so, or every
+                // owner it moves reads as something gameplay did - and this is exactly the arm an
+                // on/off comparison needs labelled.
+                if (Monitoring.Active) { Monitoring.NoteVanillaPass(); }
+                return true;
+            }
 
             // Vanilla's ReleaseZDOS is already host-only in practice (ZDOMan.Update gates it),
             // but be explicit: a client must never reassign ownership on anyone's behalf.
@@ -46,11 +51,14 @@ namespace NetworkPerformanceSystem.Patches {
         [HarmonyPatch(typeof(ZNet), "StopAll")]
         [HarmonyPostfix]
         private static void OnStopAll() {
+            // First: it closes its files with a record of the session ending, and takes its hooks
+            // off before anything below resets the state those hooks read.
+            Monitoring.Shutdown();
             OwnershipArbiter.Reset();
             OwnershipPolicy.Reset();
             ShipHelmOwnership.Reset();
             SendWindow.Reset();
-            QueueDrain.Reset();
+            SendQueueView.Reset();
             SendSchedulerPatches.Reset();
             RoutedRpcFilter.Reset();
             StationRpcRouter.Reset();

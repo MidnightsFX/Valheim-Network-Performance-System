@@ -30,7 +30,10 @@ namespace NetworkPerformanceSystem.Runtime {
         /// worse off than stock.</summary>
         internal const int VanillaWindowBytes = 10240;
 
-        /// <summary>Last computed window per peer, for diagnostics only.</summary>
+        /// <summary>The window each peer was given on its last send, present only while that peer
+        /// is being sized. Read by the peer table, by the monitoring uploader, and by M14, which
+        /// takes the part above vanilla off what other mods read - so an entry must not outlive
+        /// the sizing it records.</summary>
         private static readonly System.Collections.Generic.Dictionary<long, int> LastWindow =
             new System.Collections.Generic.Dictionary<long, int>();
 
@@ -38,39 +41,53 @@ namespace NetworkPerformanceSystem.Runtime {
             return LastWindow.TryGetValue(peerUid, out bytes);
         }
 
+        /// <summary>How far above vanilla this peer's window was on its last send, or 0. This is
+        /// the part of its queue M14 keeps out of what other mods read.</summary>
+        internal static int ExtraBytes(long peerUid) {
+            return LastWindow.TryGetValue(peerUid, out int window) && window > VanillaWindowBytes
+                ? window - VanillaWindowBytes
+                : 0;
+        }
+
         /// <summary>
         /// Called from the rewritten IL in ZDOMan.SendZDOs, once per peer per send attempt.
         /// Must be cheap and must never throw - it sits directly in the send path.
         /// </summary>
         internal static int For(ZDOMan.ZDOPeer peer) {
-            if (!PatchGuard.IsActive(Mechanism.SendWindow)) { return VanillaWindowBytes; }
-            if (!ValConfig.EnableSendWindowSizing.Value) { return VanillaWindowBytes; }
-
             ZNetPeer netPeer = peer?.m_peer;
             if (netPeer == null) { return VanillaWindowBytes; }
 
             long uid = netPeer.m_uid;
+            if (!TrySize(uid, out int window)) {
+                // Not sized this time: sizing switched off, stood down, or no RTT for this peer.
+                // Forget any earlier window so M14 stops adjusting on the same send that stops
+                // using it, rather than on the next reconnect.
+                LastWindow.Remove(uid);
+                return VanillaWindowBytes;
+            }
+
+            LastWindow[uid] = window;
+            return window;
+        }
+
+        private static bool TrySize(long uid, out int window) {
+            window = VanillaWindowBytes;
+            if (!PatchGuard.IsActive(Mechanism.SendWindow)) { return false; }
+            if (!ValConfig.EnableSendWindowSizing.Value) { return false; }
 
             // Both sides measure their own sockets, so this works for the host sizing each client
             // and for a client sizing its own upstream to the host.
-            if (!LatencyRegistry.HasMeasurement(uid)) { return VanillaWindowBytes; }
+            if (!LatencyRegistry.HasMeasurement(uid)) { return false; }
 
             float rttSeconds = LatencyRegistry.MeasuredRttMs(uid) / 1000f;
             float targetBytesPerSecond = ValConfig.SendWindowTargetRateKBps.Value * 1024f;
             float bdp = targetBytesPerSecond * rttSeconds * ValConfig.SendWindowBdpFactor.Value;
 
-            int window = Mathf.Clamp(
+            window = Mathf.Clamp(
                 Mathf.RoundToInt(bdp),
                 VanillaWindowBytes,
                 Mathf.Max(VanillaWindowBytes, ValConfig.SendWindowMaxBytes.Value));
-
-            LastWindow[uid] = window;
-
-            // M14 - a drain in progress caps this peer at the compatibility floor. Read-only here:
-            // QueueDrain.Observe, in a prefix on the same method, is what moves the state. The
-            // undrained window is what was stored above, so the peer table keeps showing it.
-            if (QueueDrain.IsDraining(uid)) { return Mathf.Min(window, QueueDrain.FloorBytes); }
-            return window;
+            return true;
         }
 
         internal static void Forget(long peerUid) {

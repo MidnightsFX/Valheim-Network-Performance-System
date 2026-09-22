@@ -35,7 +35,7 @@ namespace NetworkPerformanceSystem
     {
         public const string PluginGUID = "MidnightsFX.NetworkPerformanceSystem";
         public const string PluginName = "NetworkPerformanceSystem";
-        public const string PluginVersion = "1.6.0";
+        public const string PluginVersion = "1.7.0";
 
         internal static ManualLogSource Log;
         internal static Harmony HarmonyInstance;
@@ -71,6 +71,8 @@ namespace NetworkPerformanceSystem
         }
 
         public void OnDestroy() {
+            // Closes its files and removes its own hooks; a no-op when monitoring was never on.
+            Monitoring.Shutdown();
             JotunnSendQueue.Restore();
             HarmonyInstance?.UnpatchSelf();
         }

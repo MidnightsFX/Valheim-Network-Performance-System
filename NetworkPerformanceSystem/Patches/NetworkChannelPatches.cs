@@ -44,6 +44,12 @@ namespace NetworkPerformanceSystem.Patches {
             // point in the handshake peer.m_uid is still 0 anyway.
             peer.m_rpc.Register<ZPackage>(RpcLatencyTable, RPC_LatencyTable);
             peer.m_rpc.Register<Vector3>(RpcRefPos, RPC_RefPos);
+
+            // Network monitoring's two. Registered whether or not monitoring is on - it can be
+            // switched on mid-session, and an unused handler costs a dictionary entry. Neither
+            // does anything until the host has monitoring running.
+            peer.m_rpc.Register<ZPackage>(MonitoringUpload.RpcHello, MonitoringUpload.RPC_Hello);
+            peer.m_rpc.Register<ZPackage>(MonitoringUpload.RpcBatch, MonitoringUpload.RPC_Batch);
         }
 
         // -- RTT sampling ------------------------------------------------------------------
@@ -78,7 +84,7 @@ namespace NetworkPerformanceSystem.Patches {
             }
         }
 
-        private static ZNetPeer FindPeerByRpc(ZRpc rpc) {
+        internal static ZNetPeer FindPeerByRpc(ZRpc rpc) {
             System.Collections.Generic.List<ZNetPeer> peers = ZNet.instance.GetPeers();
             for (int i = 0; i < peers.Count; i++) {
                 if (peers[i].m_rpc == rpc) { return peers[i]; }
@@ -104,6 +110,9 @@ namespace NetworkPerformanceSystem.Patches {
                 TickRefPos(dt);
                 GhostWatchdog.Tick();                                         // M22, client-side only
             }
+
+            // Both roles. While monitoring is off this is two config reads and a comparison.
+            Monitoring.Tick();
         }
 
         private static void TickLatencyTable(float dt) {
@@ -194,9 +203,9 @@ namespace NetworkPerformanceSystem.Patches {
             LatencyRegistry.ForgetPeer(netPeer.m_uid);
             PeerLiveness.Forget(netPeer.m_uid);
             SendWindow.Forget(netPeer.m_uid);
-            QueueDrain.Forget(netPeer.m_uid);
             NetworkStats.ForgetPeer(netPeer.m_uid);
             SyncListCache.ForgetPeer(netPeer.m_uid);
+            Monitoring.ForgetPeer(netPeer.m_uid);
         }
 
         /// <summary>StopAll rather than Shutdown: it is the common tail of both Shutdown and

@@ -30,6 +30,10 @@ namespace NetworkPerformanceSystem {
         // already stopped answering, could not be pushed down anyway.
         public static ConfigEntry<bool> EnableGhostWatchdog;
 
+        // Network monitoring, the player's half. Client-local because it is the player's say over
+        // what their own game reports, whatever the server has asked for.
+        public static ConfigEntry<bool> AllowMonitoringUpload;
+
         // Add Server synced config entries under here
 
         // M2/M2c - bandwidth-delay-product send window
@@ -58,6 +62,10 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<float> OwnershipInteractiveChallengeMargin;
         public static ConfigEntry<float> OwnershipInteractiveMinHoldSeconds;
         public static ConfigEntry<int> OwnershipInteractiveMaxReassignsPerPass;
+
+        // M3 proximity layer - a simulated object with exactly one player near it belongs to that player
+        public static ConfigEntry<bool> EnableCreatureProximityOwnership;
+        public static ConfigEntry<float> CreatureProximityRadius;
 
         // M20 - ship ownership follows the helmsman
         public static ConfigEntry<bool> ShipOwnershipFollowsHelmsman;
@@ -98,9 +106,8 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<bool> EvictGhostOwners;
         public static ConfigEntry<float> GhostOwnerEvictSeconds;
 
-        // M14 - periodic queue drain for mods that wait on a fixed send queue threshold
-        public static ConfigEntry<float> QueueDrainIntervalSeconds;
-        public static ConfigEntry<int> QueueDrainFloorBytes;
+        // M14 - other mods read the send queue as vanilla's window would leave it
+        public static ConfigEntry<bool> ReportVanillaQueueSize;
 
         // M15-M18 - allocation removals on the ZDO network path. All four are byte-identical on
         // the wire; each is opt-in for its first release.
@@ -110,6 +117,12 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<bool> EnableRpcInvokeFastPath;
         // M19 - routed RPC relay written once per message
         public static ConfigEntry<bool> EnableRelaySendReuse;
+
+        // Network monitoring - an off-by-default recorder for diagnosing a server's network problems
+        public static ConfigEntry<bool> EnableMonitoring;
+        public static ConfigEntry<bool> MonitoringCollectFromClients;
+        public static ConfigEntry<int> MonitoringClientBytesPerSecond;
+        public static ConfigEntry<int> MonitoringMaxDiskMB;
 
         public const string cfgFolder = "NetworkPerformanceSystem";
 
@@ -162,6 +175,12 @@ namespace NetworkPerformanceSystem {
             // wrong one for "how long may I keep playing a world that is gone".
             EnableGhostWatchdog = Config.Bind("Client config", "EnableGhostWatchdog", true,
                 new ConfigDescription("Warn when the server stops answering, and return to the menu once it is certain rather than leaving you playing a world the server is no longer part of. The warning appears halfway to the timeout actually in force, and clears itself if the connection comes back. No new timeout of its own: it follows the same deadline the game is using, so it cannot disagree with the server's setting. Stands down automatically if ClientGhostWatchdog is installed, which does the same job."));
+
+            // --- Network monitoring, the player's half (client-local) ----------------------
+            // Nothing is recorded or sent unless the server has monitoring switched on and has
+            // asked this client for its records. This is the player's veto over that request.
+            AllowMonitoringUpload = Config.Bind("Client config", "AllowMonitoringUpload", true,
+                new ConfigDescription("When the server has network monitoring switched on, let this game send it what it sees: when creatures change owner, hits that were sent to a player who no longer owned the target, creatures jumping on screen, frame rate. No player names, platform ids, addresses or chat - only session ids, object ids, positions to the metre and timings, at up to 2KB per second and never ahead of the game's own traffic. Does nothing at all unless the server asks. Set to false to refuse."));
 
             // --- M2/M2c: bandwidth-delay-product send window -------------------------------
             // Vanilla allows a fixed 10240 bytes of in-flight reliable ZDO data per peer.
@@ -236,6 +255,17 @@ namespace NetworkPerformanceSystem {
                 "Minimum time before an interactable object that has already been moved can move again. Unlike Min Hold Seconds above, this is measured from the last move rather than from when the owner was first seen: nothing in the game hands these objects over by itself, so there is no player-initiated claim to wait out, and charging a wait would mean the first berry you pick after walking into a patch is still the slow one. So the first placement is immediate and only repeat moves are damped. Raise it if a busy shared base shows a lot of ownership churn in nps_stats.", false, 0f, 120f);
             OwnershipInteractiveMaxReassignsPerPass = BindServerConfig("Ownership", "Interactive Max Reassigns Per Pass", 16,
                 "Minimum cap on how many interactable objects may be placed on a nearer player per arbitration pass. It is a separate budget from Max Reassigns Per Pass on purpose, so a zone full of contested creatures cannot starve the handful of moves that make a berry patch local, or be starved by them. The nearest objects are done first, so walking into a patch converts the bushes you are about to reach before the ones at its far edge. As with Max Reassigns Per Pass the effective cap is the larger of this value and the number of connected players. Each move costs one small object update to each player nearby: raise it to convert a large patch or ore face in a single pass, lower it on a bandwidth-constrained host.", true, 1, 256);
+
+            // --- M3 proximity layer: one player near it, that player owns it ----------------
+            // Latency placement prices a whole zone and weighs everyone in range of it equally,
+            // which is right for a fight they are all watching and wrong for two players a hundred
+            // metres apart with a fight each: being in range of each other is then enough to put
+            // one player's creatures on the other's machine. This sits in front of the cost
+            // function and takes the decision away from it whenever exactly one player is near.
+            EnableCreatureProximityOwnership = BindServerConfig("Ownership", "Creature Proximity Ownership", true,
+                "When exactly one player is near a creature, that player owns it, whatever anyone else's latency is. It is never taken from them for a lower-latency player who is merely in loading range; a creature nobody is simulating goes to them rather than to the lowest-latency player present; and one owned by a player who has moved well away is handed to them. When two or more players are near the same creature it is a shared fight and latency decides, exactly as before, and the same when nobody is near it. Applies to everything simulated, so an unattended cart or an idle tame follows the same rule; a ship, a ridden mount and an attached cart are never taken from a present owner, as before. Host-side only, no client install needed. Applies immediately, no restart needed.");
+            CreatureProximityRadius = BindServerConfig("Ownership", "Creature Proximity Radius", 48f,
+                "How close, in metres, a player has to be to a creature to count as near it for Creature Proximity Ownership. Two players both inside this distance of one creature are sharing a fight; two players further apart than about twice this are not, for anything close to either of them. A creature is only taken from its owner for another player once the owner is 8m beyond this. Smaller is stricter about who is really in a fight and protects less at bow range; larger protects more and treats players who are merely close as fighting together.", false, 16f, 96f);
 
             // --- M20: ship ownership follows the helmsman -----------------------------------
             // Vanilla hands a saddle or a cart to whoever takes control of it, but never a ship:
@@ -372,14 +402,17 @@ namespace NetworkPerformanceSystem {
             // socket the queue figure includes bytes in flight, so the M2 window IS the standing
             // queue for a backlogged peer, and past ~100ms RTT it sits above their threshold for
             // as long as the backlog lasts. Jotunn's threshold is a static field and is raised to
-            // sit above the window (JotunnSendQueue); the others have theirs compiled in, so for
-            // them the queue is periodically brought under it instead.
-            QueueDrainIntervalSeconds = BindServerConfig("Compatibility", "Queue Drain Interval Seconds", 8f,
-                "Some mods (ServerSync and every mod bundling it, ConditionalConfigSync) wait for a peer's socket send queue to fall under a fixed 10000-20000 bytes before sending, and disconnect that peer after 30 seconds if it never does. A latency-sized send window can legitimately keep more than that in flight, so every this-many seconds a peer whose queue has stayed above 'Queue Drain Floor Bytes' has its ZDO sends held at that floor for a fraction of a second - long enough for those mods to get their packet out. Costs a few percent of throughput, and only while a peer is backlogged; an idle peer is never touched. Must stay well under 30. 0 disables the drain. Jotunn's own limit is handled separately and needs no drain.",
-                false, 0f, 25f);
-            QueueDrainFloorBytes = BindServerConfig("Compatibility", "Queue Drain Floor Bytes", 8192,
-                "Queue level a drain brings the peer down to, in bytes. Must sit below the lowest threshold any installed mod waits for - older ServerSync copies use 10000, current ones and ConditionalConfigSync 20000 - with room for one ZDO of overshoot. Raising it shortens each drain; lowering it makes the dip more certain to be seen.",
-                true, 2048, 20000);
+            // sit above the window (JotunnSendQueue). The others have theirs compiled in, so what
+            // they read is changed instead: the part of the queue the window adds above vanilla is
+            // taken off (SendQueueView). That covers Jotunn too, which leaves M13 as the backstop
+            // for when this is off or stood down.
+            //
+            // It replaces the 1.4.2-1.6.0 drain, which held backlogged peers at 8 KB for a round
+            // trip every eight seconds so the real figure would dip - a periodic stall for every
+            // distant player. Its two settings are no longer bound and are left in old config
+            // files as orphans, which BepInEx carries along without reading.
+            ReportVanillaQueueSize = BindServerConfig("Compatibility", "Report Vanilla Queue Size", true,
+                "Some mods - ServerSync and every mod that bundles it, ConditionalConfigSync, ServerCharacters, Jotunn - wait for a player's send queue to fall under a fixed 10000-20000 bytes before sending, and disconnect that player after 30 seconds if it never does. That figure counts data already on its way, so a latency-sized send window keeps it above those numbers for as long as a distant player has updates to receive. With this on, those mods are shown the queue less the part this mod's window adds above vanilla's, which is the range they would see without this mod, so they wait exactly as long as they otherwise would. Nothing is held back and nothing sent changes; this mod's own send path keeps reading the real figure. Turn it off only if another mod misbehaves with it, and expect those mods to time out distant players when it is. Applies immediately.");
 
             // ================================================================================
             // M15-M18: allocation removals on the ZDO network path
@@ -455,6 +488,24 @@ namespace NetworkPerformanceSystem {
             EnableRelaySendReuse = BindServerConfig("Allocation", "Enable Relay Send Reuse", true,
                 "Write each relayed RPC (footsteps, hits, damage numbers, chat and the rest) once and hand the same bytes to every player it goes to, instead of rebuilding and re-copying the whole message for each one. The bytes sent are identical. Host-side only. Relayed messages no longer pass through ZRpc.Invoke, so a mod that watches Invoke to count traffic will not see them; nothing known does. Stands down alongside EnRoute or BetterZeeRouter. Applies immediately, no restart needed.");
 
+            // --- Network monitoring ---------------------------------------------------------
+            // A recorder for when something is wrong and counters cannot say what. Off by default,
+            // and off means its hooks are not applied at all - see Runtime/Monitoring/Monitoring.cs.
+            // Every setting here is read live, so it can be switched on for an evening and off
+            // again without a restart.
+            EnableMonitoring = BindServerConfig("Monitoring", "Enable Network Monitoring", false,
+                "Record what the network is doing to BepInEx/NpsMonitoring, for sending to the mod author with a bug report. Every change of a creature's owner and whether it held, messages delivered to a player who no longer owned the target (a hit that does nothing), how regularly each player's creatures report in, and each player's ping and connection quality once a second. No player names, platform ids, addresses or chat - only session ids, object ids, positions to the metre and timings. Costs nothing while off: the hooks it needs are only applied while it is on. Switch it on, play through the problem, switch it off, send the folder. Applies immediately, no restart needed.");
+            MonitoringCollectFromClients = BindServerConfig("Monitoring", "Collect From Clients", true,
+                "While monitoring is on, also ask every player's game for what only it can see - what a creature was doing when it changed owner, who it was fighting, how long it took to pick its target back up, how far it jumped on screen, frame rate - and write that into the same files. Needs this mod on the client; clients without it are unaffected. A player can refuse with AllowMonitoringUpload in their own config.");
+            MonitoringClientBytesPerSecond = BindServerConfig("Monitoring", "Client Upload Bytes Per Second", 2048,
+                "The most each client may send the server in monitoring records, averaged over time. Records beyond it are dropped on the client and counted. Sent in 4KB batches that are held back whenever the client's link to the server is already near its send window, so they never delay the game's own traffic. For scale, the Send Window section's Target Rate is 150KB per second by default.", true, 256, 4096);
+            MonitoringMaxDiskMB = BindServerConfig("Monitoring", "Max Disk MB", 4096,
+                "The most BepInEx/NpsMonitoring may hold, across every session in it. Recording stops when it is reached and says so in the log. Nothing already recorded is ever deleted to make room. Files are compressed as they are closed.", false, 64, 65536);
+
+            // Any server-side setting changing mid-session is worth a record of its own while
+            // monitoring is on: it is what separates the two halves of an on/off comparison.
+            Config.SettingChanged += OnAnySettingChanged;
+
             // Steam's networking config is process-global and re-writable at any time, so these
             // four take effect on edit rather than needing a restart. The two Send Window entries
             // are here as well because the coupling warning compares them against the transport
@@ -491,6 +542,10 @@ namespace NetworkPerformanceSystem {
 
         private static void OnConnectionTimeoutSettingChanged(object sender, EventArgs e) {
             Runtime.ConnectionTimeout.OnConfigChanged();
+        }
+
+        private static void OnAnySettingChanged(object sender, SettingChangedEventArgs e) {
+            Runtime.Monitoring.OnSettingChanged(e.ChangedSetting);
         }
 
         /// <summary>

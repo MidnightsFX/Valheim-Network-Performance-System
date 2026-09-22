@@ -153,6 +153,45 @@ namespace NetworkPerformanceSystem.Runtime {
             return ownerMetres - nearestMetres >= marginMetres;
         }
 
+        /// <summary>
+        /// How far beyond the proximity radius an owner has to be before a simulated object is
+        /// taken from it for the one player standing near. Same standing as
+        /// InteractionStandOffMetres: a constant, because it is not a preference.
+        ///
+        /// It is the whole of the proximity layer's distance hysteresis. "Exactly one player
+        /// within the radius, and it is not the owner" already puts the owner outside the radius;
+        /// without a margin a creature pacing along that line would change hands every time the
+        /// min-hold allowed. With it, the creature has to cross the margin plus whatever gap lies
+        /// between the two players' radii before it can go back. The distances are measured
+        /// against reference positions, which are up to 200ms old on the fast channel and up to
+        /// two seconds old for a client without this mod, so the band absorbs some of that error
+        /// too. The min-hold is the other half: whatever the geometry says, a new owner keeps the
+        /// object for Min Hold Seconds.
+        /// </summary>
+        internal const float ProximityPullMarginMetres = 8f;
+
+        /// <summary>
+        /// The proximity layer's pull rule, with the geometry factored out for the same reason
+        /// ShouldPlaceInteractive is: pure, so the offline harness can table it. Squared distances
+        /// in and out, because the caller never needs a root.
+        ///
+        /// Asked only once the caller has established that exactly one player is near the object
+        /// and that player is not its owner. What is left to decide is whether the owner is far
+        /// enough away to lose it:
+        ///
+        ///   * owner is not a viewer -> yes. That is a dedicated host, whose reference position is
+        ///                              the world origin and not a place anybody is standing, so
+        ///                              its distance means nothing. It simulates the object for
+        ///                              nobody's benefit but latency's, and one player fighting
+        ///                              alone is better off at zero hops than at one.
+        ///   * owner beyond the margin -> yes.
+        ///   * otherwise               -> no, and the caller holds the object where it is.
+        /// </summary>
+        internal static bool ShouldPullToSoleNearby(bool ownerIsViewer, float ownerSq, float pullSq) {
+            if (!ownerIsViewer) { return true; }
+            return ownerSq > pullSq;
+        }
+
         private static PrefabClass Classify(ZDO zdo) {
             int prefab = zdo.GetPrefab();
             if (ClassCache.TryGetValue(prefab, out PrefabClass cached)) { return cached; }

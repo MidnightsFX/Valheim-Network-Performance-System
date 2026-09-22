@@ -22,7 +22,7 @@ namespace NetworkPerformanceSystem.Runtime {
         ConnectionTimeout, // M11 - ZRpc.SetLongTimeout + Steam TimeoutInitial/TimeoutConnected
         StationRpcRouting, // M12 - ZRoutedRpc.RPC_RoutedRPC delivery of station item requests to the current owner
         JotunnQueueLimit,  // M13 - Jotunn.Entities.CustomRPC.MaximumSendQueueSize kept above the M2 window ceiling
-        QueueDrain,        // M14 - ZDOMan.SendZDOs periodic queue drain for mods with a fixed send queue threshold
+        QueueSizeView,     // M14 - ZSteamSocket.GetSendQueueSize shown to other mods as vanilla's window would leave it
         DeserializeAlloc,  // M15 - ZDO.Deserialize field read without the fourteen per-ZDO delegates
         PacketReadAlloc,   // M16 - ZPackage.ReadPackage(ref) straight into the target buffer
         SendPacketReuse,   // M17 - ZDOMan.SendZDOs reuses its two packages instead of rebuilding them

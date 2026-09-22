@@ -231,6 +231,13 @@ namespace NetworkPerformanceSystem.Runtime {
             /// only reset at the top of RunPass, and ApplyUpgrades runs at the end of that same
             /// pass.</summary>
             internal SectorVerdict Sector;
+
+            /// <summary>A tier-1 move made by the proximity layer rather than by the cost
+            /// function: the object is going to the one player standing near it. It shares tier
+            /// 1's queue, budget and sort, and differs in two ways when applied - it is pushed to
+            /// the sector at once, because the player it is going to is about to hit the thing,
+            /// and it is counted and reported apart.</summary>
+            internal bool Proximity;
         }
 
         // Diagnostics. Rescue and optimisation are counted apart on purpose: they are different
@@ -279,6 +286,16 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static int LastPassNearestRescued;
         internal static long TotalInteractiveOptimised;
 
+        // The proximity layer: simulated objects with exactly one player near them. Kept counts
+        // every such object left where it was, whether because that player already owned it or
+        // because its owner was not yet far enough away to lose it - either way the cost function
+        // was not asked. Pulled counts moves actually applied, not queued.
+        internal static int LastPassProximityKept;
+        internal static int LastPassProximityPulled;
+        internal static int LastPassProximityRescued;
+        internal static long TotalProximityPulled;
+        internal static long TotalProximityRescued;
+
         // Tier 2's settings, read once per pass. ArbitrateZone already carries five arguments down
         // from RunPass and four more would be noise - but the real reason these are fields is that
         // they are read on a path that runs per ZDO rather than per zone, and a BepInEx
@@ -289,6 +306,12 @@ namespace NetworkPerformanceSystem.Runtime {
         private static float _interactiveClaimRadiusSq;
         private static float _interactiveMargin;
         private static float _interactiveHold;
+
+        // The proximity layer's settings, read once per pass for the same reason. Both distances
+        // are kept squared: the scan compares squares and never needs a root.
+        private static bool _proximityEnabled;
+        private static float _proximityRadiusSq;
+        private static float _proximityPullSq;
 
         /// <summary>Entries no pass has seen for this long are dropped so the history table
         /// cannot grow without bound on a long-running server. Pruning keys off LastSeenAt, not
@@ -319,6 +342,12 @@ namespace NetworkPerformanceSystem.Runtime {
         private const int RescueWarningConsecutivePasses = 3;
         private static int _rescueBurstStreak;
 
+        // Network monitoring's denominators: how many simulated objects sat in a zone one
+        // candidate covered, against how many sat in a contested one. Only counted while
+        // monitoring is on. See CountCreatures.
+        private static int _monitorSoleCreatures;
+        private static int _monitorContestedCreatures;
+
         internal static void RunPass(ZDOMan zdoMan) {
             if (ZNet.instance == null || ZoneSystem.instance == null) { return; }
 
@@ -336,6 +365,12 @@ namespace NetworkPerformanceSystem.Runtime {
             _interactiveHold = ValConfig.OwnershipInteractiveMinHoldSeconds.Value;
             _evictGhostOwners = PatchGuard.IsActive(Mechanism.PeerLiveness)
                                 && ValConfig.EvictGhostOwners.Value;
+
+            _proximityEnabled = ValConfig.EnableCreatureProximityOwnership.Value;
+            float proximityRadius = ValConfig.CreatureProximityRadius.Value;
+            float proximityPull = proximityRadius + OwnershipPolicy.ProximityPullMarginMetres;
+            _proximityRadiusSq = proximityRadius * proximityRadius;
+            _proximityPullSq = proximityPull * proximityPull;
 
             LastPassGhostsExcluded = 0;
             BuildCandidates(zdoMan);
@@ -362,6 +397,10 @@ namespace NetworkPerformanceSystem.Runtime {
             LastPassStaticHeld = 0;
             LastPassInteractiveHeld = 0;
             LastPassNearestRescued = 0;
+            LastPassProximityKept = 0;
+            LastPassProximityRescued = 0;
+            _monitorSoleCreatures = 0;
+            _monitorContestedCreatures = 0;
 
             long sessionId = zdoMan.m_sessionID;
 
@@ -390,6 +429,10 @@ namespace NetworkPerformanceSystem.Runtime {
             watch.Stop();
             LastPassMs = (float)watch.Elapsed.TotalMilliseconds;
 
+            if (Monitoring.Active) {
+                Monitoring.OnPassCompleted(ZonesToScan.Count, _monitorSoleCreatures, _monitorContestedCreatures);
+            }
+
             bool burst = LastPassConsidered > 0 && LastPassRescued * 4 > LastPassConsidered;
             _rescueBurstStreak = burst ? _rescueBurstStreak + 1 : 0;
             if (_rescueBurstStreak >= RescueWarningConsecutivePasses
@@ -403,7 +446,7 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             if (Logger.Level >= BepInEx.Logging.LogLevel.Debug) {
-                Logger.LogDebug($"Ownership pass: considered {LastPassConsidered} ({LastPassUnownedOnEntry} unowned) over {ZonesToScan.Count} zones, rescued {LastPassRescued} ({LastPassHelmRescued} to a helmsman, {LastPassNearestRescued} to the nearest), released {LastPassReleased}, optimised {LastPassOptimised}, deferred {LastPassDeferred}, interactive {LastPassInteractiveOptimised} ({LastPassInteractiveDeferred} deferred, {LastPassInteractiveHeld} held), static held {LastPassStaticHeld}, ghosts excluded {LastPassGhostsExcluded}, history {OwnerHistory.Count}, {LastPassMs:F1}ms.");
+                Logger.LogDebug($"Ownership pass: considered {LastPassConsidered} ({LastPassUnownedOnEntry} unowned) over {ZonesToScan.Count} zones, rescued {LastPassRescued} ({LastPassHelmRescued} to a helmsman, {LastPassNearestRescued} to the nearest), released {LastPassReleased}, optimised {LastPassOptimised}, deferred {LastPassDeferred}, proximity {LastPassProximityPulled} pulled / {LastPassProximityKept} kept / {LastPassProximityRescued} rescued, interactive {LastPassInteractiveOptimised} ({LastPassInteractiveDeferred} deferred, {LastPassInteractiveHeld} held), static held {LastPassStaticHeld}, ghosts excluded {LastPassGhostsExcluded}, history {OwnerHistory.Count}, {LastPassMs:F1}ms.");
             }
         }
 
@@ -413,6 +456,10 @@ namespace NetworkPerformanceSystem.Runtime {
         private static void ApplyVerdict(List<ZDO> objects, SectorVerdict verdict, long sessionId,
                                          float now, float minHold, float margin) {
             int present = verdict.Present.Count;
+
+            // A pass of its own rather than a counter in the loops below, so that those stay
+            // exactly as they were for everyone who is not monitoring.
+            if (present > 0 && Monitoring.Active) { CountCreatures(objects, present == 1); }
 
             if (!verdict.HasEligible && present == 0) {
                 // Nobody covers this zone at all, so no owner can be present and every owned ZDO
@@ -724,6 +771,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
                 if (!zdo.HasOwner()) { LastPassUnownedOnEntry++; continue; }
 
+                if (Monitoring.Active) { Monitoring.NoteCause(zdo, HandoffCause.Release); }
                 zdo.SetOwner(0L);
                 OwnerHistory.Remove(zdo.m_uid);
                 LastPassReleased++;
@@ -790,6 +838,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     // Nobody can take it - see ReleaseZone for why an absent owner is released
                     // rather than left in place.
                     if (!IsPresent(verdict, currentOwner)) {
+                        if (Monitoring.Active) { Monitoring.NoteCause(zdo, HandoffCause.Release); }
                         zdo.SetOwner(0L);
                         OwnerHistory.Remove(zdo.m_uid);
                         LastPassReleased++;
@@ -894,9 +943,72 @@ namespace NetworkPerformanceSystem.Runtime {
                     continue;
                 }
 
-                // Tier 1 from here down, unchanged. A single compare that retires nearly every
-                // remaining ZDO in the zone - in a settled world the owner already is the best
-                // choice.
+                // THE PROXIMITY LAYER. Tier 1 prices a whole sector by latency and weighs every
+                // player whose active area covers it equally - which is right when they are all
+                // watching the same fight, and wrong when two of them are a hundred metres apart
+                // with a fight each. Being in range of each other is then enough for one player's
+                // creatures to be simulated on the other's machine: every swing costs
+                // rtt(attacker) + rtt(owner) instead of nothing, and the creature lags or freezes
+                // around the handoff that put it there. With three players present the cost
+                // function does that itself, handing a creature to a lower-latency bystander. With
+                // exactly two it never challenges a present owner (the two totals are always
+                // equal, and the load handicap is capped under the margin), but the same damage is
+                // done earlier: whoever loaded the zone first owns what is in it, and an unowned
+                // creature is rescued to the lower-latency of the two even with the other
+                // standing on it.
+                //
+                // So: when EXACTLY ONE player is near an object, that player is its owner of
+                // choice and the cost function is not consulted at all. If that player already
+                // owns it, it is kept. If somebody else does, it is pulled to that player once
+                // its owner is far enough away to lose it (OwnershipPolicy.ShouldPullToSoleNearby)
+                // and the ordinary hold has run out, and kept where it is until then - NOT handed
+                // to the sector's best in the meantime, which is the whole point. Two or more
+                // players near it is a shared fight, and nobody near it is nobody's fight; both
+                // fall through to the cost function exactly as before.
+                //
+                // Ahead of the "owner is already the sector's best" test on purpose: the commonest
+                // shape of the two-player case is the lower-latency player owning a creature the
+                // other one has just walked up to, and that test would retire it.
+                //
+                // The cost is SoleNearbyViewer: the same handful of multiplies tier 2 runs, per
+                // simulated object in a contested zone. Everything that does not move was retired
+                // by the tier split above without reaching this.
+                if (_proximityEnabled) {
+                    int sole = SoleNearbyViewer(verdict, zdo.GetPosition(), currentOwner,
+                                                out int ownerIndex, out float ownerSq);
+                    if (sole >= 0 && Candidates[sole].CanOwn) {
+                        Candidate near = Candidates[sole];
+
+                        // IsPresent above has already established that the owner is one of the
+                        // candidates the scan walked, so ownerIndex is real. Belt and braces, as
+                        // in tier 2: an owner we somehow failed to find declines the move.
+                        //
+                        // The hold is read last: Touch writes the history table, and only a ZDO
+                        // that is otherwise about to move needs an entry in it. Same discipline
+                        // as the cost function's path below.
+                        if (near.Uid != currentOwner
+                            && ownerIndex >= 0
+                            && OwnershipPolicy.ShouldPullToSoleNearby(Candidates[ownerIndex].IsViewer, ownerSq, _proximityPullSq)
+                            && !OwnershipPolicy.IsDirectlyControlled(zdo)
+                            && now - Touch(zdo.m_uid, currentOwner, now) >= minHold) {
+                            // Priority is the staleness the near player stops paying - the same
+                            // quantity, in the same unit, as every other entry in this queue, so
+                            // the shared sort in Drain stays meaningful across both kinds.
+                            PendingSimulated.Add(new PendingMove {
+                                Zdo = zdo, NewOwner = near.Uid,
+                                Priority = (Candidates[ownerIndex].RttMs + near.RttMs) * 0.5f,
+                                Sector = verdict, Proximity = true,
+                            });
+                        } else {
+                            LastPassProximityKept++;
+                        }
+                        continue;
+                    }
+                }
+
+                // Tier 1's cost function from here down, unchanged. A single compare that retires
+                // nearly every remaining ZDO in the zone - in a settled world the owner already is
+                // the best choice.
                 if (verdict.BestUid == currentOwner) { continue; }
 
                 // Directly-controlled objects follow their controller, never the cost function.
@@ -1094,9 +1206,59 @@ namespace NetworkPerformanceSystem.Runtime {
             return nearest;
         }
 
+        /// <summary>
+        /// The proximity layer's scan: the index into Candidates of the ONE player within the
+        /// proximity radius of this position, or -1 when nobody is or more than one is.
+        ///
+        /// The same loop tier 2 runs, over the same two to four present candidates, asking a
+        /// different question - not "who is nearest" but "is anybody here alone". Squares
+        /// throughout, XZ only for the reason given in TryArbitrateInteractive, and it returns the
+        /// moment a second player turns up, because that is a shared fight and the answer no
+        /// longer depends on anything else.
+        ///
+        /// Only VIEWERS count as being near. A dedicated host's reference position is the world
+        /// origin, which is not somewhere anybody is standing; counting it would make every
+        /// creature near spawn look like a shared fight and switch the layer off exactly where a
+        /// busy server's players gather. A listen host is a viewer and counts like anyone else.
+        /// CanOwn is deliberately NOT tested here - a player barred from owning is still a player
+        /// standing next to the creature, and still makes it a shared fight. The caller checks
+        /// whether the one it got back may own.
+        ///
+        /// Also reports where the current owner is among the candidates and how far away, so the
+        /// caller can decide a pull without a second walk. Both are only meaningful when the
+        /// return value is not -1: an early return has not necessarily reached the owner yet.
+        /// Pass 0 for a rescue, which has no owner to find.
+        /// </summary>
+        private static int SoleNearbyViewer(SectorVerdict verdict, Vector3 pos, long currentOwner,
+                                            out int ownerIndex, out float ownerSq) {
+            ownerIndex = -1;
+            ownerSq = float.MaxValue;
+            int sole = -1;
+
+            List<int> presentIndex = verdict.PresentIndex;
+            for (int i = 0; i < presentIndex.Count; i++) {
+                Candidate candidate = Candidates[presentIndex[i]];
+
+                float dx = candidate.RefPos.x - pos.x;
+                float dz = candidate.RefPos.z - pos.z;
+                float sq = dx * dx + dz * dz;
+
+                if (candidate.Uid == currentOwner) {
+                    ownerIndex = presentIndex[i];
+                    ownerSq = sq;
+                }
+
+                if (!candidate.IsViewer || sq > _proximityRadiusSq) { continue; }
+                if (sole >= 0) { return -1; }                                 // a second player: a shared fight
+                sole = presentIndex[i];
+            }
+            return sole;
+        }
+
         /// <summary>Restore an owner to a ZDO that has none present. Uncapped by design - see
         /// ArbitrateZone.</summary>
         private static void Rescue(ZDO zdo, long newOwner, float now) {
+            if (Monitoring.Active) { Monitoring.NoteCause(zdo, HandoffCause.Rescue); }
             zdo.SetOwner(newOwner);
             OwnerHistory[zdo.m_uid] = new OwnershipRecord { Owner = newOwner, ChangedAt = now, LastSeenAt = now };
             LastPassRescued++;
@@ -1143,20 +1305,54 @@ namespace NetworkPerformanceSystem.Runtime {
                 return Candidates[nearest].Uid;
             }
 
-            if (!ShipHelmOwnership.Enabled) { return verdict.BestUid; }
+            // The helm rule first: a ship with somebody steering it goes to them whoever else is
+            // standing on deck. Everything that is not such a ship - every creature - used to fall
+            // back to the sector's best candidate from each of the four exits below, and now falls
+            // back through the proximity layer instead, which is the sector's best candidate
+            // unless exactly one player is near.
+            if (!ShipHelmOwnership.Enabled) { return SoleNearbyOrBest(zdo, verdict); }
 
             long playerId = OwnershipPolicy.HelmsmanPlayerId(zdo);
-            if (playerId == 0L) { return verdict.BestUid; }
+            if (playerId == 0L) { return SoleNearbyOrBest(zdo, verdict); }
 
             long helmsman = PeerForPlayer(playerId);
-            if (helmsman == 0L) { return verdict.BestUid; }
+            if (helmsman == 0L) { return SoleNearbyOrBest(zdo, verdict); }
             if (helmsman != verdict.BestUid && (!IsPresent(verdict, helmsman) || !CanOwn(helmsman))) {
-                return verdict.BestUid;
+                return SoleNearbyOrBest(zdo, verdict);
             }
 
             LastPassHelmRescued++;
             TotalHelmRescued++;
             return helmsman;
+        }
+
+        /// <summary>
+        /// The proximity layer's half of a rescue: an object nobody present is simulating goes to
+        /// the one player near it, and to the sector's best candidate when there is no such
+        /// player - nobody near, or several.
+        ///
+        /// This is the safest place the layer acts and the one that matters most with two players.
+        /// Safest for the reason the nearest rule is safe for stationary objects: nobody present
+        /// is writing this ZDO, so there is no in-flight owner write to race. Most valuable
+        /// because with exactly two players the cost function's two totals are always equal and
+        /// the tie goes to the lower-latency one - so without this, every unowned creature in a
+        /// zone they share goes to that player, including the ones the other is standing next to.
+        ///
+        /// The counters only move when the answer differs from the sector's best, so they read as
+        /// "rescues this layer changed" rather than "rescues it looked at".
+        /// </summary>
+        private static long SoleNearbyOrBest(ZDO zdo, SectorVerdict verdict) {
+            if (!_proximityEnabled) { return verdict.BestUid; }
+
+            int sole = SoleNearbyViewer(verdict, zdo.GetPosition(), 0L, out _, out _);
+            if (sole < 0 || !Candidates[sole].CanOwn) { return verdict.BestUid; }
+
+            long uid = Candidates[sole].Uid;
+            if (uid != verdict.BestUid) {
+                LastPassProximityRescued++;
+                TotalProximityRescued++;
+            }
+            return uid;
         }
 
         /// <summary>The candidate's own eligibility - false for a host barred by Allow Host As
@@ -1281,6 +1477,7 @@ namespace NetworkPerformanceSystem.Runtime {
             LastPassInteractiveOptimised = 0;
             LastPassInteractiveDeferred = 0;
             LastPassInteractiveCap = 0;
+            LastPassProximityPulled = 0;
 
             // The configured cap is a floor, not a ceiling: it is tuned for a small group, and a
             // fixed number of transfers per pass means convergence time grows linearly with the
@@ -1334,12 +1531,29 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (taken >= perTargetCap) { deferred++; continue; }
                 MovesPerTarget[move.NewOwner] = taken + 1;
 
+                // Tier 1 only: NoteCause ignores anything not Prioritized, and the candidate
+                // listing is the one part of a record worth skipping when nobody will read it.
+                if (Monitoring.Active && !forceSend) {
+                    Monitoring.NoteCause(move.Zdo, move.Proximity ? HandoffCause.Proximity : HandoffCause.Optimise,
+                                         move.Priority, DescribeCandidates(move));
+                }
                 move.Zdo.SetOwner(move.NewOwner);
                 OwnerHistory[move.Zdo.m_uid] = new OwnershipRecord { Owner = move.NewOwner, ChangedAt = now, LastSeenAt = now };
                 applied++;
                 total++;
 
-                if (forceSend) { ForceSendToSector(move); }
+                // A proximity move is pushed out at once for the reasons tier 2's are, and they
+                // bite harder here. The player it is going to is standing next to the creature
+                // and about to hit it, and until their copy of the owner id catches up that hit is
+                // addressed to the old owner, who drops it without a word. And the old owner is
+                // writing this ZDO every frame, so it is the peer that most needs to hear soonest.
+                // The cost function's own moves keep their old behaviour: changing those is a
+                // separate question, and one the monitoring data should answer first.
+                if (move.Proximity) {
+                    LastPassProximityPulled++;
+                    TotalProximityPulled++;
+                }
+                if (forceSend || move.Proximity) { ForceSendToSector(move); }
             }
         }
 
@@ -1394,6 +1608,59 @@ namespace NetworkPerformanceSystem.Runtime {
             for (int i = 0; i < stale.Count; i++) { OwnerHistory.Remove(stale[i]); }
         }
 
+        // -- network monitoring --------------------------------------------------------------
+        // Read-only views for Runtime/Monitoring. None of this runs unless monitoring is on.
+
+        /// <summary>Simulated objects this peer owned as of the last pass, from the load tally.
+        /// Zero when the load penalty is off, because then nothing tallies.</summary>
+        internal static int OwnedCountFor(long uid) {
+            return OwnedCount.TryGetValue(uid, out int owned) ? owned : 0;
+        }
+
+        private static void CountCreatures(List<ZDO> objects, bool soleCandidate) {
+            int count = 0;
+            for (int i = 0; i < objects.Count; i++) {
+                ZDO zdo = objects[i];
+                if (zdo != null && zdo.Persistent && zdo.Type == ZDO.ObjectType.Prioritized) { count++; }
+            }
+            if (soleCandidate) { _monitorSoleCreatures += count; } else { _monitorContestedCreatures += count; }
+        }
+
+        /// <summary>
+        /// Everyone the cost function weighed for this move, as a JSON array: what each would
+        /// have cost in total, its RTT, how many simulated objects it already owned, and how far
+        /// it stood from the object. The last of those is the one the cost function does NOT
+        /// use - it is recorded so that a rule which did can be tried against the same moves.
+        /// </summary>
+        private static string DescribeCandidates(PendingMove move) {
+            if (move.Zdo.Type != ZDO.ObjectType.Prioritized) { return null; }
+
+            SectorVerdict verdict = move.Sector;
+            Vector3 pos = move.Zdo.GetPosition();
+            System.Globalization.CultureInfo invariant = System.Globalization.CultureInfo.InvariantCulture;
+
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(64 * verdict.PresentIndex.Count);
+            sb.Append('[');
+            for (int i = 0; i < verdict.PresentIndex.Count; i++) {
+                Candidate candidate = Candidates[verdict.PresentIndex[i]];
+                float dx = candidate.RefPos.x - pos.x;
+                float dz = candidate.RefPos.z - pos.z;
+                verdict.TotalByOwner.TryGetValue(candidate.Uid, out float total);
+
+                if (i > 0) { sb.Append(','); }
+                sb.Append("{\"uid\":\"").Append(candidate.Uid.ToString(invariant)).Append('"')
+                  .Append(",\"rtt\":").Append(candidate.RttMs.ToString("0.#", invariant))
+                  .Append(",\"totalMs\":").Append(total.ToString("0.#", invariant))
+                  .Append(",\"owned\":").Append(OwnedCountFor(candidate.Uid).ToString(invariant))
+                  .Append(",\"distM\":").Append(Mathf.Sqrt(dx * dx + dz * dz).ToString("0", invariant))
+                  .Append(",\"canOwn\":").Append(candidate.CanOwn ? "true" : "false")
+                  .Append(",\"viewer\":").Append(candidate.IsViewer ? "true" : "false")
+                  .Append('}');
+            }
+            sb.Append(']');
+            return sb.ToString();
+        }
+
         internal static void Reset() {
             Candidates.Clear();
             ZonesToScan.Clear();
@@ -1439,6 +1706,18 @@ namespace NetworkPerformanceSystem.Runtime {
             _interactiveClaimRadiusSq = 0f;
             _interactiveMargin = 0f;
             _interactiveHold = 0f;
+
+            LastPassProximityKept = 0;
+            LastPassProximityPulled = 0;
+            LastPassProximityRescued = 0;
+            TotalProximityPulled = 0;
+            TotalProximityRescued = 0;
+            _proximityEnabled = false;
+            _proximityRadiusSq = 0f;
+            _proximityPullSq = 0f;
+
+            _monitorSoleCreatures = 0;
+            _monitorContestedCreatures = 0;
         }
     }
 }

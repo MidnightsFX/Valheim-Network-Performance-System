@@ -54,6 +54,7 @@ namespace NetworkPerformanceSystem.Runtime {
             if (helmsman == 0L || helmsman == ZDOMan.GetSessionID()) { return false; }
 
             ZDO zdo = nview.GetZDO();
+            if (Monitoring.Active) { Monitoring.NoteCause(zdo, HandoffCause.Helm); }
             zdo.SetOwner(helmsman);
             // Ownership travels with the next ZDO send while the grant already went out as an
             // RPC. Put it at the front of that send so the helmsman's first throttle press has

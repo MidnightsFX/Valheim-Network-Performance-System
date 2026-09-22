@@ -3,6 +3,24 @@
 **For groups playing together across long distances.** If your friends are 200ms+ away and the game
 feels like mush no matter how much bandwidth everyone has, this is aimed at you.
 
+> **Lag, rubber-banding, hits not landing? Send a report.**
+>
+> **Server owners:** in `BepInEx/config/MidnightsFX.NetworkPerformanceSystem.cfg`, set
+> `Enable Network Monitoring = true` under `[Monitoring]`. You do not need to restart, and an admin
+> can also change it in game. Play through the problem, set it back to `false`, and zip the newest
+> folder in `BepInEx/NpsMonitoring/`.
+>
+> **Players:** your game sends nothing unless the server asks, and never sends names, platform ids,
+> addresses or chat. To opt out anyway, set `AllowMonitoringUpload = false` under `[Client config]`
+> in your own copy of that file. The server cannot override it. It only stops your game uploading:
+> the server still logs its own side of the connection, such as your ping, under an anonymous
+> session number.
+>
+> **Then** post the zip as a [GitHub issue](https://github.com/MidnightsFX/Valheim-Network-Performance-System/issues)
+> or on the [Discord](https://discord.gg/Dmr9PQTy9m), with a description of what you saw: what
+> happened, how often, roughly when, and how many players were on. See
+> [Reporting a network problem](#reporting-a-network-problem) for what is recorded.
+
 ## Why this is different from the other networking mods
 
 Every other Valheim networking mod treats multiplayer performance as a **bandwidth** problem —
@@ -35,7 +53,7 @@ someone who did not have a problem.
 | | |
 |---|---|
 | **Per-peer send window** | Sized from measured RTT (bandwidth-delay product) instead of a fixed 10 KB. Applies in both directions, so a distant player's *uploads* stop being throttled too. |
-| **Latency-aware ownership** | Assigns each **moving** object (creatures, physics props) to whoever minimises perceived staleness, with hysteresis so ownership cannot thrash. Never takes an object somebody is actively driving, and never moves a building, container, crafting station, piece or portal away from a player who is still there: those follow vanilla's rules, since moving them gains nothing and races the RPCs that put items into them. |
+| **Latency-aware ownership** | Assigns each **moving** object (creatures, physics props) to whoever minimises perceived staleness, with hysteresis so ownership cannot thrash. A creature with **exactly one player near it** belongs to that player whatever anyone else's latency is, so two groups fighting a hundred metres apart do not end up simulating each other's creatures just because they are in loading range of one another; latency only decides a fight that players are actually sharing. Never takes an object somebody is actively driving, and never moves a building, container, crafting station, piece or portal away from a player who is still there: those follow vanilla's rules, since moving them gains nothing and races the RPCs that put items into them. |
 | **Interactables follow the player** | Picking a berry does not happen on your machine — it asks whoever *owns* the bush to do it, and if that is another player the request goes you → server → them and the result comes back the same way. Four network legs for one keypress, which is why a shared berry patch feels sluggish and why the same bush sometimes needs a second press. The same is true of every swing at an ore vein, a rock or a tree. Pickables, ore deposits, rocks, trees, logs and destructibles are now placed on whoever is standing **nearest** them — by distance, not by ping, because nothing about a bush changes between interactions and the only thing that matters is whether the person about to touch it is the one simulating it. An object is never taken from an owner still within reach of it, and never from more than a short distance away, so a patch nobody is near is left alone. Players do not need the mod for it. |
 | **Ships follow the helm** | Vanilla hands a saddle or a cart to whoever takes control of it, but never a ship: whoever owned it keeps simulating it while they are aboard, and the person steering rides relayed motion — choppy, with every throttle change a round trip. Taking the helm now hands the ship to you, the same way the game hands over saddles and carts, and an abandoned ship goes to the player at its helm first. |
 | **Send scheduler fix** | Vanilla services one peer per rendered frame, so the advertised 20Hz silently becomes ~5.5Hz at ten players. This sends to everyone each tick. |
@@ -49,6 +67,7 @@ someone who did not have a problem.
 | **Clean exit from a dead session** | If the server stops answering, you are told at the halfway mark with a countdown, and returned to the menu once it is certain — instead of playing on in a world the server is no longer part of and losing everything you did there. It follows whatever timeout is actually in force rather than adding one of its own, which matters more than it sounds: `ZRpc`'s timeout is a process-wide static that the game itself raises to 90 seconds the moment one crossplay socket is accepted. Client-side, and the one part of this table that needs the mod on *your* machine. |
 | **Allocation relief** *(opt-in)* | Five changes that remove short-lived objects from the network path. None of them alters a byte on the wire or a value in a ZDO; what they reduce is how often the garbage collector has to run.<br>• **ZDO Deserialize** — reads a received ZDO's fields directly, instead of through the fourteen delegates the game allocates for every one whether the packet contains that field type or not. The largest of the four, and clients gain more than servers.<br>• **Packet Read** — reads each incoming payload straight into the buffer about to hold it, not into a temporary array that is copied across and thrown away.<br>• **Send Package Reuse** — reuses the two packet buffers the send path builds, rather than constructing and discarding both on every send to every peer.<br>• **RPC Invoke** — calls an incoming RPC's handler directly when its signature is the common one, instead of going through reflection for every message. The largest CPU saving of the four ZDO-path changes.<br>• **Relay Send Reuse** — the host writes each relayed RPC once and hands the same bytes to every player it goes to, instead of rebuilding and re-copying the whole message for each one. Host-only; applies without a restart.<br>All five ship **off** — see "Known limitations" for what they are and are not worth. |
 | **`nps_stats`** | Per-peer RTT, window size, and how often peers are being starved. Open to anyone. Run `nps_stats_collect` (needs `devcommands`, since sampling costs a Steam call per peer per tick), play, then `nps_stats`. |
+| **Network monitoring** *(off by default)* | A recorder for when something is wrong and you want it looked at. See "Reporting a network problem" below. |
 
 ## Installing
 
@@ -62,6 +81,38 @@ exactly as vanilla. There is **no version lock**: nobody gets kicked for not hav
 
 Works on dedicated servers and on player-hosted games.
 
+## Reporting a network problem
+
+If creatures rubber-band, hits do nothing, or things freeze when players come and go, the server
+can record what the network was doing so it can be diagnosed rather than guessed at.
+
+1. On the server, set `Enable Network Monitoring` to `true` in the `Monitoring` section. No restart
+   is needed, and it can be changed in game by an admin.
+2. Play through the problem. An evening with the usual players is ideal.
+3. Set it back to `false`.
+4. Zip the newest folder under `BepInEx/NpsMonitoring/` on the server and send it, with a sentence
+   about what players saw and roughly when, as a
+   [GitHub issue](https://github.com/MidnightsFX/Valheim-Network-Performance-System/issues) or on
+   the [Discord](https://discord.gg/Dmr9PQTy9m).
+
+**What is recorded:** each time a creature changes owner and whether the change held, messages
+delivered to a player who no longer owned the target, how regularly each player's creatures report
+in, and each player's ping and connection quality once a second. Clients that have the mod add
+what only they can see: what a creature was doing when it changed hands, who it was fighting, how
+far it jumped on screen, and frame rate. That costs each client up to 2 KB per second of upload,
+sent in small batches that are held back whenever the connection is busy with the game's own
+traffic, so recording never delays it.
+
+**What is not:** player names, Steam or platform ids, IP addresses, chat. Players appear only as
+the random session number the game gives them for that connection, and positions are rounded to
+the metre. Any player can refuse to send anything by setting `AllowMonitoringUpload` to `false` in
+their own config.
+
+While it is off it costs nothing: the hooks it uses are only installed while it is on. The folder
+is capped by `Max Disk MB` (4096 by default, across all sessions). When the cap is reached recording
+stops and the log says so; nothing already recorded is deleted, so clear out old sessions yourself.
+`nps_stats` shows whether it is running and whether anything is being dropped.
+
 ## Known limitations
 
 - On a **dedicated** server, contested objects go to the lowest-latency player present rather than
@@ -71,6 +122,16 @@ Works on dedicated servers and on player-hosted games.
   simulates them. That is intended and is a CPU cost to plan for on a busy spawn hub; set
   `Allow Host As Owner` to false to place purely on players. The server never takes ownership of
   zones it has not loaded, because owning something it is not simulating would freeze it.
+- `Creature Proximity Ownership` decides by where players are standing, and the server only knows
+  that as well as it is told. Clients with the mod report their position five times a second;
+  clients without it every two seconds, so a sprinting vanilla client can be ten metres or more
+  from where the server thinks it is. `Creature Proximity Radius` (48 m) and the 8 m an owner has
+  to be beyond it before losing a creature are both sized with that in mind, but a creature right
+  on the boundary between two players can still change hands once as they move. It will not
+  change back until `Min Hold Seconds` has passed and the geometry has reversed. When two or more
+  players are near the same creature this setting steps aside entirely and latency decides, as it
+  always has - including in favour of a lower-latency player who is in range but not in the fight.
+  That case is known and is waiting on real data; see "Reporting a network problem".
 - Ownership arbitration re-places two kinds of object, by two different rules: creatures and other
   simulated, moving things go to whoever minimises staleness for everyone watching, and interactables
   that do not move — pickables, ore deposits, rocks, trees, logs, destructibles — go to whoever is
@@ -137,14 +198,15 @@ Works on dedicated servers and on player-hosted games.
   ceiling below are what decide whether a bigger number is actually playable - read the two
   bullets above before setting one.
 - Some mods wait for a peer's socket send queue to fall under a fixed byte count before they send
-  (Jotunn's `CustomRPC`, ServerSync and every mod bundling it, ConditionalConfigSync) and disconnect
-  the peer after 30 seconds if it never does. That number was sized against vanilla; a latency-sized
-  window legitimately keeps more in flight past ~100 ms RTT. Jotunn's limit is a field, and it is
-  raised automatically to `Max Window Bytes` plus 20000 on both ends. The others have theirs compiled
-  in, so the `Compatibility` settings briefly bring a backlogged peer's queue under it every
-  `Queue Drain Interval Seconds` - a few percent of throughput, only while that peer is backlogged. If
-  a mod with its own threshold still times out, lower `Queue Drain Floor Bytes` or the interval;
-  `nps_stats` shows both limits and how often the drain ran.
+  (Jotunn's `CustomRPC`, ServerSync and every mod bundling it, ConditionalConfigSync,
+  ServerCharacters) and disconnect the peer after 30 seconds if it never does. That number was sized
+  against vanilla; a latency-sized window legitimately keeps more in flight past ~100 ms RTT. With
+  `Compatibility` > `Report Vanilla Queue Size` on (the default), those mods read the queue less the
+  part the window adds above vanilla's, which is the same range they would see without this mod, so
+  they wait exactly as long as they otherwise would. Nothing is held back, and this mod's own send
+  path keeps reading the real figure. Jotunn's limit is also raised to `Max Window Bytes` plus 20000,
+  as a backstop for when that setting is off. `nps_stats` shows both, and how much is being kept out
+  of other mods' reading for each player.
 - The `Allocation` settings are **churn reductions, not a fix for running out of memory**, and it is
   worth being precise about the difference. Mono's collector runs more often the faster objects are
   created, so removing allocations from the ZDO path means fewer collections and less CPU spent on

@@ -1,5 +1,18 @@
 # Changelog
 
+**1.7.0**
+- Players on a high-ping connection no longer see the world pause every 8 seconds while there is a lot going on.
+	- `Queue Drain Interval Seconds` and `Queue Drain Floor Bytes` are no longer read and can be deleted from the config.
+	- `nps_stats` "Third-party send queue thresholds" shows how many outside reads were adjusted and how much is kept out of them for each player.
+- A creature with exactly one player near it now belongs to that player, whatever anyone else's latency is. New `Ownership` setting **Creature Proximity Ownership** (default on), with **Creature Proximity Radius** (default 48 m).
+	- `nps_stats` gains a "proximity" line: kept, pulled, and rescues it redirected.
+- Network monitoring: a recorder a server owner can switch on when something is wrong, to send with a bug report. New `Monitoring` section, **Enable Network Monitoring** (default off). See "Reporting a network problem" in the README.
+	- Records each change of a creature's owner and whether it held, messages delivered to a player who no longer owned the target, how regularly each player's creatures report in, and each player's ping and connection quality. Clients with the mod add what only they can see, at up to 2 KB per second in small batches that always wait for the game's own traffic, and a player can refuse with `AllowMonitoringUpload`.
+	- No player names, platform ids, addresses or chat. Players appear only as the session number the game gives them.
+	- Costs nothing while off: its hooks are installed when it is switched on and removed when it is switched off, with no restart either way.
+	- Written to `BepInEx/NpsMonitoring`, compressed, and capped by **Max Disk MB** (default 4096). Recording stops at the cap; nothing already recorded is deleted.
+	- `nps_stats` gains a "Network monitoring" block.
+
 **1.6.0**
 - A player who has stopped answering no longer freezes everything they were simulating. New `Connection Timeout` setting **Evict Ghost Owners** (default on), with **Ghost Owner Evict Seconds** (default 10).
 	- "Stop trusting this peer to simulate" is a different question and is now asked separately. A peer that goes quiet loses its objects to the players who are actually there, while keeping its slot for the full timeout so it can come back. Nothing is disconnected any sooner, and if it returns it competes for ownership again on the next pass.

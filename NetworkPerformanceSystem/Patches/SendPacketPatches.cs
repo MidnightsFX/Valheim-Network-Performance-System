@@ -13,14 +13,13 @@ namespace NetworkPerformanceSystem.Patches {
     /// fails quietly rather than loudly.
     ///
     /// This mod already touches SendZDOs twice: M2/M2c transpiles it (SendWindowPatches rewrites
-    /// both window constants and splices in M14's queue observation) and M5 prefixes it for
-    /// telemetry. A prefix here that returned false to run a replacement body would skip the very
-    /// body M2 had just transpiled. That is not a crash - it is worse. M2 runs at patch time,
-    /// finds the IL shape intact, rewrites its two sites and logs "Send window sizing active",
-    /// and then that code never executes: every peer silently reverts to a fixed 10 KB window and
-    /// the queue drain observes nothing, with a startup line asserting the opposite. M2's own
-    /// guard cannot catch it either, because a prefix leaves the constants exactly where they
-    /// were and its count still passes.
+    /// both window constants and marks M14's queue read) and M5 prefixes it for telemetry. A
+    /// prefix here that returned false to run a replacement body would skip the very body M2 had
+    /// just transpiled. That is not a crash - it is worse. M2 runs at patch time, finds the IL
+    /// shape intact, rewrites its two sites and logs "Send window sizing active", and then that
+    /// code never executes: every peer silently reverts to a fixed 10 KB window, with a startup
+    /// line asserting the opposite. M2's own guard cannot catch it either, because a prefix leaves
+    /// the constants exactly where they were and its count still passes.
     ///
     /// As transpilers the two compose in either order and neither can hide the other's failure:
     /// this one only touches `newobj ZPackage`, which M2 never emits or removes, and M2 only

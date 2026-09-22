@@ -111,6 +111,12 @@ namespace NetworkPerformanceSystem.Runtime {
             return Measured.TryGetValue(peerUid, out PeerLatency state) && state.HasSample;
         }
 
+        /// <summary>The whole measurement for one peer - last sample, smoothed value and jitter
+        /// together. Host side. False until the peer has been sampled at least once.</summary>
+        internal static bool TryGetState(long peerUid, out PeerLatency state) {
+            return Measured.TryGetValue(peerUid, out state) && state.HasSample;
+        }
+
         /// <summary>
         /// RTT for any session id, usable on either side: the host reads its own measurements, a
         /// client reads the table the host published. Returns 0 when unknown.

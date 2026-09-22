@@ -75,7 +75,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             PeerStats entry = GetOrCreate(netPeer.m_uid, netPeer.m_playerName);
 
-            int queue = netPeer.m_socket.GetSendQueueSize();
+            int queue = SendQueueView.Real(netPeer.m_socket);                // what the send path reads, not what other mods see
             int window = SendWindow.For(peer);
 
             entry.SendAttempts++;
@@ -140,6 +140,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendShipHelm(sb);
             AppendExtrapolation(sb);
             AppendAllocationRelief(sb);
+            AppendMonitoring(sb);
 
             if (!Collecting) {
                 sb.AppendLine();
@@ -177,7 +178,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.ConnectionTimeout: return ValConfig.EnableConnectionTimeoutTuning.Value;
                 case Mechanism.StationRpcRouting: return ValConfig.EnableStationRpcRouting.Value;
                 case Mechanism.JotunnQueueLimit: return ValConfig.EnableSendWindowSizing.Value;
-                case Mechanism.QueueDrain: return ValConfig.EnableSendWindowSizing.Value && ValConfig.QueueDrainIntervalSeconds.Value > 0f;
+                case Mechanism.QueueSizeView: return ValConfig.EnableSendWindowSizing.Value && ValConfig.ReportVanillaQueueSize.Value;
                 case Mechanism.DeserializeAlloc: return AllocationRelief.DeserializeWanted;
                 case Mechanism.PacketReadAlloc: return AllocationRelief.PacketReadWanted;
                 case Mechanism.SendPacketReuse: return AllocationRelief.SendPackageReuseWanted;
@@ -399,8 +400,9 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>
         /// M13/M14 - the two answers to mods that wait on a fixed send queue size. Jotunn's limit
         /// is printed as read back from its field, so a Jotunn update that renamed it shows here
-        /// as "not applied" rather than as a mystery 30-second disconnect. The drain rows are the
-        /// cost side: how often a backlogged peer was briefly held, and for how long.
+        /// as "not applied" rather than as a mystery 30-second disconnect. The view rows say
+        /// whether anybody outside this mod is actually reading the queue, and how much is being
+        /// kept out of what they read for each peer right now.
         /// </summary>
         private static void AppendThirdPartyThresholds(StringBuilder sb) {
             sb.AppendLine();
@@ -416,37 +418,41 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine($"  Jotunn CustomRPC   not applied: {reason ?? "not started"}");
             }
 
-            if (!QueueDrain.Enabled) {
-                string drainReason = PatchGuard.GetDisableReason(Mechanism.QueueDrain);
-                bool sizing = PatchGuard.IsActive(Mechanism.SendWindow) && ValConfig.EnableSendWindowSizing.Value;
-                if (drainReason != null) {
-                    sb.AppendLine($"  queue drain        stood down: {drainReason}");
-                } else {
-                    sb.AppendLine(sizing
-                        ? "  queue drain        off (Queue Drain Interval Seconds is 0)"
-                        : "  queue drain        off (vanilla window - nothing to drain)");
-                }
+            string viewReason = PatchGuard.GetDisableReason(Mechanism.QueueSizeView);
+            if (viewReason != null) {
+                sb.AppendLine($"  vanilla queue view stood down: {viewReason}");
+                return;
+            }
+            if (!ValConfig.ReportVanillaQueueSize.Value) {
+                sb.AppendLine("  vanilla queue view off (Report Vanilla Queue Size) - other mods read the real queue, and ones");
+                sb.AppendLine("                     that wait for it to fall under 10-20KB may time out distant players");
+                return;
+            }
+            if (!SendQueueView.OwnReadMarked) {
+                sb.AppendLine("  vanilla queue view not running - the send path's queue read was not marked this session, so");
+                sb.AppendLine("                     it could not be told apart from other mods' reads");
                 return;
             }
 
-            sb.AppendLine($"  queue drain        every {ValConfig.QueueDrainIntervalSeconds.Value:F0}s to {QueueDrain.FloorBytes / 1024f:F1}KB, for mods with the threshold compiled in (ServerSync, ConditionalConfigSync)");
+            sb.AppendLine("  vanilla queue view on - other mods read each player's queue less the window opened above vanilla's");
+            sb.AppendLine($"  outside reads      {SendQueueView.OutsideReads} since start, {SendQueueView.AdjustedReads} of them adjusted");
 
             List<ZNetPeer> peers = ZNet.instance.GetPeers();
             bool any = false;
             for (int i = 0; i < peers.Count; i++) {
                 long uid = peers[i].m_uid;
-                if (!QueueDrain.TryGetState(uid, out QueueDrain.State state)) { continue; }
+                int extra = SendWindow.ExtraBytes(uid);
+                if (extra <= 0) { continue; }
                 if (!any) {
-                    sb.AppendLine("  name                 drains  held ticks  aborted  last drain");
+                    sb.AppendLine("  name                 window    kept out of other mods' reading");
                     any = true;
                 }
                 string name = string.IsNullOrEmpty(peers[i].m_playerName) ? "(connecting)" : peers[i].m_playerName;
-                string last = state.Drains > 0 && state.LastDrainSeconds > 0f ? $"{state.LastDrainSeconds:F2}s" : "-";
-                string now = state.Draining ? " (draining)" : "";
-                sb.AppendLine($"  {Pad(name, 20)} {Pad(state.Drains.ToString(), 7)} {Pad(state.HeldTicks.ToString(), 11)} {Pad(state.Aborted.ToString(), 8)} {last}{now}");
+                string window = $"{(extra + SendWindow.VanillaWindowBytes) / 1024f:F1}KB";
+                sb.AppendLine($"  {Pad(name, 20)} {Pad(window, 9)} {extra / 1024f:F1}KB");
             }
             if (!any) {
-                sb.AppendLine("  (no peer has held a window above vanilla yet - nothing to drain)");
+                sb.AppendLine("  (no player's window is above vanilla right now - other mods read the real queue)");
             }
         }
 
@@ -627,8 +633,15 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  unowned     {OwnershipArbiter.LastPassUnownedOnEntry} on entry");
             sb.AppendLine($"  rescued     {OwnershipArbiter.LastPassRescued} (had no present owner - never capped)");
             sb.AppendLine($"  released    {OwnershipArbiter.LastPassReleased} (no eligible owner in range)");
-            sb.AppendLine($"  optimised   {OwnershipArbiter.LastPassOptimised} (moving objects, given to a lower-latency owner)");
+            sb.AppendLine($"  optimised   {OwnershipArbiter.LastPassOptimised} (moving objects, given to a better-placed owner; includes the pulls below)");
             sb.AppendLine($"  deferred    {OwnershipArbiter.LastPassDeferred} (moving objects only, hit the per-pass cap of {OwnershipArbiter.LastPassCap})");
+
+            // Same reasoning as tier 2 below: say "latency only" when it is off rather than say nothing.
+            if (ValConfig.EnableCreatureProximityOwnership.Value) {
+                sb.AppendLine($"  proximity   {OwnershipArbiter.LastPassProximityKept} kept with the only player near them, {OwnershipArbiter.LastPassProximityPulled} pulled to that player, {OwnershipArbiter.LastPassProximityRescued} rescues sent to that player instead of the lowest-latency one (within {ValConfig.CreatureProximityRadius.Value:F0}m)");
+            } else {
+                sb.AppendLine("  proximity   off (creatures are placed by latency alone, however far away the lowest-latency player is)");
+            }
 
             // Tier 2 prints a "vanilla" line when it is off rather than nothing at all: a silently
             // missing mechanism is the worst failure mode for a performance mod, and this block is
@@ -643,7 +656,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             sb.AppendLine($"  static held {OwnershipArbiter.LastPassStaticHeld} (present owner is not the lowest-latency one; kept because the object does not move)");
             sb.AppendLine($"  pass time   {OwnershipArbiter.LastPassMs:F1}ms");
-            sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued}, optimised {OwnershipArbiter.TotalOptimised}, interactive {OwnershipArbiter.TotalInteractiveOptimised}");
+            sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued}, optimised {OwnershipArbiter.TotalOptimised}, interactive {OwnershipArbiter.TotalInteractiveOptimised}, proximity pulled {OwnershipArbiter.TotalProximityPulled} / rescued {OwnershipArbiter.TotalProximityRescued}");
 
             // The failure this split exists to make visible: a growing backlog of ZDOs with no
             // simulator is frozen creatures that cannot be damaged, and it is otherwise invisible
@@ -668,6 +681,33 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  {Pad("handed off", 13)} {ShipHelmOwnership.HandedOff} (ships this machine owned, given to the player who took the helm)");
             if (NpsEnv.IsHost() && PatchGuard.IsActive(Mechanism.Ownership) && ValConfig.EnableOwnershipArbitration.Value) {
                 sb.AppendLine($"  {Pad("helm rescues", 13)} {OwnershipArbiter.TotalHelmRescued} (abandoned ship given to the player at its helm)");
+            }
+        }
+
+        /// <summary>Whether the recorder is running and whether it is keeping up. The recording
+        /// itself is in the files; this only answers "is it on, and is anything being lost".</summary>
+        private static void AppendMonitoring(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Network monitoring:");
+            if (!Monitoring.Active) {
+                sb.AppendLine(NpsEnv.IsHost()
+                    ? "  off (Monitoring > Enable Network Monitoring)"
+                    : "  off (the server has not asked this client for records, or AllowMonitoringUpload is false)");
+                return;
+            }
+
+            if (Monitoring.ServerRole && Monitoring.Writer != null) {
+                MonitoringWriter writer = Monitoring.Writer;
+                sb.AppendLine($"  {Pad("recording to", 15)} {writer.Directory}");
+                sb.AppendLine($"  {Pad("records", 15)} {writer.RecordsWritten} written, {writer.RecordsDropped} dropped");
+                sb.AppendLine($"  {Pad("on disk", 15)} {writer.StoredBytes / (1024 * 1024)}MB of {ValConfig.MonitoringMaxDiskMB.Value}MB{(writer.DiskFull ? " - FULL, recording has stopped" : "")}");
+                sb.AppendLine($"  {Pad("ownership", 15)} {Monitoring.HandoffsRecorded} owner changes of simulated objects, {Monitoring.DragBacksRecorded} undone by the previous owner's packet");
+                sb.AppendLine($"  {Pad("misaddressed", 15)} {Monitoring.MisroutedRpcs} creature messages sent to a machine that did not own the target");
+                sb.AppendLine($"  {Pad("client batches", 15)} {MonitoringUpload.BatchesAccepted} accepted, {MonitoringUpload.BatchesRejected} rejected, {MonitoringUpload.LinesRejected} lines rejected");
+            } else {
+                sb.AppendLine("  on - sending this game's records to the server");
+                sb.AppendLine($"  {Pad("dropped here", 15)} {MonitoringUpload.LocalRecordsDropped} (over the server's upload budget)");
+                sb.AppendLine($"  {Pad("held for link", 15)} {MonitoringUpload.SendsDeferredForLink} sends waited because the connection was already near its send window");
             }
         }
 

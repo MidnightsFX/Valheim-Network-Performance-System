@@ -386,7 +386,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
         /// <summary>See through socket wrappers to the transport underneath. Steady state is the
         /// first check: a ZSteamSocket is returned before any reflection happens.</summary>
-        private static ISocket Unwrap(ISocket socket) {
+        internal static ISocket Unwrap(ISocket socket) {
             for (int depth = 0; depth < MaxUnwrapDepth; depth++) {
                 if (socket is ZSteamSocket) { return socket; }
                 Type type = socket.GetType();

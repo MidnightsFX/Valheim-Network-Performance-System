@@ -91,9 +91,10 @@ namespace NetworkPerformanceSystem.Patches {
         // -- ZDO.SetOwner ------------------------------------------------------------------
 
         private static void SetOwnerPrefix(ZDO __instance, out long __state) {
-            // A flag read, and it retires nearly every call: walls, trees and bushes change hands
-            // far more often than creatures do.
-            if (__instance.Type != ZDO.ObjectType.Prioritized) {
+            // A flag read and, for a Default ZDO, a cached prefab lookup; together they retire
+            // nearly every call: walls, trees and bushes change hands far more often than
+            // creatures do.
+            if (!Monitoring.IsTracked(__instance)) {
                 __state = NotCaptured;
                 return;
             }
@@ -130,10 +131,10 @@ namespace NetworkPerformanceSystem.Patches {
 
         private static void SetOwnerInternalPrefix(ZDO __instance, long uid) {
             if (!Monitoring.InZdoData || Monitoring.InSetOwner) { return; }
-            // A ZDO being created from this packet still has its default type here - its flags
-            // arrive with Deserialize, which comes after - so new objects fall out on this line
-            // too, and only an existing creature's update goes further.
-            if (__instance.Type != ZDO.ObjectType.Prioritized) { return; }
+            // A ZDO being created from this packet still has its default type and no prefab here -
+            // both arrive with Deserialize, which comes after - so new objects fall out on this
+            // line too, and only an existing creature's or ship's update goes further.
+            if (!Monitoring.IsTracked(__instance)) { return; }
 
             Monitoring.OnPacketZdo(__instance, uid);
         }

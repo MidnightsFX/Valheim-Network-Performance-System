@@ -45,6 +45,10 @@ namespace NetworkPerformanceSystem.Runtime {
             internal float JumpMetres = -1f;
             internal int DragBacks;
             internal int RemoteChanges;
+
+            /// <summary>Packets that would have dragged this handoff back and that
+            /// OwnerRevisionGuard refused. Each one is a DragBack that did not happen.</summary>
+            internal int Blocked;
         }
 
         private sealed class OwnerGaps {
@@ -161,6 +165,13 @@ namespace NetworkPerformanceSystem.Runtime {
             return false;
         }
 
+        /// <summary>OwnerRevisionGuard refused a packet that would have put an older owner back on
+        /// this object.</summary>
+        internal static void NoteBlocked(ZDOID uid) {
+            if (Watched.Count == 0) { return; }
+            if (Watched.TryGetValue(uid, out Entry entry)) { entry.Blocked++; }
+        }
+
         private static void NoteGap(ZDO zdo, long owner, double gapMs, double nowMs) {
             if (!GapsByOwner.TryGetValue(owner, out OwnerGaps gaps)) {
                 gaps = new OwnerGaps();
@@ -241,6 +252,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Flag("gone", zdo == null)
                 .Flag("superseded", superseded)
                 .Int("dragBacks", entry.DragBacks)
+                .Int("blocked", entry.Blocked)
                 .Int("remoteChanges", entry.RemoteChanges)
                 .Num("oldLastWriteMs", entry.OldLastWriteMs, "0")
                 .Num("newFirstWriteMs", entry.NewFirstWriteMs, "0")

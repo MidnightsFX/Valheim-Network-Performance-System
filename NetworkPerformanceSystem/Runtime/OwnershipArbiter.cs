@@ -20,9 +20,15 @@ namespace NetworkPerformanceSystem.Runtime {
     /// should own this" has two different answers depending on what the object is. The pass is
     /// tiered:
     ///
-    ///   * TIER 1 - Prioritized ZDOs: simulated things that move. Their state changes continuously
-    ///     between sends, so every viewer eats (rtt(owner) + rtt(viewer)) / 2 of staleness, and the
-    ///     cost function above is exactly the right thing to minimise.
+    ///   * TIER 1 - simulated things that move: creatures, and Prioritized ZDOs (ships, carts).
+    ///     Their state changes continuously between sends, so every viewer eats
+    ///     (rtt(owner) + rtt(viewer)) / 2 of staleness, and the cost function above is exactly the
+    ///     right thing to minimise. Creatures are found by prefab, not by ZDO.ObjectType: the game
+    ///     marks ships and players Prioritized and leaves every creature Default, which kept them
+    ///     out of this tier entirely until 1.8.0 (OwnershipPolicy.IsCreature). They are also the
+    ///     tier's first priority - their moves drain first and are pushed out at once - and the
+    ///     one kind of object never released from an owner that still has it loaded; see
+    ///     OwnerStillLoads.
     ///   * TIER 2 - interactables that do not move: pickables, ore veins, rocks, trees, logs,
     ///     destructibles. Staleness is meaningless for these - a berry bush's ZDO changes once,
     ///     when somebody picks it. What costs the player is the interaction, which
@@ -34,7 +40,7 @@ namespace NetworkPerformanceSystem.Runtime {
     /// Note what it still does NOT do. It never moves a building, container, crafting station,
     /// piece or portal away from a present owner: there is nothing to win, and the move races the
     /// game's owner-addressed item RPCs, which for a station means a consumed item (see
-    /// StationRpcRouter). And it never moves a Player, Ship, ridden tame or attached cart away from
+    /// RpcOwnerRouter). And it never moves a Player, Ship, ridden tame or attached cart away from
     /// a healthy owner, because authority must follow direct control - that is the failure mode
     /// behind ship-helm stutter. Tier 2 is the same principle one step weaker: it will not take an
     /// object from an owner still standing within reach of it, because that owner may be mid-swing.
@@ -97,6 +103,12 @@ namespace NetworkPerformanceSystem.Runtime {
             /// negotiated per peer, so it is captured here rather than read once for the pass.</summary>
             internal int NearRadius;
 
+            /// <summary>Whether that near ring is the full square (classic distance) or the
+            /// disc-clipped one. Together with NearRadius this is exactly what the candidate has
+            /// instantiated - see ZoneCompat.NearRingLoaded, and OwnerStillLoads for why a creature
+            /// owner is judged by it.</summary>
+            internal bool NearClassic;
+
             /// <summary>The candidate's own world position, not its zone centre. Tier 2 places by
             /// distance to the ZDO itself, and ZoneSystem.GetZonePos quantises to 64m - larger than
             /// the whole claim radius, so every candidate in a zone would score identically.
@@ -113,6 +125,12 @@ namespace NetworkPerformanceSystem.Runtime {
 
         private static readonly List<Candidate> Candidates = new List<Candidate>();
 
+        /// <summary>Session id -> index into Candidates, rebuilt with it every pass. Asked only
+        /// about the owner of a creature that is outside every presence square covering it, which
+        /// is the one question that has to find a candidate who is not in the sector's Present
+        /// list.</summary>
+        private static readonly Dictionary<long, int> CandidateIndex = new Dictionary<long, int>();
+
         /// <summary>Every zone inside at least one candidate's scan square this pass. Scanning each
         /// zone exactly once is what keeps the pass duplicate-free without a per-ZDO dictionary:
         /// a ZDO lives in exactly one sector list, so it can only be visited once.</summary>
@@ -128,8 +146,15 @@ namespace NetworkPerformanceSystem.Runtime {
         private static readonly List<PendingMove> PendingSimulated = new List<PendingMove>();
         private static readonly List<PendingMove> PendingInteractive = new List<PendingMove>();
 
-        private static readonly System.Comparison<PendingMove> ByPriority =
-            (a, b) => b.Priority.CompareTo(a.Priority);
+        /// <summary>Creatures first, then by priority. Only the tier-1 list ever holds a creature,
+        /// so on the tier-2 list this is the plain priority sort it always was. On tier 1 it puts
+        /// every creature ahead of every cart or idle ship whatever the numbers say: a misplaced
+        /// cart answers slowly, a misplaced creature is a fight that lags or a hit that does
+        /// nothing, and the per-pass cap should be spent on that first.</summary>
+        private static readonly System.Comparison<PendingMove> ByPriority = (a, b) => {
+            if (a.Creature != b.Creature) { return a.Creature ? -1 : 1; }
+            return b.Priority.CompareTo(a.Priority);
+        };
 
         private static readonly Dictionary<Vector2s, SectorVerdict> SectorCache = new Dictionary<Vector2s, SectorVerdict>();
         private static readonly List<SectorVerdict> VerdictPool = new List<SectorVerdict>();
@@ -238,6 +263,17 @@ namespace NetworkPerformanceSystem.Runtime {
             /// the sector at once, because the player it is going to is about to hit the thing,
             /// and it is counted and reported apart.</summary>
             internal bool Proximity;
+
+            /// <summary>The object is a creature: sorted ahead of everything else in its queue and
+            /// pushed out at once when applied, whichever rule chose it. See ByPriority and
+            /// Drain.</summary>
+            internal bool Creature;
+
+            /// <summary>Who owned it when the move was queued. A move is pushed to the sector's
+            /// Present set, and a creature's owner may be outside it - still simulating the
+            /// creature from its loaded ring - while being the one machine that most needs to
+            /// hear, because it is the one still writing.</summary>
+            internal long OldOwner;
         }
 
         // Diagnostics. Rescue and optimisation are counted apart on purpose: they are different
@@ -296,6 +332,16 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static long TotalProximityPulled;
         internal static long TotalProximityRescued;
 
+        // Creatures. Rescued and optimised are subsets of the pass-wide counters above, split out
+        // because creatures are the reason tier 1 exists and they were invisible to it before
+        // 1.8.0. Kept counts creatures whose owner is outside every presence square covering them
+        // but still has them loaded - left where they are rather than released or rescued away.
+        internal static int LastPassCreaturesRescued;
+        internal static int LastPassCreaturesOptimised;
+        internal static int LastPassCreaturesKept;
+        internal static long TotalCreaturesRescued;
+        internal static long TotalCreaturesOptimised;
+
         // Tier 2's settings, read once per pass. ArbitrateZone already carries five arguments down
         // from RunPass and four more would be noise - but the real reason these are fields is that
         // they are read on a path that runs per ZDO rather than per zone, and a BepInEx
@@ -312,6 +358,10 @@ namespace NetworkPerformanceSystem.Runtime {
         private static bool _proximityEnabled;
         private static float _proximityRadiusSq;
         private static float _proximityPullSq;
+
+        /// <summary>Arbitrate Creatures, read once per pass. Off leaves every creature on the
+        /// static path exactly as before 1.8.0.</summary>
+        private static bool _creaturesEnabled;
 
         /// <summary>Entries no pass has seen for this long are dropped so the history table
         /// cannot grow without bound on a long-running server. Pruning keys off LastSeenAt, not
@@ -371,6 +421,7 @@ namespace NetworkPerformanceSystem.Runtime {
             float proximityPull = proximityRadius + OwnershipPolicy.ProximityPullMarginMetres;
             _proximityRadiusSq = proximityRadius * proximityRadius;
             _proximityPullSq = proximityPull * proximityPull;
+            _creaturesEnabled = ValConfig.OwnershipArbitrateCreatures.Value;
 
             LastPassGhostsExcluded = 0;
             BuildCandidates(zdoMan);
@@ -399,6 +450,8 @@ namespace NetworkPerformanceSystem.Runtime {
             LastPassNearestRescued = 0;
             LastPassProximityKept = 0;
             LastPassProximityRescued = 0;
+            LastPassCreaturesRescued = 0;
+            LastPassCreaturesKept = 0;
             _monitorSoleCreatures = 0;
             _monitorContestedCreatures = 0;
 
@@ -419,8 +472,8 @@ namespace NetworkPerformanceSystem.Runtime {
 
                 // Two lists, one verdict: the decision is a property of the sector, and portals
                 // only sit apart because the game moved them to their own store.
-                if (hasObjects) { ApplyVerdict(objects, verdict, sessionId, now, minHold, margin); }
-                if (hasPortals) { ApplyVerdict(portals, verdict, sessionId, now, minHold, margin); }
+                if (hasObjects) { ApplyVerdict(objects, zone, verdict, sessionId, now, minHold, margin); }
+                if (hasPortals) { ApplyVerdict(portals, zone, verdict, sessionId, now, minHold, margin); }
             }
 
             ApplyUpgrades(now);
@@ -446,14 +499,14 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             if (Logger.Level >= BepInEx.Logging.LogLevel.Debug) {
-                Logger.LogDebug($"Ownership pass: considered {LastPassConsidered} ({LastPassUnownedOnEntry} unowned) over {ZonesToScan.Count} zones, rescued {LastPassRescued} ({LastPassHelmRescued} to a helmsman, {LastPassNearestRescued} to the nearest), released {LastPassReleased}, optimised {LastPassOptimised}, deferred {LastPassDeferred}, proximity {LastPassProximityPulled} pulled / {LastPassProximityKept} kept / {LastPassProximityRescued} rescued, interactive {LastPassInteractiveOptimised} ({LastPassInteractiveDeferred} deferred, {LastPassInteractiveHeld} held), static held {LastPassStaticHeld}, ghosts excluded {LastPassGhostsExcluded}, history {OwnerHistory.Count}, {LastPassMs:F1}ms.");
+                Logger.LogDebug($"Ownership pass: considered {LastPassConsidered} ({LastPassUnownedOnEntry} unowned) over {ZonesToScan.Count} zones, rescued {LastPassRescued} ({LastPassHelmRescued} to a helmsman, {LastPassNearestRescued} to the nearest, {LastPassCreaturesRescued} creatures), released {LastPassReleased}, optimised {LastPassOptimised} ({LastPassCreaturesOptimised} creatures), deferred {LastPassDeferred}, creatures kept by a loading owner {LastPassCreaturesKept}, proximity {LastPassProximityPulled} pulled / {LastPassProximityKept} kept / {LastPassProximityRescued} rescued, interactive {LastPassInteractiveOptimised} ({LastPassInteractiveDeferred} deferred, {LastPassInteractiveHeld} held), static held {LastPassStaticHeld}, ghosts excluded {LastPassGhostsExcluded}, history {OwnerHistory.Count}, {LastPassMs:F1}ms.");
             }
         }
 
         /// <summary>
         /// Turn one sector verdict into action over one list of that sector's ZDOs.
         /// </summary>
-        private static void ApplyVerdict(List<ZDO> objects, SectorVerdict verdict, long sessionId,
+        private static void ApplyVerdict(List<ZDO> objects, Vector2s zone, SectorVerdict verdict, long sessionId,
                                          float now, float minHold, float margin) {
             int present = verdict.Present.Count;
 
@@ -466,16 +519,17 @@ namespace NetworkPerformanceSystem.Runtime {
                 // here is released. That decision needs no owner id, only the flag - which matters
                 // because at the stock near simulation distance of 2 the scan square is 5x5 while
                 // the presence square is 3x3, so sixteen of every twenty-five zones a lone
-                // candidate pulls in land here.
-                ReleaseZone(objects);
+                // candidate pulls in land here. The one exception is a creature whose owner still
+                // has it loaded, and that is the only case that reads an owner id.
+                ReleaseZone(objects, zone);
             } else if (verdict.HasEligible && present == 1) {
                 // Exactly one candidate covers this zone, and BuildVerdict only ever picks a
                 // winner from the candidates it marked present - so the sole present peer is
                 // the best one. "Owner present" and "owner is best" collapse into the same
                 // test, which is what lets AssignZone answer most ZDOs from flags alone.
-                AssignZone(objects, verdict.BestUid, sessionId, now);
+                AssignZone(objects, zone, verdict, sessionId, now, minHold);
             } else {
-                ArbitrateZone(objects, verdict, now, minHold, margin);
+                ArbitrateZone(objects, zone, verdict, now, minHold, margin);
             }
         }
 
@@ -576,6 +630,7 @@ namespace NetworkPerformanceSystem.Runtime {
         /// </summary>
         private static void BuildCandidates(ZDOMan zdoMan) {
             Candidates.Clear();
+            CandidateIndex.Clear();
 
             // The host is always present so that ZDOs it legitimately owns are not read as
             // abandoned, but it only competes for ownership when configured to.
@@ -599,7 +654,9 @@ namespace NetworkPerformanceSystem.Runtime {
                 CanOwn = ValConfig.OwnershipAllowHostOwner.Value,
                 IsViewer = !NpsEnv.IsDedicated(),                            // a listen host has a player looking
                 NearRadius = Mathf.Max(1, hostDistance.NearSimulationDistance),
+                NearClassic = hostDistance.IsClassic,
             });
+            CandidateIndex[zdoMan.m_sessionID] = 0;
 
             // A peer we have no round-trip measurement for - PlayFab/crossplay, which never
             // reports one, or a Steam peer in its first seconds - must not read as 0ms, or the
@@ -615,8 +672,8 @@ namespace NetworkPerformanceSystem.Runtime {
 
                 // Exactly (0,0,0) is the "no position yet" sentinel: ZNet.RPC_PeerInfo copies it
                 // from the client's PeerInfo, which is sent before the client has chosen a spawn
-                // point, and it stays there until the first ServerSyncedPlayerData or RefPos
-                // arrives. A peer that has told us nothing about where it is cannot be
+                // point, and it stays there until the first ServerSyncedPlayerData arrives or M23
+                // finds the player's character. A peer that has told us nothing about where it is cannot be
                 // simulating anything, so it is neither an owner, a viewer nor present - treating
                 // it as a candidate at the origin handed it spawn-area objects it had not
                 // instantiated, which then sat frozen until the next pass. No real player stands
@@ -649,6 +706,8 @@ namespace NetworkPerformanceSystem.Runtime {
                     LastPassGhostsExcluded++;
                     continue;
                 }
+                SimulationDistance distance = ZoneCompat.For(netPeer);
+                CandidateIndex[uid] = Candidates.Count;
                 Candidates.Add(new Candidate {
                     Uid = uid,
                     Zone = ZoneSystem.GetZone(refPos),
@@ -656,7 +715,8 @@ namespace NetworkPerformanceSystem.Runtime {
                     RttMs = LatencyRegistry.HasMeasurement(uid) ? LatencyRegistry.MeasuredRttMs(uid) : unmeasuredMs,
                     CanOwn = true,
                     IsViewer = true,
-                    NearRadius = ZoneCompat.NearFor(netPeer),
+                    NearRadius = Mathf.Max(1, distance.NearSimulationDistance),        // ZoneCompat.NearFor, without asking twice
+                    NearClassic = distance.IsClassic,
                 });
             }
         }
@@ -718,9 +778,13 @@ namespace NetworkPerformanceSystem.Runtime {
         /// on the ZDO itself, so only what survives all three (a character or a ship that has an
         /// owner) costs an owner lookup.
         ///
-        /// Counting only Prioritized ZDOs is deliberate - things that actually cost their owner
-        /// simulation time, not walls and trees. Counting everything persistent meant anyone
-        /// standing in a base was instantly saturated and the term stopped saying anything.
+        /// Counting only simulated objects is deliberate - creatures, ships and carts, the things
+        /// that actually cost their owner simulation time, not walls and trees. Counting everything
+        /// persistent meant anyone standing in a base was instantly saturated and the term stopped
+        /// saying anything. Creatures need a prefab lookup, which the flags above it cannot
+        /// avoid: this is the one place the pass classifies every owned object, not just the
+        /// contested ones. OwnershipPolicy answers it from a small direct-mapped cache in front of
+        /// its prefab table, so the cost per object is an index and a compare.
         /// </summary>
         private static void TallyOwnedLoad(ZDOMan zdoMan, bool tallyLoad) {
             OwnedCount.Clear();
@@ -738,8 +802,9 @@ namespace NetworkPerformanceSystem.Runtime {
             for (int i = 0; i < objects.Count; i++) {
                 ZDO zdo = objects[i];
                 if (zdo == null || !zdo.Persistent) { continue; }
-                if (zdo.Type != ZDO.ObjectType.Prioritized) { continue; }
                 if (!zdo.HasOwner()) { continue; }
+                if (zdo.Type != ZDO.ObjectType.Prioritized
+                    && !(_creaturesEnabled && OwnershipPolicy.IsCreature(zdo))) { continue; }
 
                 long owner = zdo.GetOwner();
                 OwnedCount.TryGetValue(owner, out int count);
@@ -758,18 +823,27 @@ namespace NetworkPerformanceSystem.Runtime {
         /// as vanilla does it. The two must stay symmetrical - capping one side and not the other
         /// is what left creatures frozen.
         ///
-        /// Note what is absent: no ZDO.GetOwner. HasOwner() is the Owned flag on the ZDO, and
-        /// GetOwner is defined as "!Owned ? 0 : &lt;owner dictionary lookup&gt;", so the flag is
-        /// exactly the "owner != 0" test this needs and the lookup never happens. Vanilla's own
-        /// ReleaseNearbyZDOS reads it the same way.
+        /// Note what is absent: no ZDO.GetOwner for anything but a creature. HasOwner() is the
+        /// Owned flag on the ZDO, and GetOwner is defined as "!Owned ? 0 : &lt;owner dictionary
+        /// lookup&gt;", so the flag is exactly the "owner != 0" test this needs and the lookup never
+        /// happens. Vanilla's own ReleaseNearbyZDOS reads it the same way.
+        ///
+        /// A creature is the exception, and the only one: its owner may still have it loaded - this
+        /// zone is in that player's scan square, which is exactly the ring their game instantiates
+        /// but does not count as present - and then it stays. See OwnerStillLoads.
         /// </summary>
-        private static void ReleaseZone(List<ZDO> objects) {
+        private static void ReleaseZone(List<ZDO> objects, Vector2s zone) {
             for (int i = 0; i < objects.Count; i++) {
                 ZDO zdo = objects[i];
                 if (zdo == null || !zdo.Persistent) { continue; }
                 LastPassConsidered++;
 
                 if (!zdo.HasOwner()) { LastPassUnownedOnEntry++; continue; }
+
+                if (_creaturesEnabled && OwnershipPolicy.IsCreature(zdo) && OwnerStillLoads(zdo.GetOwner(), zone)) {
+                    LastPassCreaturesKept++;
+                    continue;
+                }
 
                 if (Monitoring.Active) { Monitoring.NoteCause(zdo, HandoffCause.Release); }
                 zdo.SetOwner(0L);
@@ -789,8 +863,15 @@ namespace NetworkPerformanceSystem.Runtime {
         /// "owner == ZDOMan.GetSessionID()" - settles the rest whenever the host is the sole
         /// candidate. When the winner is a remote peer, IsOwner() still rules out host-owned ZDOs
         /// for free and only the remainder pay for a lookup.
+        ///
+        /// Creatures are the one thing that costs a prefab lookup here, and only on the two
+        /// branches that were going to change an owner anyway: an unowned one is pushed out to its
+        /// new owner at once (RescueObject), and one owned by somebody outside the presence square
+        /// who still has it loaded is not a rescue at all - see ConsiderLoadedCreature.
         /// </summary>
-        private static void AssignZone(List<ZDO> objects, long bestUid, long sessionId, float now) {
+        private static void AssignZone(List<ZDO> objects, Vector2s zone, SectorVerdict verdict, long sessionId,
+                                       float now, float minHold) {
+            long bestUid = verdict.BestUid;
             bool bestIsSelf = bestUid == sessionId;
 
             for (int i = 0; i < objects.Count; i++) {
@@ -800,7 +881,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
                 if (!zdo.HasOwner()) {
                     LastPassUnownedOnEntry++;
-                    Rescue(zdo, bestUid, now);
+                    RescueObject(zdo, bestUid, _creaturesEnabled && OwnershipPolicy.IsCreature(zdo), verdict, 0L, now);
                     continue;
                 }
 
@@ -810,7 +891,15 @@ namespace NetworkPerformanceSystem.Runtime {
                     continue;
                 }
 
-                Rescue(zdo, bestUid, now);
+                // Owned by someone who is not the one candidate present here - so not present.
+                long owner = zdo.GetOwner();
+                bool creature = _creaturesEnabled && OwnershipPolicy.IsCreature(zdo);
+                if (creature && OwnerStillLoads(owner, zone)) {
+                    ConsiderLoadedCreature(zdo, verdict, owner, now, minHold);
+                    continue;
+                }
+
+                RescueObject(zdo, bestUid, creature, verdict, owner, now);
             }
         }
 
@@ -819,7 +908,7 @@ namespace NetworkPerformanceSystem.Runtime {
         /// none may own. This is the only loop that has to read owner ids, and the only one where
         /// a ZDO can reach the optimisation path.
         /// </summary>
-        private static void ArbitrateZone(List<ZDO> objects, SectorVerdict verdict, float now, float minHold, float margin) {
+        private static void ArbitrateZone(List<ZDO> objects, Vector2s zone, SectorVerdict verdict, float now, float minHold, float margin) {
             for (int i = 0; i < objects.Count; i++) {
                 ZDO zdo = objects[i];
                 if (zdo == null || !zdo.Persistent) { continue; }
@@ -828,16 +917,39 @@ namespace NetworkPerformanceSystem.Runtime {
                 // Unowned is a flag read, so the commonest rescue costs nothing to spot.
                 if (!zdo.HasOwner()) {
                     LastPassUnownedOnEntry++;
-                    if (verdict.HasEligible) { Rescue(zdo, RescueTarget(zdo, verdict), now); }
+                    if (verdict.HasEligible) {
+                        bool unownedCreature = _creaturesEnabled && OwnershipPolicy.IsCreature(zdo);
+                        RescueObject(zdo, RescueTarget(zdo, verdict, unownedCreature), unownedCreature, verdict, 0L, now);
+                    }
                     continue;
                 }
 
                 long currentOwner = zdo.GetOwner();
+                bool present = IsPresent(verdict, currentOwner);
+
+                // Asked only where the answer changes what happens: here for an owner outside the
+                // presence square, and at the tier split below for a present one - so at most once
+                // per ZDO, and never for the buildings a present owner simply keeps.
+                bool creature = false;
+
+                if (!present) {
+                    creature = _creaturesEnabled && OwnershipPolicy.IsCreature(zdo);
+
+                    // Not present is not the same as not simulating, for a creature. The owner's
+                    // game has instantiated its whole near ring, the presence square is only the
+                    // middle of it, and an owner who has stepped out of the middle is still running
+                    // the creature's AI and writing its position. Releasing or rescuing it away from
+                    // them is what left creatures frozen mid-fight at the edge of a player's view.
+                    if (creature && OwnerStillLoads(currentOwner, zone)) {
+                        ConsiderLoadedCreature(zdo, verdict, currentOwner, now, minHold);
+                        continue;
+                    }
+                }
 
                 if (!verdict.HasEligible) {
                     // Nobody can take it - see ReleaseZone for why an absent owner is released
                     // rather than left in place.
-                    if (!IsPresent(verdict, currentOwner)) {
+                    if (!present) {
                         if (Monitoring.Active) { Monitoring.NoteCause(zdo, HandoffCause.Release); }
                         zdo.SetOwner(0L);
                         OwnerHistory.Remove(zdo.m_uid);
@@ -866,8 +978,8 @@ namespace NetworkPerformanceSystem.Runtime {
                 // never take a ship from a helmsman still aboard, but it does rescue one whose
                 // helmsman disconnected - which the release path above cannot reach either,
                 // because some other candidate is still eligible here.
-                if (!IsPresent(verdict, currentOwner)) {
-                    Rescue(zdo, RescueTarget(zdo, verdict), now);
+                if (!present) {
+                    RescueObject(zdo, RescueTarget(zdo, verdict, creature), creature, verdict, currentOwner, now);
                     continue;
                 }
 
@@ -887,11 +999,14 @@ namespace NetworkPerformanceSystem.Runtime {
                 // ranks by distance, so a berry bush owned by the lowest-latency player in the zone
                 // is not thereby settled.
                 //
-                // TIER 1 - Prioritized: the type ZNetView.m_type stamps on things that are
-                // simulated and move (creatures, carts, physics props; ZDOMan.ServerSortSendZDOS
-                // and TallyOwnedLoad above both read it as "costs its owner simulation time").
-                // Placed to minimise staleness, because their state changes continuously between
-                // sends and every viewer eats (rtt(owner) + rtt(viewer)) / 2 of it.
+                // TIER 1 - simulated things that move. Prioritized is the type ZNetView.m_type
+                // stamps on ships, carts and players (ZDOMan.ServerSortSendZDOS reads it as "send
+                // first"), and a flag read answers it. Creatures are the rest of this tier and the
+                // reason it exists, and the type does NOT answer for them - every creature prefab
+                // is Default - so they need the prefab lookup, paid only by a Default ZDO whose
+                // owner is present in a contested zone. Placed to minimise staleness, because their
+                // state changes continuously between sends and every viewer eats
+                // (rtt(owner) + rtt(viewer)) / 2 of it.
                 //
                 // TIER 2 - interactables that do not move: pickables, ore veins, rocks, trees,
                 // logs, destructibles. Staleness is the wrong metric for these and always was - a
@@ -918,7 +1033,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 //     For a station that is a CONSUMED ITEM: Fermenter.RPC_AddItem,
                 //     Smelter.RPC_AddOre/RPC_AddFuel, Fireplace.RPC_AddFuel and
                 //     CookingStation.RPC_AddFuel all run after the caller has already removed the
-                //     item from the inventory (see StationRpcRouter). For a pickable or a
+                //     item from the inventory (see RpcOwnerRouter). For a pickable or a
                 //     destructible it is a lost keypress and the player presses again - nothing is
                 //     spent before the call and all the state is in the ZDO. That difference is
                 //     exactly why tier 2 can accept the window and stations still cannot.
@@ -931,16 +1046,21 @@ namespace NetworkPerformanceSystem.Runtime {
                 //     the person interacting with it, and the person interacting with it is the one
                 //     standing next to it - which is the candidate this tier keeps or gives the
                 //     object to. OwnershipPolicy.InteractionStandOffMetres makes that explicit
-                //     rather than incidental, and ForceSendToSector shortens the window besides.
+                //     rather than incidental, and ForceSendTo shortens the window besides. (With
+                //     Reject Stale Owner Updates on, OwnerRevisionGuard closes this race outright;
+                //     the tier-2 rules above do not depend on it.)
                 if (zdo.Type != ZDO.ObjectType.Prioritized) {
-                    // Tier 2 first, then the static hold. TryArbitrateInteractive returns true when
-                    // it reached a verdict of its own - a queued move, or an interactable it
-                    // confirmed and then held - so the counter below keeps exactly the meaning it
-                    // has always had: a present but not-best owner kept because the object does not
-                    // move.
-                    if (_interactiveEnabled && TryArbitrateInteractive(zdo, verdict, currentOwner, now)) { continue; }
-                    if (verdict.BestUid != currentOwner) { LastPassStaticHeld++; }
-                    continue;
+                    creature = _creaturesEnabled && OwnershipPolicy.IsCreature(zdo);
+                    if (!creature) {
+                        // Tier 2 first, then the static hold. TryArbitrateInteractive returns true
+                        // when it reached a verdict of its own - a queued move, or an interactable
+                        // it confirmed and then held - so the counter below keeps exactly the
+                        // meaning it has always had: a present but not-best owner kept because the
+                        // object does not move.
+                        if (_interactiveEnabled && TryArbitrateInteractive(zdo, verdict, currentOwner, now)) { continue; }
+                        if (verdict.BestUid != currentOwner) { LastPassStaticHeld++; }
+                        continue;
+                    }
                 }
 
                 // THE PROXIMITY LAYER. Tier 1 prices a whole sector by latency and weighs every
@@ -998,6 +1118,7 @@ namespace NetworkPerformanceSystem.Runtime {
                                 Zdo = zdo, NewOwner = near.Uid,
                                 Priority = (Candidates[ownerIndex].RttMs + near.RttMs) * 0.5f,
                                 Sector = verdict, Proximity = true,
+                                Creature = creature, OldOwner = currentOwner,
                             });
                         } else {
                             LastPassProximityKept++;
@@ -1038,8 +1159,110 @@ namespace NetworkPerformanceSystem.Runtime {
 
                 PendingSimulated.Add(new PendingMove {
                     Zdo = zdo, NewOwner = verdict.BestUid, Priority = improvement, Sector = verdict,
+                    Creature = creature, OldOwner = currentOwner,
                 });
             }
+        }
+
+        /// <summary>
+        /// Whether a creature's owner still has it loaded: a candidate - so connected, positioned
+        /// and not a ghost - whose near ring includes the creature's zone. That ring is what the
+        /// owner's ZNetScene instantiates, so an owner that passes this is running the creature's
+        /// AI and writing its position whether or not it counts as present.
+        ///
+        /// Asked only of creatures, and it is the whole difference in how they are treated at the
+        /// edge of a player's area. The presence square is the middle 3x3 of what a player loads
+        /// (the disc-clipped 5x5 at the stock distance), and everything else here reads "not
+        /// present" as "not simulating". For a creature that is wrong in the outer ring: its owner
+        /// is simulating it - a player who has backed off to shoot at it, or who is simply walking
+        /// away - and releasing it or handing it to somebody else there was a creature frozen on
+        /// the owner's screen and unhittable for as long as the change took to settle. Measured on
+        /// a 25-player server, the old owner's next update undid such a change 93% of the time.
+        /// </summary>
+        private static bool OwnerStillLoads(long owner, Vector2s zone) {
+            if (!CandidateIndex.TryGetValue(owner, out int index)) { return false; }
+            Candidate candidate = Candidates[index];
+            return ZoneCompat.NearRingLoaded(candidate.Zone, zone, candidate.NearRadius, candidate.NearClassic);
+        }
+
+        /// <summary>
+        /// A creature whose owner is outside the presence square but still has it loaded (see
+        /// OwnerStillLoads). It is not abandoned, so it is not rescued; it moves only if somebody
+        /// present is actually near it, and then as an ordinary tier-1 move - capped, held, and
+        /// pushed out at once - rather than an uncapped rescue every pass.
+        ///
+        ///   * nobody present may own, or nobody present is near it -> it stays where it is. The
+        ///     owner is the one player simulating it for any reason; moving it would only swap a
+        ///     working simulation for one on a machine that may not have been near it.
+        ///   * a ridden mount                                         -> it stays. Its rider is its
+        ///     controller wherever they are standing.
+        ///   * exactly one present player near it                     -> to them, as a proximity
+        ///     pull. The owner is outside the presence square, so at least a zone away and beyond
+        ///     the pull distance at the default radius.
+        ///   * two or more near it                                    -> a shared fight the owner
+        ///     is not in, so the cost function's choice among the present candidates.
+        ///
+        /// The hold applies to all of it: a creature that has just changed hands keeps its owner
+        /// for Min Hold Seconds whatever the geometry says.
+        /// </summary>
+        private static void ConsiderLoadedCreature(ZDO zdo, SectorVerdict verdict, long owner, float now, float minHold) {
+            if (!verdict.HasEligible || OwnershipPolicy.IsDirectlyControlled(zdo)) {
+                LastPassCreaturesKept++;
+                return;
+            }
+
+            int sole;
+            int near = NearbyViewers(verdict, zdo.GetPosition(), out sole);
+            if (near == 0 || now - Touch(zdo.m_uid, owner, now) < minHold) {
+                LastPassCreaturesKept++;
+                return;
+            }
+
+            long target;
+            bool proximity = near == 1 && _proximityEnabled && Candidates[sole].CanOwn;
+            if (proximity) {
+                target = Candidates[sole].Uid;
+            } else {
+                target = verdict.BestUid;
+            }
+
+            int ownerIndex = CandidateIndex[owner];                           // OwnerStillLoads found it
+            int targetIndex = CandidateIndex.TryGetValue(target, out int found) ? found : ownerIndex;
+            PendingSimulated.Add(new PendingMove {
+                Zdo = zdo, NewOwner = target,
+                Priority = (Candidates[ownerIndex].RttMs + Candidates[targetIndex].RttMs) * 0.5f,
+                Sector = verdict, Proximity = proximity,
+                Creature = true, OldOwner = owner,
+            });
+        }
+
+        /// <summary>
+        /// How many present VIEWERS are within the proximity radius of a position - 0, 1, or 2
+        /// meaning "two or more" - and, when it is exactly one, which. SoleNearbyViewer's scan
+        /// without the owner bookkeeping and with the two answers it folds together kept apart:
+        /// a creature whose owner is outside the presence square is treated differently when
+        /// nobody is near it (it stays) and when several are (the cost function picks among
+        /// them), and a rescue has no owner to find. The radius is the proximity radius whether
+        /// or not that layer is enabled: this asks whether anybody present is close enough to be
+        /// fighting it, and that question does not go away with the layer.
+        /// </summary>
+        private static int NearbyViewers(SectorVerdict verdict, Vector3 pos, out int sole) {
+            sole = -1;
+            int count = 0;
+
+            List<int> presentIndex = verdict.PresentIndex;
+            for (int i = 0; i < presentIndex.Count; i++) {
+                Candidate candidate = Candidates[presentIndex[i]];
+                if (!candidate.IsViewer) { continue; }
+
+                float dx = candidate.RefPos.x - pos.x;
+                float dz = candidate.RefPos.z - pos.z;
+                if (dx * dx + dz * dz > _proximityRadiusSq) { continue; }
+
+                if (++count >= 2) { sole = -1; return 2; }
+                sole = presentIndex[i];
+            }
+            return count;
         }
 
         /// <summary>
@@ -1226,8 +1449,8 @@ namespace NetworkPerformanceSystem.Runtime {
         ///
         /// Also reports where the current owner is among the candidates and how far away, so the
         /// caller can decide a pull without a second walk. Both are only meaningful when the
-        /// return value is not -1: an early return has not necessarily reached the owner yet.
-        /// Pass 0 for a rescue, which has no owner to find.
+        /// return value is not -1: an early return has not necessarily reached the owner yet. A
+        /// caller with no owner to find - a rescue - uses NearbyViewers instead.
         /// </summary>
         private static int SoleNearbyViewer(SectorVerdict verdict, Vector3 pos, long currentOwner,
                                             out int ownerIndex, out float ownerSq) {
@@ -1266,6 +1489,23 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
+        /// Rescue, and for a creature push the new owner out at once - to everyone who can see it
+        /// and to the owner it had, who may still be writing it. Until each viewer's copy names
+        /// the new owner their hits on it go to the old one or, from an unowned copy, to everybody
+        /// and nobody; the creature hit router catches those, but only an up-to-date copy lets the
+        /// new owner's AI and the other players' view start from the right place. Buildings are
+        /// not pushed: a login rescues thousands of them at once and none of them is being hit.
+        /// </summary>
+        private static void RescueObject(ZDO zdo, long newOwner, bool creature, SectorVerdict verdict, long oldOwner, float now) {
+            Rescue(zdo, newOwner, now);
+            if (!creature) { return; }
+
+            LastPassCreaturesRescued++;
+            TotalCreaturesRescued++;
+            ForceSendTo(verdict, zdo.m_uid, oldOwner);
+        }
+
+        /// <summary>
         /// Who a rescued ZDO goes to: the sector's best candidate, except that a ship with a
         /// player at its helm goes to that player, and a stationary object goes to whoever is
         /// nearest it.
@@ -1293,9 +1533,14 @@ namespace NetworkPerformanceSystem.Runtime {
         /// passenger's machine hands it on, which it only does if it runs this mod. Every condition
         /// that fails falls back to the best candidate, so a stale s_user - the helmsman
         /// disconnected or walked away - never holds a rescue up.
+        ///
+        /// A creature takes the tier-1 route with the Prioritized objects, the caller having
+        /// already looked it up: nearest-within-the-claim-radius is the rule for something nobody
+        /// is about to fight, and the proximity layer's "the one player near it" is the rule for
+        /// something they are.
         /// </summary>
-        private static long RescueTarget(ZDO zdo, SectorVerdict verdict) {
-            if (zdo.Type != ZDO.ObjectType.Prioritized) {
+        private static long RescueTarget(ZDO zdo, SectorVerdict verdict, bool creature) {
+            if (zdo.Type != ZDO.ObjectType.Prioritized && !creature) {
                 if (!_interactiveEnabled) { return verdict.BestUid; }
 
                 int nearest = NearestEligible(verdict, zdo.GetPosition());
@@ -1344,8 +1589,7 @@ namespace NetworkPerformanceSystem.Runtime {
         private static long SoleNearbyOrBest(ZDO zdo, SectorVerdict verdict) {
             if (!_proximityEnabled) { return verdict.BestUid; }
 
-            int sole = SoleNearbyViewer(verdict, zdo.GetPosition(), 0L, out _, out _);
-            if (sole < 0 || !Candidates[sole].CanOwn) { return verdict.BestUid; }
+            if (NearbyViewers(verdict, zdo.GetPosition(), out int sole) != 1 || !Candidates[sole].CanOwn) { return verdict.BestUid; }
 
             long uid = Candidates[sole].Uid;
             if (uid != verdict.BestUid) {
@@ -1465,7 +1709,8 @@ namespace NetworkPerformanceSystem.Runtime {
         /// nor the reverse.
         ///
         /// Tier 1 drains first, because its objects look BROKEN when misplaced - a creature relayed
-        /// through an extra hop stutters - where a tier-2 object merely answers slowly.
+        /// through an extra hop stutters - where a tier-2 object merely answers slowly. Within tier
+        /// 1, creatures go first (ByPriority), for the same reason one step further.
         ///
         /// Only latency- or proximity-driven moves off a healthy, present owner reach here.
         /// Restoring an owner to a ZDO that has none is correctness, not placement, and is applied
@@ -1474,6 +1719,7 @@ namespace NetworkPerformanceSystem.Runtime {
         private static void ApplyUpgrades(float now) {
             LastPassOptimised = 0;
             LastPassDeferred = 0;
+            LastPassCreaturesOptimised = 0;
             LastPassInteractiveOptimised = 0;
             LastPassInteractiveDeferred = 0;
             LastPassInteractiveCap = 0;
@@ -1547,13 +1793,19 @@ namespace NetworkPerformanceSystem.Runtime {
                 // and about to hit it, and until their copy of the owner id catches up that hit is
                 // addressed to the old owner, who drops it without a word. And the old owner is
                 // writing this ZDO every frame, so it is the peer that most needs to hear soonest.
-                // The cost function's own moves keep their old behaviour: changing those is a
-                // separate question, and one the monitoring data should answer first.
+                // Every creature move is pushed for the same reasons, whichever rule made it: the
+                // monitoring data showed no creature had ever reached the cost function, so there
+                // was no old behaviour of its own for a creature to keep. A cart or an idle ship
+                // moved by the cost function still waits for the ordinary send.
                 if (move.Proximity) {
                     LastPassProximityPulled++;
                     TotalProximityPulled++;
                 }
-                if (forceSend || move.Proximity) { ForceSendToSector(move); }
+                if (move.Creature) {
+                    LastPassCreaturesOptimised++;
+                    TotalCreaturesOptimised++;
+                }
+                if (forceSend || move.Proximity || move.Creature) { ForceSendTo(move.Sector, move.Zdo.m_uid, move.OldOwner); }
             }
         }
 
@@ -1569,29 +1821,35 @@ namespace NetworkPerformanceSystem.Runtime {
         /// side of the world, once per move, every pass. That is a real bill on a full server and
         /// it buys nothing.
         ///
-        /// ForceSendZDO(newOwner, id) - what StationRpcRouter does - is too narrow here, and reason
+        /// ForceSendZDO(newOwner, id) - what RpcOwnerRouter does - is too narrow here, and reason
         /// (b) in ArbitrateZone says why: the stale owner id is a property of every OTHER peer's
         /// copy, not just the new owner's. Telling only the new owner leaves the next player to
-        /// press E still addressing the old one. StationRpcRouter can target because it has one
+        /// press E still addressing the old one. RpcOwnerRouter can target because it has one
         /// specific message for one specific machine and is about to forward it; this has no
         /// message, only a fact that several machines need.
         ///
         /// So: addressed to the sector's Present set. That is exactly the candidates whose active
         /// area covers the sector, which is exactly the set that can hold an instance and therefore
-        /// the set that can address an RPC at the owner. It includes the OLD owner, which is what
-        /// reason (c) needs - the old owner is the peer that must stop writing soonest, and the one
-        /// whose in-flight write would otherwise drag ownership back.
+        /// the set that can address an RPC at the owner. It includes the OLD owner when that owner
+        /// is present, which is what reason (c) needs - the old owner is the peer that must stop
+        /// writing soonest, and the one whose in-flight write would otherwise drag ownership back.
+        /// A creature's old owner may not be present - it can still be simulating the creature from
+        /// the outer ring of what it loads (OwnerStillLoads) - so it is passed in as alsoTo and told
+        /// too. 0 when there was no old owner, or it is in the Present set anyway.
         /// </summary>
-        private static void ForceSendToSector(PendingMove move) {
+        private static void ForceSendTo(SectorVerdict sector, ZDOID id, long alsoTo) {
             ZDOMan zdoMan = ZDOMan.instance;
             if (zdoMan == null) { return; }
 
             long self = zdoMan.m_sessionID;
-            List<long> present = move.Sector.Present;
+            List<long> present = sector.Present;
+            bool alsoToSent = alsoTo == 0L || alsoTo == self;
             for (int i = 0; i < present.Count; i++) {
+                if (present[i] == alsoTo) { alsoToSent = true; }
                 if (present[i] == self) { continue; }   // the host's own copy is authoritative already
-                zdoMan.ForceSendZDO(present[i], move.Zdo.m_uid);
+                zdoMan.ForceSendZDO(present[i], id);
             }
+            if (!alsoToSent && CandidateIndex.ContainsKey(alsoTo)) { zdoMan.ForceSendZDO(alsoTo, id); }
         }
 
         private static void PruneHoldTable(float now) {
@@ -1621,7 +1879,7 @@ namespace NetworkPerformanceSystem.Runtime {
             int count = 0;
             for (int i = 0; i < objects.Count; i++) {
                 ZDO zdo = objects[i];
-                if (zdo != null && zdo.Persistent && zdo.Type == ZDO.ObjectType.Prioritized) { count++; }
+                if (zdo != null && zdo.Persistent && Monitoring.IsTracked(zdo)) { count++; }
             }
             if (soleCandidate) { _monitorSoleCreatures += count; } else { _monitorContestedCreatures += count; }
         }
@@ -1633,7 +1891,7 @@ namespace NetworkPerformanceSystem.Runtime {
         /// use - it is recorded so that a rule which did can be tried against the same moves.
         /// </summary>
         private static string DescribeCandidates(PendingMove move) {
-            if (move.Zdo.Type != ZDO.ObjectType.Prioritized) { return null; }
+            if (!Monitoring.IsTracked(move.Zdo)) { return null; }
 
             SectorVerdict verdict = move.Sector;
             Vector3 pos = move.Zdo.GetPosition();
@@ -1663,6 +1921,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
         internal static void Reset() {
             Candidates.Clear();
+            CandidateIndex.Clear();
             ZonesToScan.Clear();
             OwnerHistory.Clear();
             PendingSimulated.Clear();
@@ -1715,6 +1974,13 @@ namespace NetworkPerformanceSystem.Runtime {
             _proximityEnabled = false;
             _proximityRadiusSq = 0f;
             _proximityPullSq = 0f;
+
+            LastPassCreaturesRescued = 0;
+            LastPassCreaturesOptimised = 0;
+            LastPassCreaturesKept = 0;
+            TotalCreaturesRescued = 0;
+            TotalCreaturesOptimised = 0;
+            _creaturesEnabled = false;
 
             _monitorSoleCreatures = 0;
             _monitorContestedCreatures = 0;

@@ -112,6 +112,31 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
+        /// Whether a peer centred on peerZone has a zone in its near ring - the ring ZNetScene
+        /// instantiates every object in, simulated or not. Exact rather than an upper bound, which
+        /// is the difference from ZdoInstancePossible: this answers "may this peer be left owning a
+        /// creature it is not standing next to", and an answer that is ever too generous leaves a
+        /// creature with an owner that has no instance of it, frozen.
+        ///
+        /// ZDOMan.FindSectorObjects walks Chebyshev rings 1..near around the peer's zone and keeps
+        /// a ring zone only when ZoneSystem.ZonesWithinRadius passes it - centre distance under
+        /// near zones plus half a zone - unless the distance is classic, which keeps the whole
+        /// square. At the stock near distance of 2 that drops the four corners of the 5x5.
+        ///
+        /// Pure, so the offline harness can table it against that loop.
+        /// </summary>
+        internal static bool NearRingLoaded(Vector2s peerZone, Vector2s zone, int near, bool classic) {
+            int dx = zone.x - peerZone.x;
+            int dy = zone.y - peerZone.y;
+            if (Mathf.Abs(dx) > near || Mathf.Abs(dy) > near) { return false; }
+            if (classic) { return true; }
+
+            float radius = near * ZoneSystem.c_ZoneSize + ZoneSystem.c_ZoneSizeHalf;
+            float distanceSq = (dx * dx + dy * dy) * ZoneSystem.c_ZoneSize * ZoneSystem.c_ZoneSize;
+            return distanceSq < radius * radius;
+        }
+
+        /// <summary>
         /// A zone's live sector list, or null when the zone holds nothing.
         ///
         /// Mirrors ZDOMan.FindObjects: the index is clamped rather than bounds-checked, with

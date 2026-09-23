@@ -61,7 +61,8 @@ namespace NetworkPerformanceSystem.Patches {
             SendQueueView.Reset();
             SendSchedulerPatches.Reset();
             RoutedRpcFilter.Reset();
-            StationRpcRouter.Reset();
+            RpcOwnerRouter.Reset();
+            OwnerRevisionGuard.Reset();
             // Diagnostics are session-scoped too: an nps_stats_collect left running must not
             // silently keep sampling on the next server, and telemetry must not carry over.
             NetworkStats.Reset();

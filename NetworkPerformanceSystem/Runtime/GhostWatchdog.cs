@@ -64,30 +64,22 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static long TotalTrips { get; private set; }
         internal static bool Warning => _warning;
 
-        internal static bool Active {
-            get {
-                EnsureRivalCheck();
-                return PatchGuard.IsActive(Mechanism.GhostWatchdog)
-                       && ValConfig.EnableGhostWatchdog != null
-                       && ValConfig.EnableGhostWatchdog.Value;
-            }
-        }
-
-        private static bool _checkedForRival;
+        internal static bool Active =>
+            PatchGuard.IsActive(Mechanism.GhostWatchdog)
+            && ValConfig.EnableGhostWatchdog != null
+            && ValConfig.EnableGhostWatchdog.Value;
 
         /// <summary>
         /// Stand down if ClientGhostWatchdog is installed - it does this half itself, and two
         /// watchdogs on one connection is a race with no upside. See PatchGuard for why its
         /// timeout and M11's disagreeing is the specific problem.
         ///
-        /// Checked lazily on first tick rather than at Awake, because BepInEx fills
+        /// Called once from the plugin's Start rather than at Awake, because BepInEx fills
         /// Chainloader.PluginInfos incrementally and a plugin ordered after us is not yet visible
-        /// from our own Awake.
+        /// from our own Awake. Start also puts it ahead of the startup summary, so the summary
+        /// does not list this as active when it is about to stand down.
         /// </summary>
-        private static void EnsureRivalCheck() {
-            if (_checkedForRival) { return; }
-            _checkedForRival = true;
-
+        internal static void CheckForRival() {
             if (PatchGuard.IsPluginLoaded(PatchGuard.ClientGhostWatchdogGUID)) {
                 PatchGuard.Disable(Mechanism.GhostWatchdog,
                     "ClientGhostWatchdog is installed and already watches this connection from the client side; "

@@ -1,5 +1,27 @@
 # Changelog
 
+**1.8.0**
+- Improves how tightly a players position is tracked to better arbitrate ownership
+	- The server follows each player's character directly, as it arrives with the game's own object updates. New `Reference Position` setting **Use Character Position** (default on). Works for players without the mod and costs nothing on the wire.
+- `Steam Transport`: **Send Rate Max KBps** and **Send Rate Min KBps** are replaced by a single **Send Rate KBps** (default 0, the game's 150).
+	- The new setting is the exact rate the server sends to each player, and it is applied on the server only. Steam never slows down for a connection that cannot keep up, so budget the server's upload for players × rate. A player whose connection cannot take it loses packets instead of getting a slower stream.
+	- `Send Window` **Target Rate KBps** is also no longer read: each player's window is now sized from the rate Steam actually uses for their connection.
+- The server now slows down for a player whose connection is losing packets, one player at a time. New `Steam Transport` setting **Enable Loss Backoff** (default on), with **Loss Backoff Threshold** (default 0.95) and **Loss Backoff Floor KBps** (default 32).
+	- Steam sends to every player at one fixed pace and never slows down for a player who cannot keep up; that player got packet loss.
+	- When a player has received under 95% of what was sent for 10 seconds, their own connection's rate is stepped down by a quarter, again every 10 seconds while it stays lossy, never below the floor. Once clean for 60 seconds it is stepped back up one step at a time, until it follows Send Rate KBps again. Change rate is isolated to the impacted user.
+	- Server-side, and needs Enable Transport Tuning. `nps_stats` gains a "Loss backoff" block, and the LOSSY verdict in the link-pressure table now says what has been done about it.
+- `nps_stats_collect` also measures how often a send runs out of room before the end of its list, and whether creatures or players were among what was left for later. See the new "Send truncation" block.
+- Creatures are now arbitrated, and before anything else. New `Ownership` setting **Arbitrate Creatures** (default on).
+	- The game marks ships and players as moving objects but not creatures, so earlier prioritization of this caused them to be deprioritized instead.
+	- `nps_stats` gains a "creatures" line in the Ownership block.
+- Hits on creatures are delivered to whoever is simulating the creature. New `Routed RPC` setting **Route Creature Hits To Owner** (default on).
+	- A hit sent to a player who no longer owned the creature, or to nobody because the attacker's game thought it had no owner, did nothing.
+	- A creature nobody is simulating is handed to the player who hit it, and the hit follows.
+	- Server-side, and works for players without the mod. `nps_stats` gains a "Creature hits" block.
+- Ownership changes made by the server now stick. New `Ownership` setting **Reject Stale Owner Updates** (default on).
+	- Server-side. `nps_stats` gains a "stale owner" line in the Ownership block.
+- Network monitoring now records creatures.
+
 **1.7.0**
 - Players on a high-ping connection no longer see the world pause every 8 seconds while there is a lot going on.
 	- `Queue Drain Interval Seconds` and `Queue Drain Floor Bytes` are no longer read and can be deleted from the config.

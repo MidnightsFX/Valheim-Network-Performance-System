@@ -44,9 +44,33 @@ namespace NetworkPerformanceSystem.Runtime {
             /// m_zdo.GetOwner() - so whether the person about to touch it is the one simulating it
             /// is the entire latency story for these objects.</summary>
             Interactive = 6,
+
+            /// <summary>Something with a Character that is not a player and not a tame: the
+            /// creatures the arbiter's tier 1 was written for. Not found by ZDO.ObjectType, which
+            /// marks ships and players as Prioritized but leaves every creature Default - the
+            /// reason tier 1 and the proximity layer had never reached one. A tame is a creature
+            /// too; it is Mount above so that riding one is still direct control, and IsCreature
+            /// counts both.</summary>
+            Creature = 7,
         }
 
         private static readonly Dictionary<int, PrefabClass> ClassCache = new Dictionary<int, PrefabClass>();
+
+        /// <summary>
+        /// A small direct-mapped cache in front of ClassCache. IsCreature is asked of every owned
+        /// object in the arbiter's load tally and of every Default object a contested zone reaches
+        /// the tier split with - mostly building pieces, every pass, and the tier split cannot be
+        /// ordered behind tier 2's cheap distance tests because a creature nobody is standing next
+        /// to still belongs to tier 1. So the classification itself has to be nearly free. A base
+        /// alternates among a few dozen prefabs, which a single "last prefab" slot missed on every
+        /// change of wall to floor to torch; a slot picked from the hash's low bits holds all of
+        /// them at once and costs an index and a compare where the dictionary costs a hash and a
+        /// bucket walk. A prefab hash of 0 is the "not deserialized yet" value and is never stored,
+        /// so 0 doubles as the empty marker. Main thread only, like everything that reads it.
+        /// </summary>
+        private const int FastSlots = 256;
+        private static readonly int[] FastPrefab = new int[FastSlots];
+        private static readonly PrefabClass[] FastClass = new PrefabClass[FastSlots];
 
         /// <summary>
         /// How far an incumbent owner must be from an object before tier 2 will take it away.
@@ -75,7 +99,7 @@ namespace NetworkPerformanceSystem.Runtime {
         /// behind by a disconnected player - from reading as "controlled" forever and excluding
         /// the mount from recovery permanently.
         ///
-        /// Also only reached for Prioritized ZDOs - tier 1 is the only path that consults this, and
+        /// Also only reached for tier 1 - Prioritized ZDOs and creatures - the only path that consults this, and
         /// tier 2 does not need to, because Classify ranks every class below ahead of Interactive
         /// and so a prefab that is both (a cart with a destructible hull, a chest with one) never
         /// reads as interactable at all.
@@ -124,6 +148,16 @@ namespace NetworkPerformanceSystem.Runtime {
         /// </summary>
         internal static bool IsInteractive(ZDO zdo) {
             return Classify(zdo) == PrefabClass.Interactive;
+        }
+
+        /// <summary>
+        /// True for a creature, tame or wild: anything with a Character that is not a player.
+        /// This, not ZDO.ObjectType, is how the arbiter and the monitor recognise the objects that
+        /// fight - see PrefabClass.Creature for why the object type cannot answer it.
+        /// </summary>
+        internal static bool IsCreature(ZDO zdo) {
+            PrefabClass cls = Classify(zdo);
+            return cls == PrefabClass.Creature || cls == PrefabClass.Mount;
         }
 
         /// <summary>
@@ -194,21 +228,27 @@ namespace NetworkPerformanceSystem.Runtime {
 
         private static PrefabClass Classify(ZDO zdo) {
             int prefab = zdo.GetPrefab();
-            if (ClassCache.TryGetValue(prefab, out PrefabClass cached)) { return cached; }
+            int slot = (prefab ^ (prefab >> 16)) & (FastSlots - 1);
+            if (prefab != 0 && FastPrefab[slot] == prefab) { return FastClass[slot]; }
+            if (ClassCache.TryGetValue(prefab, out PrefabClass cached)) { return Remember(slot, prefab, cached); }
 
             PrefabClass result = PrefabClass.Ordinary;
             if (ZNetScene.instance != null) {
                 GameObject go = ZNetScene.instance.GetPrefab(prefab);
                 if (go != null) {
                     // The first four keep the precedence they have always had, so nothing this
-                    // classified before is classified differently now. The two new cases sit
+                    // classified before is classified differently now. The later cases sit
                     // strictly below them: a cart's cargo hold is already covered by Cart, and
-                    // anything a player drives is never merely interactable.
+                    // anything a player drives is never merely interactable. Creature sits below
+                    // Container so that a modded creature carrying a chest keeps the in-use
+                    // protection a chest gets, and above Interactive because a creature that
+                    // also carries a Destructible is still something that moves and fights.
                     if (go.GetComponent<Player>() != null) { result = PrefabClass.Player; }
                     else if (go.GetComponent<Ship>() != null) { result = PrefabClass.Ship; }
                     else if (go.GetComponent<Vagon>() != null) { result = PrefabClass.Cart; }
                     else if (go.GetComponent<Tameable>() != null) { result = PrefabClass.Mount; }
                     else if (go.GetComponent<Container>() != null) { result = PrefabClass.Container; }
+                    else if (go.GetComponent<Character>() != null) { result = PrefabClass.Creature; }
                     else if (IsInteractable(go)) { result = PrefabClass.Interactive; }
                 } else {
                     // Unknown prefab (content mod not loaded here, or a stale ZDO). Do not cache a
@@ -221,12 +261,18 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             ClassCache[prefab] = result;
-            return result;
+            return Remember(slot, prefab, result);
+        }
+
+        private static PrefabClass Remember(int slot, int prefab, PrefabClass cls) {
+            FastPrefab[slot] = prefab;
+            FastClass[slot] = cls;
+            return cls;
         }
 
         /// <summary>
         /// Does this prefab carry one of the components whose interaction is owner-addressed?
-        /// Answered from the prefab rather than the name, the same way StationRpcRouter.IsStation
+        /// Answered from the prefab rather than the name, the same way RpcOwnerRouter.IsStation
         /// is, so content mods that build on the vanilla components are covered.
         ///
         /// WearNTear - and Piece, which it always accompanies - excludes the prefab outright, and
@@ -255,6 +301,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
         internal static void Reset() {
             ClassCache.Clear();
+            System.Array.Clear(FastPrefab, 0, FastSlots);
         }
     }
 }

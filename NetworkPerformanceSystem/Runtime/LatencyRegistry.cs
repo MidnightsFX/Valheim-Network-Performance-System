@@ -42,6 +42,11 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>Host side: live measurements, keyed by peer session id.</summary>
         private static readonly Dictionary<long, PeerLatency> Measured = new Dictionary<long, PeerLatency>();
 
+        /// <summary>The rate Steam reports it is sending to each peer at, in bytes/sec, read at the
+        /// same cadence as the RTT. Kept apart from PeerLatency so a peer with a rate but no RTT
+        /// yet does not read as measured.</summary>
+        private static readonly Dictionary<long, int> SteamSendRate = new Dictionary<long, int>();
+
         /// <summary>Client side: the table most recently published by the host, keyed by session
         /// id. Includes the host itself at 0ms, so consumers need no special case for host-owned
         /// ZDOs.</summary>
@@ -101,6 +106,17 @@ namespace NetworkPerformanceSystem.Runtime {
         /// </summary>
         internal static float MeasuredRttMs(long peerUid) {
             return Measured.TryGetValue(peerUid, out PeerLatency state) && state.HasSample ? state.EwmaMs : 0f;
+        }
+
+        internal static void NoteSteamSendRate(long peerUid, int bytesPerSec) {
+            if (peerUid == 0L || bytesPerSec <= 0) { return; }
+            SteamSendRate[peerUid] = bytesPerSec;
+        }
+
+        /// <summary>The rate Steam last reported for this peer's connection. False, with 0, until
+        /// the first reading - and always on crossplay, which reports none.</summary>
+        internal static bool TryGetSteamSendRate(long peerUid, out int bytesPerSec) {
+            return SteamSendRate.TryGetValue(peerUid, out bytesPerSec);
         }
 
         internal static float MeasuredJitterMs(long peerUid) {
@@ -253,10 +269,12 @@ namespace NetworkPerformanceSystem.Runtime {
 
         internal static void ForgetPeer(long peerUid) {
             Measured.Remove(peerUid);
+            SteamSendRate.Remove(peerUid);
         }
 
         internal static void Reset() {
             Measured.Clear();
+            SteamSendRate.Clear();
             Published.Clear();
             _hasPublishedTable = false;
             _publishedAtRealtime = 0f;

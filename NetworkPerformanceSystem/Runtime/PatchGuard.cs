@@ -13,14 +13,13 @@ namespace NetworkPerformanceSystem.Runtime {
         SendWindow,     // M2/M2c - ZDOMan.SendZDOs BDP window
         SendScheduler,  // M2b    - ZDOMan.SendZDOToPeers2 round-robin fix
         Ownership,      // M3     - ZDOMan.ReleaseNearbyZDOS arbitration
-        RefPos,         // M6     - Nps.RefPos fast reference position channel
         Extrapolation,  // M4     - ZSyncTransform.SyncPosition latency compensation
         RoutedRpcFilter,// M7     - ZRoutedRpc.RouteRPC interest-filtered relay of broadcast RPCs
         SteamTransport, // M8     - ZSteamSocket.RegisterGlobalCallbacks send-rate bounds and Nagle
         SyncListCache,  // M9     - ZDOMan.CreateSyncList per-peer sector scan reuse
         PlayerLimit,    // M10    - ZNet.RPC_PeerInfo configurable player cap
         ConnectionTimeout, // M11 - ZRpc.SetLongTimeout + Steam TimeoutInitial/TimeoutConnected
-        StationRpcRouting, // M12 - ZRoutedRpc.RPC_RoutedRPC delivery of station item requests to the current owner
+        RpcOwnerRouting,   // M12 - ZRoutedRpc.RPC_RoutedRPC delivery of owner-addressed RPCs (station item requests, creature hits) to the current owner
         JotunnQueueLimit,  // M13 - Jotunn.Entities.CustomRPC.MaximumSendQueueSize kept above the M2 window ceiling
         QueueSizeView,     // M14 - ZSteamSocket.GetSendQueueSize shown to other mods as vanilla's window would leave it
         DeserializeAlloc,  // M15 - ZDO.Deserialize field read without the fourteen per-ZDO delegates
@@ -31,6 +30,10 @@ namespace NetworkPerformanceSystem.Runtime {
         ShipHelmOwnership, // M20 - ShipControlls.RPC_RequestControl / Ship.UpdateOwner hand a ship to its helmsman
         PeerLiveness,      // M21 - per-peer ghost detection from Steam link state plus a stall-aware silence timer
         GhostWatchdog,     // M22 - client leaves cleanly when the server stops answering
+        LiveRefPos,        // M23 - ZDOMan.Update reference position read from each peer's character
+        EarlyZdoData,      // M24 - ZNet.OnNewConnection holds ZDOData until ZDOMan.AddPeer registers its handler
+        OwnerRevisionGuard,// M25 - ZDOMan.RPC_ZDOData keeps the host's owner when a peer's update carries an older owner revision
+        LossBackoff,       // M26 - ZRpc.ReceivePing delivery share per peer drives a per-connection Steam send-rate override
     }
 
     /// <summary>
@@ -92,8 +95,9 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
-        /// Called once after Harmony has run. Anchor failures have already reported themselves
-        /// from inside their transpilers by this point; this just summarises the outcome so the
+        /// Called once from the plugin's Start, after Harmony has run in Awake and after the
+        /// checks for mods that do a mechanism's job. Anchor failures and stand-downs have
+        /// already reported themselves by this point; this just summarises the outcome so the
         /// log makes it obvious what is actually running.
         /// </summary>
         internal static void VerifyAfterPatching() {

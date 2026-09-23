@@ -22,8 +22,6 @@ namespace NetworkPerformanceSystem.Patches {
     [HarmonyPatch]
     internal static class RoutedRpcPatches {
 
-        private static bool _checkedForOverlappingMods;
-
         /// <summary>
         /// Verify the anchors before Harmony touches anything. A game update that renames or
         /// reshapes either method disables this mechanism loudly and leaves the rest of the
@@ -104,11 +102,10 @@ namespace NetworkPerformanceSystem.Patches {
         [HarmonyPatch(typeof(ZRoutedRpc), "RouteRPC")]
         [HarmonyPrefix]
         private static bool FilterRelay(ZRoutedRpc __instance, ZRoutedRpc.RoutedRPCData rpcData, bool __runOriginal) {
-            // StationRpcPatches.RouteOutgoing runs ahead of this on the same method and may
+            // RpcOwnerRouterPatches.RouteOutgoing runs ahead of this on the same method and may
             // already have delivered the message; Harmony still runs the remaining prefixes, so
             // honour its verdict rather than relay a second copy.
             if (!__runOriginal) { return false; }
-            EnsureOverlappingModCheck();
             // false -> the filtered relay already happened
             if (RoutedRpcFilter.TryRelay(__instance, rpcData)) { return false; }
             // false -> M19 relayed it to vanilla's recipients from a reused frame
@@ -126,14 +123,14 @@ namespace NetworkPerformanceSystem.Patches {
         /// BetterZeeRouter and EnRoute both rework ZRoutedRpc's relay. Whatever their exact
         /// policy, two systems deciding who receives a routed RPC is the race this mod's own
         /// ownership code warns about, so stand down and say so rather than layer on top.
-        /// Checked lazily on first relay for the same reason as the scheduler's ReturnToSender
-        /// check: BepInEx fills Chainloader.PluginInfos incrementally, so a plugin ordered after
+        ///
+        /// Called once from the plugin's Start, for the same reason as the scheduler's
+        /// ReturnToSender check. Not from the relay prefix: either mod can skip RouteRPC or leave
+        /// __runOriginal false ahead of it, and then a check there would never run. Not from
+        /// Awake: BepInEx fills Chainloader.PluginInfos incrementally, so a plugin ordered after
         /// us is not visible from our Awake.
         /// </summary>
-        private static void EnsureOverlappingModCheck() {
-            if (_checkedForOverlappingMods) { return; }
-            _checkedForOverlappingMods = true;
-
+        internal static void CheckForOverlappingMods() {
             if (PatchGuard.IsPluginLoaded(PatchGuard.BetterZeeRouterGUID)) {
                 PatchGuard.Disable(Mechanism.RoutedRpcFilter,
                     "BetterZeeRouter is installed and reworks the routed-RPC relay path. Standing down so there is exactly one router deciding recipients.");

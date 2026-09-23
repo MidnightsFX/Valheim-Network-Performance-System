@@ -36,10 +36,30 @@ namespace NetworkPerformanceSystem.Runtime {
             /// count matters more than the size: sustained pending is standing queue, whereas a
             /// single busy tick is just a burst passing through.</summary>
             internal int SamplesWithPending;
+            /// <summary>Steam's share of our packets that reached this peer. Steam sends at a
+            /// fixed rate and never slows for loss, so this is the only sign that a peer's
+            /// connection cannot take the rate it is being sent at.</summary>
+            internal double QualityRemoteSum;
+            /// <summary>Samples where Steam knew the delivery share. It reports a negative value
+            /// until it has one, which must not be averaged in as total loss.</summary>
+            internal int QualitySamples;
 
             internal float MeanPendingBytes => StatusSamples > 0 ? (float)PendingByteSum / StatusSamples : 0f;
             internal float MeanInFlightBytes => StatusSamples > 0 ? (float)InFlightByteSum / StatusSamples : 0f;
             internal float PendingSampleShare => StatusSamples > 0 ? (float)SamplesWithPending / StatusSamples : 0f;
+            internal float MeanQualityRemote => QualitySamples > 0 ? (float)(QualityRemoteSum / QualitySamples) : 1f;
+
+            // Send truncation: sends whose list ran past the window before its end, and what was
+            // left behind. See RecordSendResult.
+            internal int SendsOut;
+            internal int SendsTruncated;
+            internal long LeftOutSum;
+            internal int LeftOutPeak;
+            internal long ActorsLeftOutSum;
+            internal int SendsWithActorsLeftOut;
+
+            internal float TruncatedShare => SendsOut > 0 ? (float)SendsTruncated / SendsOut : 0f;
+            internal float MeanLeftOut => SendsTruncated > 0 ? (float)LeftOutSum / SendsTruncated : 0f;
         }
 
         private static readonly Dictionary<long, PeerStats> Stats = new Dictionary<long, PeerStats>();
@@ -94,10 +114,70 @@ namespace NetworkPerformanceSystem.Runtime {
                 entry.PendingByteSum += status.PendingBytes;
                 entry.InFlightByteSum += status.InFlightBytes;
                 entry.LastSendRateBytesPerSec = status.SendRateBytesPerSec;
+                if (status.QualityRemote >= 0f) {
+                    entry.QualityRemoteSum += status.QualityRemote;
+                    entry.QualitySamples++;
+                }
                 if (status.PendingBytes > entry.PendingBytesPeak) { entry.PendingBytesPeak = status.PendingBytes; }
                 if (status.InFlightBytes > entry.InFlightBytesPeak) { entry.InFlightBytesPeak = status.InFlightBytes; }
                 if (status.PendingBytes > 0) { entry.SamplesWithPending++; }
             }
+        }
+
+        /// <summary>
+        /// Called from a postfix on ZDOMan.SendZDOs while collecting, for a send that went out.
+        ///
+        /// SendZDOs writes its sorted list front to back and stops at the first object that does
+        /// not fit in the window, so what went out is exactly the first <paramref name="sent"/>
+        /// entries and everything after is what waits for next time. The question this answers is
+        /// whether a send-priority rule could matter at all: priority only decides anything when
+        /// a list is cut short, and then only if the cut falls among the objects players notice.
+        /// "Actors" here are those objects: creatures, and Prioritized ZDOs (ships, carts,
+        /// players), owned by someone other than the receiver - Monitoring.IsTracked, the same
+        /// test everything else in 1.8.0 uses for "the things players watch". Not vanilla's own
+        /// first send tier, which is the Prioritized flag alone: the game leaves every creature
+        /// Default, so its sort puts ships and players at the front and creatures wherever they
+        /// fall, and a creature past the cut is exactly the case a send priority that knew about
+        /// creatures would change. A Prioritized object past the cut can only get there by a
+        /// force-send inserted ahead of the sorted list.
+        /// </summary>
+        internal static void RecordSendResult(ZDOMan man, ZDOMan.ZDOPeer peer, int sent) {
+            if (!Collecting || man == null) { return; }
+            ZNetPeer netPeer = peer?.m_peer;
+            if (netPeer == null || netPeer.m_uid == 0L) { return; }
+
+            List<ZDO> list = man.m_tempToSync;
+            int listed = list.Count;
+            int leftOut = LeftOut(listed, sent);
+            if (leftOut < 0) { return; }                                     // the counter reset under us; not a sample
+
+            PeerStats entry = GetOrCreate(netPeer.m_uid, netPeer.m_playerName);
+            entry.SendsOut++;
+            if (leftOut == 0) { return; }
+
+            int actors = 0;
+            long receiver = netPeer.m_uid;
+            for (int i = sent; i < listed; i++) {
+                ZDO zdo = list[i];
+                // Flag and owner first: they retire the buildings that make up most of any list
+                // before the prefab lookup a Default ZDO needs to be recognised as a creature.
+                if (zdo != null && zdo.HasOwner() && zdo.GetOwner() != receiver && Monitoring.IsTracked(zdo)) {
+                    actors++;
+                }
+            }
+
+            entry.SendsTruncated++;
+            entry.LeftOutSum += leftOut;
+            if (leftOut > entry.LeftOutPeak) { entry.LeftOutPeak = leftOut; }
+            entry.ActorsLeftOutSum += actors;
+            if (actors > 0) { entry.SendsWithActorsLeftOut++; }
+        }
+
+        /// <summary>How many of a send's list were left for next time, or -1 when the numbers
+        /// cannot belong to one send. Pure.</summary>
+        internal static int LeftOut(int listed, int sent) {
+            if (sent < 0 || sent > listed) { return -1; }
+            return listed - sent;
         }
 
         private static PeerStats GetOrCreate(long uid, string name) {
@@ -128,14 +208,18 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendPlayerLimit(sb);
             AppendPeerTable(sb);
             AppendLinkPressure(sb);
+            AppendSendTruncation(sb);
             AppendTransport(sb);
+            AppendLossBackoff(sb);
             AppendTimeouts(sb);
             AppendPeerLiveness(sb);
+            AppendEarlyZdoData(sb);
             AppendThirdPartyThresholds(sb);
             AppendScheduler(sb);
             AppendSyncListCache(sb);
             AppendRoutedRpc(sb);
-            AppendStationRpc(sb);
+            AppendOwnerRpc(sb);
+            AppendReferencePositions(sb);
             AppendOwnership(sb);
             AppendShipHelm(sb);
             AppendExtrapolation(sb);
@@ -170,13 +254,12 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.SendWindow: return ValConfig.EnableSendWindowSizing.Value;
                 case Mechanism.SendScheduler: return ValConfig.EnableSchedulerFix.Value;
                 case Mechanism.Ownership: return ValConfig.EnableOwnershipArbitration.Value;
-                case Mechanism.RefPos: return ValConfig.EnableFastRefPos.Value;
                 case Mechanism.Extrapolation: return ValConfig.EnableLatencyCompensation.Value;
                 case Mechanism.RoutedRpcFilter: return ValConfig.EnableRoutedRpcFilter.Value;
                 case Mechanism.SteamTransport: return ValConfig.EnableSteamTransportTuning.Value;
                 case Mechanism.SyncListCache: return ValConfig.EnableSyncListCache.Value;
                 case Mechanism.ConnectionTimeout: return ValConfig.EnableConnectionTimeoutTuning.Value;
-                case Mechanism.StationRpcRouting: return ValConfig.EnableStationRpcRouting.Value;
+                case Mechanism.RpcOwnerRouting: return ValConfig.EnableStationRpcRouting.Value || ValConfig.EnableCreatureHitRouting.Value;
                 case Mechanism.JotunnQueueLimit: return ValConfig.EnableSendWindowSizing.Value;
                 case Mechanism.QueueSizeView: return ValConfig.EnableSendWindowSizing.Value && ValConfig.ReportVanillaQueueSize.Value;
                 case Mechanism.DeserializeAlloc: return AllocationRelief.DeserializeWanted;
@@ -189,6 +272,10 @@ namespace NetworkPerformanceSystem.Runtime {
                 // consumers do with it is what the config controls.
                 case Mechanism.PeerLiveness: return true;
                 case Mechanism.GhostWatchdog: return ValConfig.EnableGhostWatchdog.Value;
+                case Mechanism.LiveRefPos: return ValConfig.UseCharacterRefPos.Value;
+                case Mechanism.EarlyZdoData: return ValConfig.EnableEarlyZdoDataGuard.Value;
+                case Mechanism.OwnerRevisionGuard: return ValConfig.RejectStaleOwnerUpdates.Value;
+                case Mechanism.LossBackoff: return ValConfig.EnableSteamTransportTuning.Value && ValConfig.EnableLossBackoff.Value;
                 default: return true;
             }
         }
@@ -203,7 +290,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 return;
             }
 
-            sb.AppendLine("  name                 rtt     jitter  window    queue   skipped");
+            sb.AppendLine("  name                 rtt     jitter  window    for rate   queue   skipped");
             for (int i = 0; i < peers.Count; i++) {
                 ZNetPeer peer = peers[i];
                 long uid = peer.m_uid;
@@ -216,6 +303,8 @@ namespace NetworkPerformanceSystem.Runtime {
                     ? $"{LatencyRegistry.MeasuredJitterMs(uid):F0}ms"
                     : "-";
                 string window = SendWindow.TryGetLastWindow(uid, out int w) ? $"{w / 1024f:F1}KB" : "vanilla";
+                // The Steam rate the window was sized for - the other half of the product.
+                string rate = SendWindow.TryGetLastRate(uid, out int r) ? $"{r / 1024}KB/s" : "-";
 
                 string queue = "-";
                 string skipped = "-";
@@ -225,7 +314,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     skipped = $"{pct:F1}% ({entry.SendsSkippedByBackpressure}/{entry.SendAttempts})";
                 }
 
-                sb.AppendLine($"  {Pad(name, 20)} {Pad(rtt, 7)} {Pad(jitter, 7)} {Pad(window, 9)} {Pad(queue, 7)} {skipped}");
+                sb.AppendLine($"  {Pad(name, 20)} {Pad(rtt, 7)} {Pad(jitter, 7)} {Pad(window, 9)} {Pad(rate, 10)} {Pad(queue, 7)} {skipped}");
             }
 
             if (Collecting) {
@@ -240,11 +329,12 @@ namespace NetworkPerformanceSystem.Runtime {
         /// is holding back. Those mean opposite things: in-flight is the bandwidth-delay product
         /// being filled, which is what the M2 window is sized to do, while pending is standing
         /// queue that adds delay to everything behind it. A peer whose link is working perfectly
-        /// and one being overdriven into bufferbloat produce the same summed number.
+        /// and one being offered more than Steam's rate produce the same summed number.
         ///
-        /// The window is currently open-loop - RTT times a configured target rate - so this table
-        /// is how you find out whether that target is set above what a link will actually carry.
-        /// Read it before changing Target Rate KBps in either direction.
+        /// Steam paces every connection at one fixed rate and never slows for loss, so a player
+        /// whose connection cannot take that rate does not show up as pending - they show up as
+        /// packets that never arrive. That is the delivery column, and it is the thing to read
+        /// before raising Send Rate KBps.
         /// </summary>
         private static void AppendLinkPressure(StringBuilder sb) {
             sb.AppendLine();
@@ -258,7 +348,7 @@ namespace NetworkPerformanceSystem.Runtime {
             List<ZNetPeer> peers = ZNet.instance.GetPeers();
             bool anySamples = false;
 
-            sb.AppendLine("  name                 in-flight  pending   pending%  steam est   fill   verdict");
+            sb.AppendLine("  name                 in-flight  pending   pending%  steam rate  fill   delivered  verdict");
             for (int i = 0; i < peers.Count; i++) {
                 long uid = peers[i].m_uid;
                 if (!Stats.TryGetValue(uid, out PeerStats entry) || entry.StatusSamples == 0) { continue; }
@@ -268,6 +358,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 int window = entry.LastWindowBytes > 0 ? entry.LastWindowBytes : SendWindow.VanillaWindowBytes;
                 float fill = entry.MeanInFlightBytes / window;
                 float pendingShare = entry.PendingSampleShare;
+                float delivered = entry.MeanQualityRemote;
 
                 sb.AppendLine(
                     $"  {Pad(name, 20)} " +
@@ -276,7 +367,8 @@ namespace NetworkPerformanceSystem.Runtime {
                     $"{Pad($"{pendingShare * 100f:F0}%", 9)} " +
                     $"{Pad($"{entry.LastSendRateBytesPerSec / 1024f:F0}KB/s", 11)} " +
                     $"{Pad($"{fill * 100f:F0}%", 6)} " +
-                    Verdict(pendingShare, fill));
+                    $"{Pad($"{delivered * 100f:F1}%", 10)} " +
+                    Verdict(pendingShare, fill, delivered, LossAction(uid)));
             }
 
             if (!anySamples) {
@@ -284,28 +376,92 @@ namespace NetworkPerformanceSystem.Runtime {
                 return;
             }
 
-            sb.AppendLine("  in-flight = on the wire, unacked (the window working). pending = Steam holding it back (congestion).");
-            sb.AppendLine("  fill = in-flight as a share of the sized window. steam est = Steam's own rate estimate for the link.");
+            sb.AppendLine("  in-flight = on the wire, unacked (the window working). pending = offered faster than Steam's rate.");
+            sb.AppendLine("  steam rate = the fixed rate Steam sends to this player at. fill = in-flight as a share of the window.");
+            sb.AppendLine("  delivered = share of packets that reached the player. Steam never slows down for loss by itself, so");
+            sb.AppendLine("  this is the sign a player's connection cannot take the rate; loss backoff (below) is what acts on it.");
+        }
+
+        /// <summary>Below this share of packets delivered, a player is losing a meaningful part of
+        /// what the fixed rate sends them - and every lost packet is sent again at the same rate.
+        /// The same line loss backoff (M26) acts on, so the verdict and the mechanism agree.</summary>
+        private static float LossyDeliveredShare =>
+            ValConfig.LossBackoffThreshold != null ? ValConfig.LossBackoffThreshold.Value : 0.95f;
+
+        /// <summary>What the LOSSY verdict should say for this peer: what loss backoff has done about
+        /// it while it runs, and the manual remedy when it does not.</summary>
+        private static string LossAction(long uid) {
+            if (!LossBackoff.Wanted) { return "LOSSY - lower Send Rate KBps"; }
+            if (LossBackoff.TryGetView(uid, out LossBackoff.View view) && view.Steps > 0) {
+                return view.AtFloor
+                    ? $"LOSSY - held at the {LossBackoff.FloorBytesPerSec / 1024} KB/s back-off floor"
+                    : $"LOSSY - backed off to {view.OverrideBytesPerSec / 1024} KB/s (step {view.Steps})";
+            }
+            return "LOSSY - back-off pending (see Loss backoff)";
         }
 
         /// <summary>
-        /// Two independent signals, and the pair is what identifies the state:
-        ///   pending high              -> the link cannot take what it is being given, whatever
-        ///                                the window says. Target Rate KBps is too high for it.
-        ///   pending low, fill high    -> the window is the binding constraint and is doing its
-        ///                                job. Raising the target would buy more throughput.
-        ///   pending low, fill low     -> neither the window nor the link is the limit; there is
-        ///                                simply not that much to send, or the limit is upstream.
+        /// Three signals, most serious first:
+        ///   delivered low             -> the player's connection drops what it is sent at this rate.
+        ///                                Steam will not back off by itself; loss backoff does, or
+        ///                                the admin lowers Send Rate KBps (lossAction says which).
+        ///   pending high              -> more is being offered than Steam's fixed rate lets out.
+        ///                                Raising Send Rate KBps would move it, if the host's upload
+        ///                                and the player's connection can take it.
+        ///   pending low, fill high    -> the window is the binding constraint and is doing its job.
+        ///   pending low, fill low     -> nothing is the limit; there is simply not that much to send.
         /// </summary>
-        private static string Verdict(float pendingShare, float fill) {
-            if (pendingShare > 0.25f) { return "CONGESTED - target rate above what this link carries"; }
-            if (pendingShare > 0.05f) { return "some queueing"; }
+        private static string Verdict(float pendingShare, float fill, float delivered, string lossAction) {
+            if (delivered < LossyDeliveredShare) { return lossAction; }
+            if (pendingShare > 0.25f) { return "RATE-BOUND - Steam's rate is the limit for this player"; }
+            if (pendingShare > 0.05f) { return "some queueing at Steam's rate"; }
             if (fill > 0.8f) { return "window-bound (working)"; }
             if (fill > 0.25f) { return "healthy"; }
             return "idle - nothing to send";
         }
 
-        /// <summary>The transport ceiling underneath everything else, and whether we moved it.</summary>
+        /// <summary>
+        /// Whether a send-priority rule could matter here. Priority only decides anything when a
+        /// send's list is cut short by the window, and only matters to players if the cut falls
+        /// among the things they watch. See RecordSendResult.
+        /// </summary>
+        private static void AppendSendTruncation(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Send truncation (sends that ran out of window before the end of their list):");
+
+            if (!Collecting) {
+                sb.AppendLine("  (not sampling - run 'nps_stats_collect')");
+                return;
+            }
+
+            List<ZNetPeer> peers = ZNet.instance.GetPeers();
+            bool any = false;
+            for (int i = 0; i < peers.Count; i++) {
+                if (!Stats.TryGetValue(peers[i].m_uid, out PeerStats entry) || entry.SendsOut == 0) { continue; }
+                if (!any) {
+                    sb.AppendLine("  name                 sends    truncated  left out mean/peak  actors left out");
+                    any = true;
+                }
+                string name = string.IsNullOrEmpty(peers[i].m_playerName) ? "(connecting)" : peers[i].m_playerName;
+                sb.AppendLine(
+                    $"  {Pad(name, 20)} " +
+                    $"{Pad(entry.SendsOut.ToString(), 8)} " +
+                    $"{Pad($"{entry.TruncatedShare * 100f:F1}%", 10)} " +
+                    $"{Pad($"{entry.MeanLeftOut:F1} / {entry.LeftOutPeak}", 20)} " +
+                    $"{entry.ActorsLeftOutSum} (in {entry.SendsWithActorsLeftOut} sends)");
+            }
+
+            if (!any) {
+                sb.AppendLine("  (no sends sampled yet)");
+                return;
+            }
+
+            sb.AppendLine("  actors = creatures, ships, carts and players owned by someone else. The game sends ships and players first");
+            sb.AppendLine("  but not creatures. Near 0 means the cut never falls on them and a different send priority would not change");
+            sb.AppendLine("  what players see; a steady count is creatures waiting behind walls and trees.");
+        }
+
+        /// <summary>The rate underneath everything else, and what it costs the host.</summary>
         private static void AppendTransport(StringBuilder sb) {
             sb.AppendLine();
             sb.AppendLine("Steam transport:");
@@ -313,15 +469,95 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine("  not applied (disabled, or no Steam networking interface in this process)");
                 return;
             }
-            sb.AppendLine($"  {SteamTransport.LastReadback}");
 
-            int capKBps = SteamTransport.EffectiveSendRateMaxBytesPerSec / 1024;
-            int targetKBps = ValConfig.SendWindowTargetRateKBps.Value;
-            sb.AppendLine($"  window target    {targetKBps} KB/s against a transport ceiling of {capKBps} KB/s");
-            if (targetKBps > capKBps) {
-                sb.AppendLine("  WARNING: sizing windows for throughput the transport will not pass. The surplus becomes");
-                sb.AppendLine("  queueing delay. Raise 'Steam Transport / Send Rate Max KBps' or lower the target.");
+            int pinned = SteamTransport.PinnedSendRateBytesPerSec;
+            int configured = ValConfig.SteamSendRateKBps.Value;
+            string setting = configured > 0 ? $"{configured} KB/s set" : "game default";
+            if (!NpsEnv.IsHost()) { setting += ", not applied on a client"; }
+            string backedOff = LossBackoff.BackedOffNow > 0 ? $" except {LossBackoff.BackedOffNow} backed off (see Loss backoff)" : "";
+            sb.AppendLine(pinned > 0
+                ? $"  send rate        {pinned / 1024} KB/s on every connection{backedOff} ({setting}) - a fixed pace, not a ceiling"
+                : $"  send rate        UNEQUAL BOUNDS: SendRateMin {SteamTransport.ReadbackMinBytesPerSec / 1024} KB/s, SendRateMax {SteamTransport.ReadbackMaxBytesPerSec / 1024} KB/s ({setting})");
+            if (pinned <= 0) {
+                sb.AppendLine("                   another mod wrote one bound. Each connection runs at max(Min, 4380 bytes / its ping at connect),");
+                sb.AppendLine("                   capped at Max - usually just Min. Send Rate KBps writes both.");
             }
+
+            int nagle = SteamTransport.ReadbackNagleMicros;
+            sb.AppendLine($"  nagle            {nagle}us (game default {SteamTransport.VanillaNagleMicros}us)");
+
+            if (NpsEnv.IsHost() && pinned > 0) {
+                int players = ZNet.instance.GetPeers().Count;
+                float kbps = players * pinned / 1024f;
+                sb.AppendLine($"  worst case       {players} players x {pinned / 1024} KB/s = {kbps:F0} KB/s ({kbps * 8f / 1024f:F1} Mbit/s) of host upload;");
+                sb.AppendLine("                   Steam never slows down for a player who cannot keep up");
+            }
+            sb.AppendLine($"  readback         {SteamTransport.LastReadback}");
+        }
+
+        /// <summary>
+        /// M26 - which players the host has slowed down for loss, and by how much. Host-only, like
+        /// the mechanism: a client's upload stays at its own game's rate.
+        /// </summary>
+        private static void AppendLossBackoff(StringBuilder sb) {
+            if (!NpsEnv.IsHost()) { return; }
+            sb.AppendLine();
+            sb.AppendLine("Loss backoff (per-player send rate):");
+
+            string standDown = PatchGuard.GetDisableReason(Mechanism.LossBackoff);
+            if (standDown != null) {
+                sb.AppendLine($"  stood down: {standDown}");
+                return;
+            }
+            if (!ValConfig.EnableSteamTransportTuning.Value) {
+                sb.AppendLine("  off (Enable Transport Tuning is off, and this needs it)");
+                return;
+            }
+            if (!ValConfig.EnableLossBackoff.Value) {
+                sb.AppendLine("  off (Enable Loss Backoff is off) - a lossy player keeps the full rate and gets resends instead");
+                return;
+            }
+
+            int pinned = SteamTransport.PinnedSendRateBytesPerSec;
+            if (pinned <= 0) {
+                sb.AppendLine("  idle: no single send rate to step down from (see Steam transport above)");
+                return;
+            }
+
+            int floor = LossBackoff.FloorBytesPerSec;
+            sb.AppendLine($"  rule             under {ValConfig.LossBackoffThreshold.Value * 100f:F0}% delivered for {ValConfig.LossBackoffHoldSeconds.Value}s: a quarter off that player's rate, never below {floor / 1024} KB/s;");
+            sb.AppendLine($"                   clean for {ValConfig.LossBackoffRecoverSeconds.Value}s: one step back up, until it follows Send Rate KBps again");
+            if (floor >= pinned) {
+                sb.AppendLine($"  floor {floor / 1024} KB/s is not below the send rate {pinned / 1024} KB/s: nothing to step down to");
+            }
+
+            List<ZNetPeer> peers = ZNet.instance.GetPeers();
+            float now = UnityEngine.Time.realtimeSinceStartup;
+            bool any = false;
+            for (int i = 0; i < peers.Count; i++) {
+                if (!LossBackoff.TryGetView(peers[i].m_uid, out LossBackoff.View view)) { continue; }
+                if (view.Steps == 0 && !view.Lossy) { continue; }
+                if (!any) {
+                    sb.AppendLine("  name                 delivered  rate now   global    steps  backed off for");
+                    any = true;
+                }
+                string name = string.IsNullOrEmpty(peers[i].m_playerName) ? "(connecting)" : peers[i].m_playerName;
+                string delivered = view.HasSample ? $"{view.Delivered * 100f:F1}%" : "-";
+                string rateNow = view.Steps > 0 ? $"{view.OverrideBytesPerSec / 1024}KB/s" : $"{pinned / 1024}KB/s";
+                string since = view.Steps > 0 ? Elapsed(now - view.BackedOffSince) : "(hold running)";
+                sb.AppendLine($"  {Pad(name, 20)} {Pad(delivered, 10)} {Pad(rateNow, 10)} {Pad($"{pinned / 1024}KB/s", 9)} {Pad(view.Steps.ToString(), 6)} {since}");
+            }
+            if (!any) {
+                sb.AppendLine("  (nobody backed off)");
+            }
+            sb.AppendLine($"  session totals   {LossBackoff.TotalStepsDown} steps down, {LossBackoff.TotalStepsUp} steps up, {LossBackoff.TotalCleared} back at the global rate");
+        }
+
+        private static string Elapsed(float seconds) {
+            if (seconds < 60f) { return $"{seconds:F0}s"; }
+            int minutes = (int)(seconds / 60f);
+            if (minutes < 60) { return $"{minutes}m{(int)(seconds % 60f):D2}s"; }
+            return $"{minutes / 60}h{minutes % 60:D2}m";
         }
 
         /// <summary>
@@ -395,6 +631,41 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine($"  note: {PeerLiveness.TotalStallsIgnored} main-thread stalls were discounted from the silence timers");
                 sb.AppendLine("  rather than counted as peers going quiet.");
             }
+        }
+
+        /// <summary>
+        /// M24 - client only. Whether world updates ever arrived before this game could accept
+        /// them. On a healthy install the answer is "never"; anything else names a mod that holds
+        /// the handshake back, and says whether anything was lost to it.
+        /// </summary>
+        private static void AppendEarlyZdoData(StringBuilder sb) {
+            if (NpsEnv.IsHost()) { return; }
+            sb.AppendLine();
+            sb.AppendLine("Early world data (arriving before the connection handshake finished):");
+
+            string standDown = PatchGuard.GetDisableReason(Mechanism.EarlyZdoData);
+            if (standDown != null) {
+                sb.AppendLine($"  stood down: {standDown}");
+                return;
+            }
+            if (!ValConfig.EnableEarlyZdoDataGuard.Value) {
+                sb.AppendLine("  not held (EnableEarlyZdoDataGuard is off) - any that arrive early are dropped, as the game does");
+                return;
+            }
+            if (ZdoDataGuard.HandshakesDelayed == 0 && ZdoDataGuard.PackagesDropped == 0) {
+                sb.AppendLine("  none arrived early since the game started");
+                return;
+            }
+
+            sb.AppendLine($"  delayed joins    {ZdoDataGuard.HandshakesDelayed} (last one {ZdoDataGuard.LastDelaySeconds:F1}s early)");
+            sb.AppendLine($"  applied          {ZdoDataGuard.PackagesReplayed} packets, {ZdoDataGuard.BytesReplayed / 1024} KB");
+            if (ZdoDataGuard.PackagesDropped > 0) {
+                sb.AppendLine($"  lost             {ZdoDataGuard.PackagesDropped} packets (past the holding limit, or the connection closed first)");
+            }
+            if (ZdoDataGuard.ReplayFailures > 0) {
+                sb.AppendLine($"  failed to apply  {ZdoDataGuard.ReplayFailures} (see the warning in the log)");
+            }
+            sb.AppendLine("  another mod delays ZNet.RPC_PeerInfo on this client; the log has a line for each delayed join.");
         }
 
         /// <summary>
@@ -600,25 +871,94 @@ namespace NetworkPerformanceSystem.Runtime {
         /// requests vanilla would have lost outright - each one is an item that stayed in the
         /// world. "Held" is the cost of doing it safely: how often the new owner had not yet been
         /// told, and the longest anyone waited for that.</summary>
-        private static void AppendStationRpc(StringBuilder sb) {
+        private static void AppendOwnerRpc(StringBuilder sb) {
             if (!NpsEnv.IsHost()) { return; }
+
+            bool hooks = PatchGuard.IsActive(Mechanism.RpcOwnerRouting);
 
             sb.AppendLine();
             sb.AppendLine("Station requests (since start):");
-            if (!PatchGuard.IsActive(Mechanism.StationRpcRouting) || !ValConfig.EnableStationRpcRouting.Value) {
+            if (!hooks || !ValConfig.EnableStationRpcRouting.Value) {
                 sb.AppendLine("  vanilla (delivered to whoever the sender's copy names as owner)");
+            } else {
+                RpcOwnerRouter.Counters s = RpcOwnerRouter.Stations;
+                sb.AppendLine($"  {Pad("seen", 13)} {s.Seen} owner-addressed requests (add item/ore/fuel/ammo, tap, empty)");
+                sb.AppendLine($"  {Pad("re-targeted", 13)} {s.Retargeted} (sender named a stale owner - delivered to the current one)");
+                sb.AppendLine($"  {Pad("claimed", 13)} {s.Claimed} (no present owner - handed to the requesting player first)");
+                AppendHoldLines(sb, s);
+            }
+
+            // Hits are the same machinery with a looser idea of "still there" and of who may take
+            // over, so they get their own block: a hit is not an item, and "claimed" here is a
+            // creature that nobody was simulating and that would not have taken the hit at all.
+            sb.AppendLine();
+            sb.AppendLine("Creature hits (since start):");
+            if (!hooks || !ValConfig.EnableCreatureHitRouting.Value) {
+                sb.AppendLine("  vanilla (delivered to whoever the attacker's copy names as owner, or to nobody if it names none)");
+            } else {
+                RpcOwnerRouter.Counters c = RpcOwnerRouter.Creatures;
+                sb.AppendLine($"  {Pad("seen", 13)} {c.Seen} hits on creatures sent through the server");
+                sb.AppendLine($"  {Pad("re-targeted", 13)} {c.Retargeted} (attacker's copy named a stale owner, or nobody - delivered to the one simulating it)");
+                sb.AppendLine($"  {Pad("claimed", 13)} {c.Claimed} (nobody was simulating it - handed to the attacker first)");
+                AppendHoldLines(sb, c);
+            }
+
+            if (RpcOwnerRouter.Waiting > 0) {
+                sb.AppendLine($"  {Pad("waiting", 13)} {RpcOwnerRouter.Waiting} (both kinds)");
+            }
+        }
+
+        private static void AppendHoldLines(StringBuilder sb, RpcOwnerRouter.Counters counters) {
+            sb.AppendLine($"  {Pad("held", 13)} {counters.HeldCount} (waited for the owner to be sent its ownership; longest {counters.MaxHoldMs:F0}ms)");
+            sb.AppendLine($"  {Pad("expired", 13)} {counters.Expired} (owner not synced within {RpcOwnerRouter.HoldTimeoutSeconds:F0}s - forwarded regardless)");
+            sb.AppendLine($"  {Pad("dropped", 13)} {counters.Dropped} (object or player gone while waiting)");
+        }
+
+        /// <summary>
+        /// M23 - where the host takes each player's position from, and how far off the player's
+        /// own report was while the character was being followed. That distance is the error the
+        /// host would otherwise have been working with: in what it sends each player, in who owns
+        /// what around them, and in which zones it generates.
+        /// </summary>
+        private static void AppendReferencePositions(StringBuilder sb) {
+            if (!NpsEnv.IsHost()) { return; }
+            sb.AppendLine();
+            sb.AppendLine("Reference positions (where the host thinks each player is):");
+
+            string standDown = PatchGuard.GetDisableReason(Mechanism.LiveRefPos);
+            if (standDown != null || !ValConfig.UseCharacterRefPos.Value) {
+                sb.AppendLine(standDown != null
+                    ? $"  stood down: {standDown}"
+                    : "  as each player's own game reports it, every 2s (Use Character Position is off)");
                 return;
             }
 
-            sb.AppendLine($"  {Pad("seen", 13)} {StationRpcRouter.Seen} owner-addressed requests (add item/ore/fuel/ammo, tap, empty)");
-            sb.AppendLine($"  {Pad("re-targeted", 13)} {StationRpcRouter.Retargeted} (sender named a stale owner - delivered to the current one)");
-            sb.AppendLine($"  {Pad("claimed", 13)} {StationRpcRouter.Claimed} (no present owner - handed to the requesting player first)");
-            sb.AppendLine($"  {Pad("held", 13)} {StationRpcRouter.HeldCount} (waited for the owner to be sent its ownership; longest {StationRpcRouter.MaxHoldMs:F0}ms)");
-            sb.AppendLine($"  {Pad("expired", 13)} {StationRpcRouter.Expired} (owner not synced within {StationRpcRouter.HoldTimeoutSeconds:F0}s - forwarded regardless)");
-            sb.AppendLine($"  {Pad("dropped", 13)} {StationRpcRouter.Dropped} (object or player gone while waiting)");
-            if (StationRpcRouter.Waiting > 0) {
-                sb.AppendLine($"  {Pad("waiting", 13)} {StationRpcRouter.Waiting}");
+            List<ZNetPeer> peers = ZNet.instance.GetPeers();
+            bool any = false;
+            for (int i = 0; i < peers.Count; i++) {
+                if (!LiveRefPos.TryGetState(peers[i].m_uid, out LiveRefPos.PeerState state)) { continue; }
+                if (!any) {
+                    sb.AppendLine("  name                 from                         report behind mean/peak   pointed elsewhere");
+                    any = true;
+                }
+                string name = string.IsNullOrEmpty(peers[i].m_playerName) ? "(connecting)" : peers[i].m_playerName;
+                string from;
+                switch (state.Current) {
+                    case LiveRefPos.Source.Character: from = "character"; break;
+                    case LiveRefPos.Source.PointsElsewhere: from = "report (pointed elsewhere)"; break;
+                    default: from = "report (no character)"; break;
+                }
+                string behind = state.BehindSamples > 0 ? $"{state.BehindMean:F1}m / {state.BehindPeak:F0}m" : "-";
+                sb.AppendLine($"  {Pad(name, 20)} {Pad(from, 28)} {Pad(behind, 24)} {state.ReportsElsewhere}");
             }
+
+            if (!any) {
+                sb.AppendLine("  (no players yet)");
+                return;
+            }
+
+            sb.AppendLine("  report behind = how far the player's own last report was from their character: the host's error");
+            sb.AppendLine("  without this. A portal jump shows as a large peak until the next report.");
         }
 
         private static void AppendOwnership(StringBuilder sb) {
@@ -635,6 +975,13 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  released    {OwnershipArbiter.LastPassReleased} (no eligible owner in range)");
             sb.AppendLine($"  optimised   {OwnershipArbiter.LastPassOptimised} (moving objects, given to a better-placed owner; includes the pulls below)");
             sb.AppendLine($"  deferred    {OwnershipArbiter.LastPassDeferred} (moving objects only, hit the per-pass cap of {OwnershipArbiter.LastPassCap})");
+
+            // Creatures first, because until 1.8.0 none of the lines around this reached one.
+            if (ValConfig.OwnershipArbitrateCreatures.Value) {
+                sb.AppendLine($"  creatures   {OwnershipArbiter.LastPassCreaturesRescued} rescued, {OwnershipArbiter.LastPassCreaturesOptimised} moved (first in the queue, pushed out at once), {OwnershipArbiter.LastPassCreaturesKept} kept by an owner who has stepped away but still has them loaded");
+            } else {
+                sb.AppendLine("  creatures   not arbitrated (they keep whoever loaded them first, and are released at the edge of that player's area)");
+            }
 
             // Same reasoning as tier 2 below: say "latency only" when it is off rather than say nothing.
             if (ValConfig.EnableCreatureProximityOwnership.Value) {
@@ -656,7 +1003,17 @@ namespace NetworkPerformanceSystem.Runtime {
 
             sb.AppendLine($"  static held {OwnershipArbiter.LastPassStaticHeld} (present owner is not the lowest-latency one; kept because the object does not move)");
             sb.AppendLine($"  pass time   {OwnershipArbiter.LastPassMs:F1}ms");
-            sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued}, optimised {OwnershipArbiter.TotalOptimised}, interactive {OwnershipArbiter.TotalInteractiveOptimised}, proximity pulled {OwnershipArbiter.TotalProximityPulled} / rescued {OwnershipArbiter.TotalProximityRescued}");
+            sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued} ({OwnershipArbiter.TotalCreaturesRescued} creatures), optimised {OwnershipArbiter.TotalOptimised} ({OwnershipArbiter.TotalCreaturesOptimised} creatures), interactive {OwnershipArbiter.TotalInteractiveOptimised}, proximity pulled {OwnershipArbiter.TotalProximityPulled} / rescued {OwnershipArbiter.TotalProximityRescued}");
+
+            // M25 is not part of the pass - it acts on every update the host receives - but what it
+            // protects is exactly what the pass does, so it is reported here.
+            if (!PatchGuard.IsActive(Mechanism.OwnerRevisionGuard)) {
+                sb.AppendLine($"  stale owner stood down: {PatchGuard.GetDisableReason(Mechanism.OwnerRevisionGuard)}");
+            } else if (!ValConfig.RejectStaleOwnerUpdates.Value) {
+                sb.AppendLine("  stale owner off (an update written before its sender heard of an ownership change puts the old owner back, as vanilla)");
+            } else {
+                sb.AppendLine($"  stale owner {OwnerRevisionGuard.Kept} ownership changes kept against an older update that would have undone them ({OwnerRevisionGuard.KeptCreatures} creatures; {OwnerRevisionGuard.Seen} outdated updates in all, since start)");
+            }
 
             // The failure this split exists to make visible: a growing backlog of ZDOs with no
             // simulator is frozen creatures that cannot be damaged, and it is otherwise invisible

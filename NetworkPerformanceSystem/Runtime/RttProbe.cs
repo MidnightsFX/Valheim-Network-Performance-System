@@ -144,7 +144,8 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
-        /// The three numbers ZDOMan.SendZDOs cannot tell apart, plus Steam's own rate estimate.
+        /// The three numbers ZDOMan.SendZDOs cannot tell apart, plus the rate Steam paces the
+        /// connection at.
         ///
         /// GetSendQueueSize - the value vanilla budgets against and the one nps_stats reported
         /// until now - sums pending and in-flight bytes into a single figure. Those two mean
@@ -157,32 +158,32 @@ namespace NetworkPerformanceSystem.Runtime {
         ///     on the wire yet, because its own rate limiter will not pass it. This is real
         ///     congestion, and it is standing queue - latency added to every subsequent update.
         ///
-        /// Summed, a peer whose link is working perfectly and a peer being overdriven into
-        /// bufferbloat look identical. Separated, they are unmistakable, which is the whole reason
-        /// this read exists: the M2 window is currently open-loop - RTT times a *configured*
-        /// target rate - so nothing in the mod can otherwise tell that the target is set above
-        /// what a given link will actually carry.
+        /// Summed, a peer whose link is working perfectly and a peer being offered more than
+        /// Steam's fixed send rate look identical. Separated, they are unmistakable.
+        ///
+        /// SendRateBytesPerSec is not an estimate. Steam paces each connection at a fixed rate
+        /// (see SteamTransport), and this is that rate - which is what M2 sizes the window from.
         /// </summary>
         internal struct LinkStatus {
-            internal int PendingBytes;         // queued in Steam, not yet sent - congestion
+            internal int PendingBytes;         // queued in Steam, not yet sent - offered faster than the rate
             internal int InFlightBytes;        // sent, unacknowledged - the window doing its job
-            internal int SendRateBytesPerSec;  // Steam's own bandwidth estimate for this connection
-            internal float QualityLocal;
-            internal float QualityRemote;
+            internal int SendRateBytesPerSec;  // the fixed rate Steam paces this connection at
+            internal float QualityLocal;       // share of the remote's packets that reached us
+            internal float QualityRemote;      // share of our packets that reached the remote - loss on the way to them
         }
+
+        /// <summary>Consecutive calls on which neither interface produced a status. This read runs
+        /// per peer per ping, and per peer per send tick while sampling, so a build where it simply
+        /// does not work must stop costing two interop exceptions every time.</summary>
+        private static int _consecutiveStatusFailures;
+        private static bool _statusUnavailable;
+        private const int MaxConsecutiveStatusFailures = 20;
 
         /// <summary>
         /// Reads the transport's real-time view of one socket. Never throws. False means the
         /// socket is not a Steam socket, is not connected, or this process has no interface that
         /// will answer - in every case the caller simply records no sample.
         /// </summary>
-        /// <summary>Consecutive calls on which neither interface produced a status. This read runs
-        /// per peer per send tick while sampling, so a build where it simply does not work must
-        /// stop costing two interop exceptions every time rather than paying them at 20Hz.</summary>
-        private static int _consecutiveStatusFailures;
-        private static bool _statusUnavailable;
-        private const int MaxConsecutiveStatusFailures = 20;
-
         internal static bool TryGetLinkStatus(ISocket socket, out LinkStatus status) {
             status = default;
             if (socket == null || _statusUnavailable) { return false; }
@@ -211,9 +212,26 @@ namespace NetworkPerformanceSystem.Runtime {
                 _statusUnavailable = true;
                 Logger.LogInfo("Link-pressure sampling is unavailable on this build - neither Steamworks sockets " +
                                "interface reports connection status. nps_stats still shows RTT, window and queue size; " +
-                               "the pending-vs-in-flight split is what is missing.");
+                               "the pending-vs-in-flight split is what is missing, and send windows are sized from the " +
+                               "configured Steam rate instead of the one each connection reports.");
             }
             return false;
+        }
+
+        /// <summary>
+        /// The Steam connection handle under a peer's socket, for a config write addressed to that
+        /// one connection (M26). False for anything that is not a connected ZSteamSocket - a
+        /// crossplay peer, or a connection already closed - and the handle is only meaningful
+        /// until the socket closes; a caller that kept it must compare it with a fresh read before
+        /// acting on it again.
+        /// </summary>
+        internal static bool TryGetConnectionHandle(ISocket socket, out uint handle) {
+            handle = 0;
+            if (socket == null) { return false; }
+            if (!(Unwrap(socket) is ZSteamSocket steam)) { return false; }
+            if (!steam.IsConnected()) { return false; }
+            handle = steam.m_con.m_HSteamNetConnection;
+            return handle != 0;
         }
 
         private static bool TryStatus(SteamApi api, ZSteamSocket steam, ref LinkStatus status) {

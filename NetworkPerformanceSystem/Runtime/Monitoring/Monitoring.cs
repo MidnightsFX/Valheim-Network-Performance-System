@@ -8,7 +8,8 @@ using UnityEngine;
 
 namespace NetworkPerformanceSystem.Runtime {
 
-    /// <summary>Why a Prioritized ZDO changed owner, as far as the host can tell.</summary>
+    /// <summary>Why a tracked ZDO - a creature, or a Prioritized one - changed owner, as far as
+    /// the host can tell.</summary>
     internal enum HandoffCause {
         Gameplay,        // game code on this machine called SetOwner - a saddle, a cart, a claim
         VanillaPass,     // vanilla's own ReleaseNearbyZDOS, running because arbitration is off
@@ -116,6 +117,17 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         internal static bool IsWatchedRpc(int methodHash) => WatchedRpcs.Contains(methodHash);
+
+        /// <summary>
+        /// The objects this module follows: creatures, and Prioritized ZDOs (ships, carts,
+        /// players). The type flag alone was the test in 1.7.0, and it silently excluded every
+        /// creature - the game leaves them Default - so the first recording from a real server
+        /// held two hours of ships and not one creature. Flag first: it answers the ships and
+        /// players for free, and only a Default ZDO pays for the prefab lookup.
+        /// </summary>
+        internal static bool IsTracked(ZDO zdo) {
+            return zdo.Type == ZDO.ObjectType.Prioritized || OwnershipPolicy.IsCreature(zdo);
+        }
 
         // -- lifecycle ---------------------------------------------------------------------
 
@@ -334,11 +346,11 @@ namespace NetworkPerformanceSystem.Runtime {
 
         /// <summary>
         /// The arbiter is about to call SetOwner on this ZDO, and this is why. Consumed by the
-        /// SetOwner hook that follows immediately; filtered to Prioritized here so that the much
-        /// commoner moves of static objects set nothing that could be left behind.
+        /// SetOwner hook that follows immediately; filtered to tracked objects here so that the
+        /// much commoner moves of static objects set nothing that could be left behind.
         /// </summary>
         internal static void NoteCause(ZDO zdo, HandoffCause cause, float improvementMs = 0f, string candidates = null) {
-            if (zdo.Type != ZDO.ObjectType.Prioritized) { return; }
+            if (!IsTracked(zdo)) { return; }
 
             _pendingCause = cause;
             _pendingImprovementMs = improvementMs;
@@ -352,14 +364,17 @@ namespace NetworkPerformanceSystem.Runtime {
             _ambientCause = HandoffCause.VanillaPass;
         }
 
-        /// <summary>SetOwner ran on this machine and changed the owner of a Prioritized ZDO.</summary>
+        /// <summary>SetOwner ran on this machine and changed the owner of a tracked ZDO.</summary>
         internal static void OnLocalSetOwner(ZDO zdo, long from, long to) {
             HandoffCause cause = _hasPendingCause ? _pendingCause : _ambientCause;
             float improvement = _hasPendingCause ? _pendingImprovementMs : 0f;
             string candidates = _hasPendingCause ? _pendingCandidates : null;
             ClearPendingCause();
 
-            if (ServerRole) { EmitHandoff(zdo, from, to, cause, improvement, candidates, 0L, watch: to != 0L); }
+            // Releases are followed too. In 1.7.0 they were not, and the old owner's next update
+            // putting itself back - 95% of the ship releases in the first recording - was written
+            // down as an ordinary Remote change instead of the drag-back it was.
+            if (ServerRole) { EmitHandoff(zdo, from, to, cause, improvement, candidates, 0L, watch: true); }
             if (WantsSimulatorRecord(from, to)) { MonitoringClient.OnOwnerFlip(zdo, from, to, viaPacket: false); }
         }
 
@@ -381,7 +396,7 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
-        /// A Prioritized ZDO is being applied from a packet. Runs from the SetOwnerInternal hook,
+        /// A tracked ZDO is being applied from a packet. Runs from the SetOwnerInternal hook,
         /// so before the packet's position and fields have landed.
         /// </summary>
         internal static void OnPacketZdo(ZDO zdo, long packetOwner) {
@@ -473,28 +488,64 @@ namespace NetworkPerformanceSystem.Runtime {
         /// the host's count of those, and it needs nothing from the clients.
         /// </summary>
         internal static void OnRoutedRpc(ZRoutedRpc.RoutedRPCData data) {
+            OnRoutedRpc(data, data.m_targetPeerID, routed: false);
+        }
+
+        /// <summary>The same record, for a message the owner router has already delivered: the
+        /// peer the sender addressed it to is passed in, because the message now names the one it
+        /// went to, and "routed" says the router corrected it - so a miss here is a hit that
+        /// LANDED, which is the opposite of what a miss meant before the router took creature
+        /// hits.</summary>
+        internal static void OnRoutedRpc(ZRoutedRpc.RoutedRPCData data, long addressedTo, bool routed) {
+            if (!WatchedRpcs.Contains(data.m_methodHash)) { return; }
+
             ZDO zdo = ZDOMan.instance.GetZDO(data.m_targetZDO);
-            if (zdo != null && zdo.Type != ZDO.ObjectType.Prioritized && zdo.GetPrefab() != PlayerPrefabHash) {
+            if (zdo != null && !IsTracked(zdo) && zdo.GetPrefab() != PlayerPrefabHash) {
                 return;                                                       // a tree, a rock, a wall
             }
 
             long owner = zdo != null ? zdo.GetOwner() : 0L;
-            bool broadcast = data.m_targetPeerID == 0L;
-            bool misrouted = zdo != null && !broadcast && data.m_targetPeerID != owner;
-            if (misrouted || (broadcast && zdo != null)) { MisroutedRpcs++; }
+            bool broadcast = addressedTo == 0L;
+            bool misrouted = zdo != null && !broadcast && addressedTo != owner;
+            if (!routed && (misrouted || (broadcast && zdo != null))) { MisroutedRpcs++; }
 
             JsonLine line = Line.Begin("rpc")
                 .Num("t", NowMs, "0.#")
                 .Str("m", WatchedRpcNames[data.m_methodHash])
                 .Str("zdo", ZdoId(data.m_targetZDO))
                 .Id("sender", data.m_senderPeerID)
-                .Id("to", data.m_targetPeerID)
+                .Id("to", addressedTo)
                 .Id("owner", owner)
                 .Flag("miss", misrouted)
                 .Flag("bcast", broadcast)
                 .Flag("gone", zdo == null);
+            if (routed) { line.Flag("routed", true); }
             if (zdo != null) { line.Str("prefab", PrefabName(zdo)); }
             EmitServer(line.End());
+        }
+
+        /// <summary>
+        /// OwnerRevisionGuard kept the host's owner against a packet that would have put an older
+        /// one back - a drag-back that did not happen. Tracked objects only, like everything here.
+        /// The watched handoff, if there is one, counts it as blocked rather than dragged back.
+        /// </summary>
+        internal static void OnStaleOwnerRejected(ZDO zdo, long staleOwner, ushort staleRevision) {
+            if (!ServerRole || !IsTracked(zdo)) { return; }
+
+            HandoffWatch.NoteBlocked(zdo.m_uid);
+            Vector3 pos = zdo.GetPosition();
+            EmitServer(Line.Begin("stale_owner")
+                .Num("t", NowMs, "0.#")
+                .Str("zdo", ZdoId(zdo.m_uid))
+                .Str("prefab", PrefabName(zdo))
+                .Id("owner", zdo.GetOwner())
+                .Int("rev", zdo.OwnerRevision)
+                .Id("stale", staleOwner)
+                .Int("staleRev", staleRevision)
+                .Id("via", PacketPeerUid)
+                .Num("x", Math.Round(pos.x), "0")
+                .Num("z", Math.Round(pos.z), "0")
+                .End());
         }
 
         // -- peers -------------------------------------------------------------------------

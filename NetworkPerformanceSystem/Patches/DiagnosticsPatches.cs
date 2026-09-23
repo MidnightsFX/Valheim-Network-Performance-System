@@ -50,9 +50,27 @@ namespace NetworkPerformanceSystem.Patches {
         /// </summary>
         [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.SendZDOs))]
         [HarmonyPrefix]
-        private static void SampleSendAttempt(ZDOMan.ZDOPeer peer, bool flush) {
+        private static void SampleSendAttempt(ZDOMan __instance, ZDOMan.ZDOPeer peer, bool flush, out int __state) {
+            __state = -1;
             if (!NetworkStats.Collecting) { return; }
+            // The game's own count of objects written, so the postfix can tell how many of this
+            // send's list actually went out. UpdateStats zeroes it once a second, but only after
+            // SendZDOToPeers2 has finished, so it cannot reset between the two halves.
+            __state = __instance.m_zdosSent;
             NetworkStats.RecordSendAttempt(peer, flush);
+        }
+
+        /// <summary>
+        /// The other half of the same sample: how much of the list this send got through. It must
+        /// live in this class - Harmony hands __state only between a prefix and postfix declared
+        /// together. Only a send that actually went out is read, because SendZDOs' backpressure
+        /// returns leave m_tempToSync holding whichever peer was served before.
+        /// </summary>
+        [HarmonyPatch(typeof(ZDOMan), nameof(ZDOMan.SendZDOs))]
+        [HarmonyPostfix]
+        private static void SampleSendResult(ZDOMan __instance, ZDOMan.ZDOPeer peer, bool flush, bool __result, int __state) {
+            if (__state < 0 || flush || !__result || !NetworkStats.Collecting) { return; }
+            NetworkStats.RecordSendResult(__instance, peer, __instance.m_zdosSent - __state);
         }
     }
 }

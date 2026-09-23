@@ -5,7 +5,8 @@ using UnityEngine;
 namespace NetworkPerformanceSystem.Runtime {
 
     /// <summary>
-    /// M12 - delivers a station's owner-addressed item requests to whoever owns the station NOW.
+    /// M12 - delivers owner-addressed RPCs to whoever owns the object NOW: a station's item
+    /// requests, and hits on a creature (the second family, below).
     ///
     /// Fermenter.AddItem, Smelter.OnAddOre, CookingStation.CookItem, Fireplace.Interact,
     /// ShieldGenerator.UseItem and Turret.UseItem all take the item out of the player's inventory
@@ -50,10 +51,70 @@ namespace NetworkPerformanceSystem.Runtime {
     ///
     /// Only the components below, only their owner-addressed requests, only on the host. A
     /// client with this mod installed does nothing here, and a vanilla client benefits in full.
+    ///
+    /// CREATURE HITS take the same road, as a second family with its own switch and counters.
+    /// Character.Damage addresses RPC_Damage exactly the way a station request is addressed, and
+    /// Character.RPC_Damage drops it on a non-owner exactly as silently - but a creature changes
+    /// hands far more often than a station, and while it has no owner at all a hit is sent to
+    /// everybody and discarded by everybody. Measured on a 25-player server before this existed:
+    /// 2.8% of all hits, 412 of them on creatures whose owner the attacker's copy gave as nobody,
+    /// one of which took 87 hits over two minutes without any landing. Two rules differ:
+    ///
+    ///   * "The owner is present" means the owner still has the creature LOADED, not that it is in
+    ///     the 3x3 presence square - the arbiter keeps a creature with an owner in the outer ring
+    ///     of what that owner loads (OwnershipArbiter.OwnerStillLoads), and the router must agree
+    ///     with it or it would take creatures off the players simulating them.
+    ///   * An absent owner is replaced by the ATTACKER, anywhere in what they load. The attacker
+    ///     hit the creature, so its game has the instance; a bow shot from the outer ring is as
+    ///     good a claim as a sword swing. The claim is judged by the same near-ring test as the
+    ///     owner's presence, so it is one the pass will keep rather than undo two seconds later.
+    ///
+    /// Double delivery is as impossible for hits as for station requests, with one cosmetic
+    /// exception: RPC_Damage counts the attacker's hit statistic before its IsOwner check, so a
+    /// hit the attacker sent to nobody (target 0), ran locally as a no-op, and is then forwarded
+    /// back to it as the new owner, counts twice in that player's stats. The damage lands once.
+    /// RPC_Stagger is deliberately NOT routed: it has no IsOwner check at all and runs on every
+    /// receiver, so re-addressing it would take the stagger away from the others.
     /// </summary>
-    internal static class StationRpcRouter {
+    internal static class RpcOwnerRouter {
 
         private const string RoutedRpcMethod = "RoutedRPC";
+
+        internal enum Family : byte {
+            Station,
+            Creature,
+        }
+
+        /// <summary>What one family of requests needed correcting. "Re-targeted" and "claimed" are
+        /// the deliveries vanilla would have lost outright; "held" is the cost of doing it safely.</summary>
+        internal sealed class Counters {
+            internal long Seen;         // owner-addressed requests inspected
+            internal long Retargeted;   // target id rewritten to the current owner
+            internal long Claimed;      // owner absent or none - ownership handed to the requester first
+            internal long HeldCount;    // forwarded only after the target had been sent its ownership
+            internal long Expired;      // hold timed out; forwarded regardless
+            internal long Dropped;      // object or target gone while waiting
+            internal float MaxHoldMs;
+
+            internal void Clear() {
+                Seen = 0;
+                Retargeted = 0;
+                Claimed = 0;
+                HeldCount = 0;
+                Expired = 0;
+                Dropped = 0;
+                MaxHoldMs = 0f;
+            }
+        }
+
+        internal static readonly Counters Stations = new Counters();
+        internal static readonly Counters Creatures = new Counters();
+
+        /// <summary>The owner-addressed creature requests that must land. Only RPC_Damage - see the
+        /// class comment for why RPC_Stagger is not one of them.</summary>
+        private static readonly HashSet<int> CreatureRequestHashes = new HashSet<int> {
+            "RPC_Damage".GetStableHashCode(),
+        };
 
         /// <summary>
         /// The owner-addressed requests the station components make. Anything they send to
@@ -89,6 +150,7 @@ namespace NetworkPerformanceSystem.Runtime {
         private struct HeldRpc {
             internal ZRoutedRpc.RoutedRPCData Data;
             internal float QueuedAt;
+            internal Family Family;
         }
 
         private static readonly List<HeldRpc> Held = new List<HeldRpc>();
@@ -101,25 +163,21 @@ namespace NetworkPerformanceSystem.Runtime {
 
         // -- diagnostics -----------------------------------------------------------------------
 
-        internal static long Seen;         // owner-addressed station requests inspected
-        internal static long Retargeted;   // target id rewritten to the current owner
-        internal static long Claimed;      // owner absent or none - ownership handed to the requester first
-        internal static long HeldCount;    // forwarded only after the target had been sent its ownership
-        internal static long Expired;      // hold timed out; forwarded regardless
-        internal static long Dropped;      // object or target gone while waiting
-        internal static float MaxHoldMs;
         internal static int Waiting => Held.Count;
+
+        private static Counters For(Family family) => family == Family.Station ? Stations : Creatures;
 
         // -- entry points ----------------------------------------------------------------------
 
         /// <summary>
         /// Prefix on ZRoutedRpc.RPC_RoutedRPC, the host's entry point for every routed RPC a
-        /// client sends. Peeks at the header without allocating; only a station request is
+        /// client sends. Peeks at the header without allocating; only a request of a family this
+        /// router takes - a station request, or a hit on something that is a creature - is
         /// deserialized and taken over. Returns true when the message has been dealt with here
         /// and vanilla must not run; on false the package is rewound and untouched.
         /// </summary>
         internal static bool TryRouteIncoming(ZRoutedRpc router, ZPackage pkg) {
-            if (!Enabled(router) || pkg == null) { return false; }
+            if (!HooksLive(router) || pkg == null) { return false; }
 
             int saved = pkg.GetPos();
             try {
@@ -128,7 +186,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 pkg.ReadLong();                                              // m_targetPeerID
                 ZDOID targetZdo = pkg.ReadZDOID();
                 int methodHash = pkg.ReadInt();
-                if (targetZdo.IsNone() || !RequestHashes.Contains(methodHash)) {
+                if (!TryClassify(targetZdo, methodHash, out ZDO zdo, out Family family)) {
                     pkg.SetPos(saved);
                     return false;
                 }
@@ -136,11 +194,20 @@ namespace NetworkPerformanceSystem.Runtime {
                 pkg.SetPos(saved);
                 ZRoutedRpc.RoutedRPCData data = new ZRoutedRpc.RoutedRPCData();
                 data.Deserialize(pkg);
-                if (TryRoute(router, data)) { return true; }
+
+                For(family).Seen++;
+                long addressedTo = data.m_targetPeerID;
+                if (Route(router, data, zdo, family, retry: false, expired: false) == Outcome.Done) {
+                    // A client's message taken over here never reaches RouteRPC, where network
+                    // monitoring watches, so a creature hit is shown to it from here instead, with
+                    // the peer the sender addressed it to rather than the one it went to.
+                    if (family == Family.Creature && Monitoring.Active) { Monitoring.OnRoutedRpc(data, addressedTo, routed: true); }
+                    return true;
+                }
             } catch (Exception e) {
                 // A throw here would land in ZRpc.Update's catch-all, logged without our name,
                 // and the message would be lost. Fall back to vanilla instead.
-                Logger.LogWarning($"Station RPC routing fell back to vanilla: {e.GetType().Name}: {e.Message}");
+                Logger.LogWarning($"Owner RPC routing fell back to vanilla: {e.GetType().Name}: {e.Message}");
             }
 
             pkg.SetPos(saved);
@@ -152,19 +219,43 @@ namespace NetworkPerformanceSystem.Runtime {
         /// has been dealt with here and vanilla must not run.
         /// </summary>
         internal static bool TryRoute(ZRoutedRpc router, ZRoutedRpc.RoutedRPCData data) {
-            if (!Enabled(router) || data == null) { return false; }
-            if (data.m_targetZDO.IsNone() || !RequestHashes.Contains(data.m_methodHash)) { return false; }
+            if (!HooksLive(router) || data == null) { return false; }
 
             try {
-                ZDO zdo = ZDOMan.instance?.GetZDO(data.m_targetZDO);
-                if (zdo == null || !IsStation(zdo)) { return false; }
+                if (!TryClassify(data.m_targetZDO, data.m_methodHash, out ZDO zdo, out Family family)) { return false; }
 
-                Seen++;
-                return Route(router, data, zdo, retry: false, expired: false) == Outcome.Done;
+                For(family).Seen++;
+                return Route(router, data, zdo, family, retry: false, expired: false) == Outcome.Done;
             } catch (Exception e) {
-                Logger.LogWarning($"Station RPC routing fell back to vanilla: {e.GetType().Name}: {e.Message}");
+                Logger.LogWarning($"Owner RPC routing fell back to vanilla: {e.GetType().Name}: {e.Message}");
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Is this a request one of the enabled families takes, and on what object? The method
+        /// hash is checked first because it retires nearly every message for the price of two set
+        /// probes; only a matching hash pays for the ZDO lookup and the prefab check. A hit on a
+        /// player or a building matches the hash and fails the prefab check, and is left alone.
+        /// </summary>
+        private static bool TryClassify(ZDOID target, int methodHash, out ZDO zdo, out Family family) {
+            zdo = null;
+            family = Family.Station;
+            if (target.IsNone()) { return false; }
+
+            bool station = RequestHashes.Contains(methodHash) && ValConfig.EnableStationRpcRouting.Value;
+            bool creature = !station && CreatureRequestHashes.Contains(methodHash) && ValConfig.EnableCreatureHitRouting.Value;
+            if (!station && !creature) { return false; }
+
+            zdo = ZDOMan.instance?.GetZDO(target);
+            if (zdo == null) { return false; }
+
+            if (station) {
+                family = Family.Station;
+                return IsStation(zdo);
+            }
+            family = Family.Creature;
+            return OwnershipPolicy.IsCreature(zdo);
         }
 
         /// <summary>
@@ -177,7 +268,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             ZRoutedRpc router = ZRoutedRpc.instance;
             if (router == null || !router.m_server || ZDOMan.instance == null) {
-                Dropped += Held.Count;
+                for (int i = 0; i < Held.Count; i++) { For(Held[i].Family).Dropped++; }
                 Held.Clear();
                 return;
             }
@@ -186,29 +277,30 @@ namespace NetworkPerformanceSystem.Runtime {
             int kept = 0;
             for (int i = 0; i < Held.Count; i++) {
                 HeldRpc held = Held[i];
+                Counters counters = For(held.Family);
                 bool keep = false;
                 try {
                     ZDO zdo = ZDOMan.instance.GetZDO(held.Data.m_targetZDO);
                     if (zdo == null) {
-                        Dropped++;
+                        counters.Dropped++;
                     } else {
                         float waitedMs = (now - held.QueuedAt) * 1000f;
                         bool expired = waitedMs > HoldTimeoutSeconds * 1000f;
-                        switch (Route(router, held.Data, zdo, retry: true, expired: expired)) {
+                        switch (Route(router, held.Data, zdo, held.Family, retry: true, expired: expired)) {
                             case Outcome.Wait:
                                 keep = true;
                                 break;
                             case Outcome.Done:
-                                if (waitedMs > MaxHoldMs) { MaxHoldMs = waitedMs; }
+                                if (waitedMs > counters.MaxHoldMs) { counters.MaxHoldMs = waitedMs; }
                                 break;
                             default:
-                                Dropped++;                               // nobody credible left to give it to
+                                counters.Dropped++;                      // nobody credible left to give it to
                                 break;
                         }
                     }
                 } catch (Exception e) {
-                    Logger.LogWarning($"Station RPC routing dropped a held request: {e.GetType().Name}: {e.Message}");
-                    Dropped++;
+                    Logger.LogWarning($"Owner RPC routing dropped a held request: {e.GetType().Name}: {e.Message}");
+                    counters.Dropped++;
                 }
                 if (keep) { Held[kept++] = held; }
             }
@@ -217,9 +309,10 @@ namespace NetworkPerformanceSystem.Runtime {
 
         // -- the decision ----------------------------------------------------------------------
 
-        private static bool Enabled(ZRoutedRpc router) {
-            return PatchGuard.IsActive(Mechanism.StationRpcRouting)
-                && ValConfig.EnableStationRpcRouting.Value
+        /// <summary>The hooks are in and this is the host. Each family's own switch is read in
+        /// TryClassify, so either can be turned off without the other.</summary>
+        private static bool HooksLive(ZRoutedRpc router) {
+            return PatchGuard.IsActive(Mechanism.RpcOwnerRouting)
                 && router != null
                 && router.m_server;
         }
@@ -229,15 +322,16 @@ namespace NetworkPerformanceSystem.Runtime {
         /// not the message, not the ZDO - until it is certain the message will be delivered from
         /// here, so a Vanilla outcome hands back exactly what arrived.
         /// </summary>
-        private static Outcome Route(ZRoutedRpc router, ZRoutedRpc.RoutedRPCData data, ZDO zdo, bool retry, bool expired) {
+        private static Outcome Route(ZRoutedRpc router, ZRoutedRpc.RoutedRPCData data, ZDO zdo, Family family, bool retry, bool expired) {
             ZDOMan zdoMan = ZDOMan.instance;
             long self = router.m_id;
+            Counters counters = For(family);
 
             long owner = zdo.GetOwner();
             ZDOMan.ZDOPeer ownerPeer = null;
             bool claim = false;
 
-            if (owner == 0L || !IsPresent(zdoMan, owner, self, zdo, out ownerPeer)) {
+            if (owner == 0L || !Holds(family, zdoMan, owner, self, zdo, out ownerPeer)) {
                 // Nobody present is simulating this. The requester is standing at it - they have
                 // the instance, or they could not have interacted - so they are the right owner,
                 // and the ownership pass would agree within two seconds. Refuse only when the
@@ -245,7 +339,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 // credible owner to name, and vanilla's behaviour is the honest one.
                 long sender = data.m_senderPeerID;
                 if (sender != self) {
-                    if (!IsPresent(zdoMan, sender, self, zdo, out ownerPeer)) { return Outcome.Vanilla; }
+                    if (!Holds(family, zdoMan, sender, self, zdo, out ownerPeer)) { return Outcome.Vanilla; }
                 }
                 owner = sender;
                 claim = zdo.GetOwner() != owner;
@@ -255,11 +349,11 @@ namespace NetworkPerformanceSystem.Runtime {
 
             if (claim) {
                 zdo.SetOwner(owner);
-                Claimed++;
+                counters.Claimed++;
             }
 
             if (owner != data.m_targetPeerID) {
-                if (!retry) { Retargeted++; }
+                if (!retry) { counters.Retargeted++; }
                 data.m_targetPeerID = owner;
             }
 
@@ -280,7 +374,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             if (retry) {
                 if (!expired) { return Outcome.Wait; }
-                Expired++;
+                counters.Expired++;
                 Forward(ownerPeer.m_peer, data);
                 return Outcome.Done;
             }
@@ -289,29 +383,67 @@ namespace NetworkPerformanceSystem.Runtime {
             // update is at the front of its next send, then wait for it - FlushHeld will forward
             // this behind it.
             zdoMan.ForceSendZDO(owner, zdo.m_uid);
-            Held.Add(new HeldRpc { Data = data, QueuedAt = Time.realtimeSinceStartup });
-            HeldCount++;
+            Held.Add(new HeldRpc { Data = data, QueuedAt = Time.realtimeSinceStartup, Family = family });
+            counters.HeldCount++;
             return Outcome.Done;
         }
 
         /// <summary>
-        /// Is this peer, as the host currently sees it, inside the station's active area? The
-        /// same zone-level test the ownership pass uses for "owner present", against the same
-        /// reference position - so the two can never disagree about who is here. A peer with no
-        /// position yet (the (0,0,0) sentinel) is not present anywhere.
+        /// Is this peer, as the host currently sees it, somewhere it can handle a request on this
+        /// object - and, for the forward, which ZDOPeer is it? Asked of the current owner ("still
+        /// there to take this?") and, when the owner is not, of the requester ("may it be handed
+        /// the object?"). The same test both times, on purpose: whoever passes it is who the
+        /// ownership pass would leave the object with, so a claim made here is one the pass will
+        /// not undo two seconds later.
+        ///
+        ///   * A station: the peer's 3x3 presence square covers the station's zone - the test the
+        ///     pass uses for "owner present", against the same reference position, so the two can
+        ///     never disagree about who is here.
+        ///   * A creature: the creature's zone is in the peer's near ring - what its ZNetScene
+        ///     instantiates - which is the test the pass uses to keep a creature with an owner who
+        ///     has stepped out of the presence square (OwnershipArbiter.OwnerStillLoads). Exact,
+        ///     not an upper bound: a claimant judged by a looser test would be taken off the
+        ///     creature by the next pass, and the hit forwarded to it would find no instance. A
+        ///     peer that has stopped answering is excluded here as it is there (M21).
+        ///
+        /// A peer with no position yet (the (0,0,0) sentinel) is nowhere.
         /// </summary>
-        private static bool IsPresent(ZDOMan zdoMan, long uid, long self, ZDO zdo, out ZDOMan.ZDOPeer peer) {
+        private static bool Holds(Family family, ZDOMan zdoMan, long uid, long self, ZDO zdo, out ZDOMan.ZDOPeer peer) {
             peer = null;
             Vector3 refPos;
             if (uid == self) {
                 refPos = ZNet.instance.GetReferencePosition();
-            } else {
-                peer = zdoMan.GetPeer(uid);
-                if (peer?.m_peer == null || !peer.m_peer.IsReady()) { return false; }
-                refPos = peer.m_peer.GetRefPos();
-                if (refPos == Vector3.zero) { return false; }
+            } else if (!TryPositionedPeer(zdoMan, uid, out peer, out refPos)) {
+                return false;
             }
-            return ZoneCompat.InActiveArea(ZoneSystem.GetZone(zdo.GetPosition()), ZoneSystem.GetZone(refPos), ZoneCompat.ActiveZoneRadius);
+
+            Vector2s zone = ZoneSystem.GetZone(zdo.GetPosition());
+            Vector2s peerZone = ZoneSystem.GetZone(refPos);
+            if (family == Family.Station) {
+                return ZoneCompat.InActiveArea(zone, peerZone, ZoneCompat.ActiveZoneRadius);
+            }
+
+            if (peer != null && IsGhost(uid)) { return false; }
+            SimulationDistance distance = peer != null ? ZoneCompat.For(peer.m_peer) : ZoneCompat.Local();
+            return ZoneCompat.NearRingLoaded(peerZone, zone, Mathf.Max(1, distance.NearSimulationDistance), distance.IsClassic);
+        }
+
+        /// <summary>The peer's ZDOPeer and reference position, when it is connected, has finished
+        /// the handshake and has told us where it is.</summary>
+        private static bool TryPositionedPeer(ZDOMan zdoMan, long uid, out ZDOMan.ZDOPeer peer, out Vector3 refPos) {
+            refPos = Vector3.zero;
+            peer = zdoMan.GetPeer(uid);
+            if (peer?.m_peer == null || !peer.m_peer.IsReady()) { return false; }
+            refPos = peer.m_peer.GetRefPos();
+            return refPos != Vector3.zero;
+        }
+
+        /// <summary>A peer that has stopped answering is no owner for a creature, the same as in
+        /// the ownership pass (M21) - when that pass is excluding ghosts at all.</summary>
+        private static bool IsGhost(long uid) {
+            return ValConfig.EvictGhostOwners.Value
+                && PatchGuard.IsActive(Mechanism.PeerLiveness)
+                && PeerLiveness.IsGhost(uid);
         }
 
         /// <summary>
@@ -359,13 +491,8 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static void Reset() {
             Held.Clear();
             StationPrefabs.Clear();
-            Seen = 0;
-            Retargeted = 0;
-            Claimed = 0;
-            HeldCount = 0;
-            Expired = 0;
-            Dropped = 0;
-            MaxHoldMs = 0f;
+            Stations.Clear();
+            Creatures.Clear();
         }
     }
 }

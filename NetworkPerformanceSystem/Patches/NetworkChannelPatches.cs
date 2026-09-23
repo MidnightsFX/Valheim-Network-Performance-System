@@ -16,21 +16,12 @@ namespace NetworkPerformanceSystem.Patches {
     internal static class NetworkChannelPatches {
 
         internal const string RpcLatencyTable = "Nps.LatencyTable";
-        internal const string RpcRefPos = "Nps.RefPos";
 
         /// <summary>How often the host republishes the latency table. Ownership decisions move on
         /// a multi-second hysteresis anyway, so there is nothing to gain from going faster.</summary>
         private const float LatencyTableIntervalSeconds = 2f;
 
-        /// <summary>Anything further from the origin than this is not a position in a Valheim
-        /// world (radius 10 000m plus margin). Used to reject garbage reference positions before
-        /// they reach the zone maths, where a NaN or an out-of-range float turns into an
-        /// int.MinValue zone and a sector scan over overflowed coordinates.</summary>
-        private const float MaxRefPosCoordinate = 12000f;
-
         private static float _latencyTableTimer;
-        private static float _refPosTimer;
-        private static Vector3 _lastSentRefPos = Vector3.positiveInfinity;
 
         // -- channel registration ----------------------------------------------------------
 
@@ -43,7 +34,6 @@ namespace NetworkPerformanceSystem.Patches {
             // sends, so there is no need to know our role at registration time - and at this
             // point in the handshake peer.m_uid is still 0 anyway.
             peer.m_rpc.Register<ZPackage>(RpcLatencyTable, RPC_LatencyTable);
-            peer.m_rpc.Register<Vector3>(RpcRefPos, RPC_RefPos);
 
             // Network monitoring's two. Registered whether or not monitoring is on - it can be
             // switched on mid-session, and an unused handler costs a dictionary entry. Neither
@@ -82,6 +72,18 @@ namespace NetworkPerformanceSystem.Patches {
             if (RttProbe.TryGetPingMs(peer.m_socket, out int ping)) {
                 LatencyRegistry.Sample(peer.m_uid, ping);
             }
+
+            // The other half of M2's bandwidth-delay product: the rate Steam paces this connection
+            // at. A separate read rather than folded into the ping query, because the client-side
+            // ping goes through vanilla's GetConnectionQuality on purpose (so a mod re-pointing it
+            // is respected) and that accessor does not expose the rate. One more native call per
+            // peer per ping.
+            if (RttProbe.TryGetLinkStatus(peer.m_socket, out RttProbe.LinkStatus link)) {
+                LatencyRegistry.NoteSteamSendRate(peer.m_uid, link.SendRateBytesPerSec);
+                SteamTransport.NoteObservedRate(peer.m_uid, link.SendRateBytesPerSec);
+                // M26: the same status carries the share of our packets that reached this peer.
+                LossBackoff.Observe(peer, link.QualityRemote);
+            }
         }
 
         internal static ZNetPeer FindPeerByRpc(ZRpc rpc) {
@@ -107,7 +109,6 @@ namespace NetworkPerformanceSystem.Patches {
             if (NpsEnv.IsHost()) {
                 TickLatencyTable(dt);
             } else {
-                TickRefPos(dt);
                 GhostWatchdog.Tick();                                         // M22, client-side only
             }
 
@@ -132,66 +133,11 @@ namespace NetworkPerformanceSystem.Patches {
             }
         }
 
-        /// <summary>
-        /// M6. Vanilla only reports our reference position inside ZNet.SendPeriodicData, which is
-        /// gated behind a single 2 second timer it shares with SendNetTime and SendPlayerList.
-        /// The server uses that position for both the interest set and ownership arbitration, so
-        /// at sprint speed it can be arbitrating against a position 10m out of date, and on a
-        /// longship 20m+ - a third of a zone. This is a 12 byte side-channel that keeps it fresh
-        /// without touching the vanilla path or its heavier payload.
-        /// </summary>
-        private static void TickRefPos(float dt) {
-            if (!ValConfig.EnableFastRefPos.Value) { return; }
-
-            _refPosTimer += dt;
-            float interval = 1f / Mathf.Max(1f, ValConfig.RefPosSendHz.Value);
-            if (_refPosTimer < interval) { return; }
-            _refPosTimer = 0f;
-
-            ZNetPeer server = ZNet.instance.GetServerPeer();
-            if (server == null || !server.IsReady()) { return; }
-
-            Vector3 pos = ZNet.instance.GetReferencePosition();
-            // Exactly zero is what ZNet holds before Game.FindSpawnPoint has chosen where we are
-            // going. The server already treats it as "no position yet"; advertising it would only
-            // re-assert the sentinel the vanilla PeerInfo has already given it.
-            if (pos == Vector3.zero) { return; }
-
-            float minMove = ValConfig.RefPosMinMoveDistance.Value;
-            if (minMove > 0f && (pos - _lastSentRefPos).sqrMagnitude < minMove * minMove) {
-                return;                                                       // standing still costs nothing
-            }
-
-            _lastSentRefPos = pos;
-            server.m_rpc.Invoke(RpcRefPos, pos);
-        }
-
         // -- handlers ----------------------------------------------------------------------
 
         private static void RPC_LatencyTable(ZRpc rpc, ZPackage pkg) {
             if (NpsEnv.IsHost()) { return; }                                  // hosts measure, they do not receive
             LatencyRegistry.ApplyTablePackage(pkg);
-        }
-
-        private static void RPC_RefPos(ZRpc rpc, Vector3 pos) {
-            if (!NpsEnv.IsHost()) { return; }
-            if (!ValConfig.EnableFastRefPos.Value) { return; }
-            if (!IsPlausibleRefPos(pos)) { return; }
-
-            ZNetPeer peer = FindPeerByRpc(rpc);
-            if (peer == null) { return; }
-            peer.m_refPos = pos;
-        }
-
-        /// <summary>Client-supplied, so it is checked before it can reach ZoneSystem.GetZone.
-        /// Vanilla's own RPC_ServerSyncedPlayerData trusts the same value; this channel is five
-        /// times as frequent, so it at least should not.</summary>
-        private static bool IsPlausibleRefPos(Vector3 pos) {
-            if (float.IsNaN(pos.x) || float.IsNaN(pos.y) || float.IsNaN(pos.z)) { return false; }
-            if (float.IsInfinity(pos.x) || float.IsInfinity(pos.y) || float.IsInfinity(pos.z)) { return false; }
-            return Mathf.Abs(pos.x) <= MaxRefPosCoordinate
-                && Mathf.Abs(pos.y) <= MaxRefPosCoordinate
-                && Mathf.Abs(pos.z) <= MaxRefPosCoordinate;
         }
 
         // -- lifecycle ---------------------------------------------------------------------
@@ -206,6 +152,11 @@ namespace NetworkPerformanceSystem.Patches {
             NetworkStats.ForgetPeer(netPeer.m_uid);
             SyncListCache.ForgetPeer(netPeer.m_uid);
             Monitoring.ForgetPeer(netPeer.m_uid);
+            LiveRefPos.ForgetPeer(netPeer.m_uid);
+            SteamTransport.ForgetPeer(netPeer.m_uid);
+            LossBackoff.ForgetPeer(netPeer.m_uid);
+            // Keyed by connection, not uid: a peer dropped mid-handshake may never have had one.
+            ZdoDataGuard.Forget(netPeer.m_rpc);
         }
 
         /// <summary>StopAll rather than Shutdown: it is the common tail of both Shutdown and
@@ -218,9 +169,11 @@ namespace NetworkPerformanceSystem.Patches {
             RttProbe.Reset();
             PeerLiveness.Reset();
             GhostWatchdog.Reset();
+            LiveRefPos.Reset();
+            SteamTransport.Reset();
+            LossBackoff.Reset();
+            ZdoDataGuard.Reset();
             _latencyTableTimer = 0f;
-            _refPosTimer = 0f;
-            _lastSentRefPos = Vector3.positiveInfinity;
         }
     }
 }

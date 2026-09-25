@@ -298,6 +298,9 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (PatchGuard.IsActive(mechanism)) { live.Add(mechanism.ToString()); }
             }
 
+            // The host's own distance caps every peer's, and stands in for a peer that has not
+            // reported one; see AppendSimulationDistance.
+            SimulationDistance hostDistance = ZoneCompat.Local();
             EmitServer(Line.Begin("session")
                 .Num("t", NowMs, "0.#")
                 .Str("utc", DateTime.UtcNow.ToString("o"))
@@ -305,6 +308,9 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Str("game", Version.GetVersionString())
                 .Flag("dedicated", NpsEnv.IsDedicated())
                 .Id("host", NpsEnv.LocalSessionId())
+                .Int("simNear", hostDistance.NearSimulationDistance)
+                .Int("simFar", hostDistance.FarSimulationDistance)
+                .Flag("simClassic", hostDistance.IsClassic)
                 .Str("mechanisms", string.Join(",", live.ToArray()))
                 .Raw("config", DescribeConfig())
                 .End());
@@ -528,8 +534,10 @@ namespace NetworkPerformanceSystem.Runtime {
         /// OwnerRevisionGuard kept the host's owner against a packet that would have put an older
         /// one back - a drag-back that did not happen. Tracked objects only, like everything here.
         /// The watched handoff, if there is one, counts it as blocked rather than dragged back.
+        /// "refused" says the packet's data was dropped too (creatures), rather than applied under
+        /// the host's owner; either way the object was force-sent back to the sender.
         /// </summary>
-        internal static void OnStaleOwnerRejected(ZDO zdo, long staleOwner, ushort staleRevision) {
+        internal static void OnStaleOwnerRejected(ZDO zdo, long staleOwner, ushort staleRevision, bool dataRefused) {
             if (!ServerRole || !IsTracked(zdo)) { return; }
 
             HandoffWatch.NoteBlocked(zdo.m_uid);
@@ -545,6 +553,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Id("via", PacketPeerUid)
                 .Num("x", Math.Round(pos.x), "0")
                 .Num("z", Math.Round(pos.z), "0")
+                .Flag("refused", dataRefused)
                 .End());
         }
 
@@ -582,6 +591,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     .Int("zy", zone.y)
                     .Int("owned", OwnershipArbiter.OwnedCountFor(peer.m_uid))
                     .Flag("ghost", PeerLiveness.IsGhost(peer.m_uid));
+                AppendSimulationDistance(line, peer.m_simulationDistance);
 
                 if (LatencyRegistry.TryGetState(peer.m_uid, out LatencyRegistry.PeerLatency latency)) {
                     line.Int("rttLast", latency.LastMs)
@@ -599,6 +609,41 @@ namespace NetworkPerformanceSystem.Runtime {
 
                 EmitServer(line.End());
             }
+        }
+
+        /// <summary>
+        /// The simulation distance the game negotiated for this peer, exactly as stored - how far
+        /// it loads, and so which creatures it can be writing. It decides the ring the host sends
+        /// it (CreateSyncList) and the ring the arbiter believes it holds (OwnerStillLoads), and
+        /// the first 1.8.0 recording could not tell whether the two ever disagree without it.
+        /// A peer that has not finished the handshake reads (0, 0), which ZoneCompat.For replaces
+        /// with the host's own value; recorded raw so that case is visible.
+        /// </summary>
+        private static void AppendSimulationDistance(JsonLine line, SimulationDistance distance) {
+            line.Int("simNear", distance.NearSimulationDistance)
+                .Int("simFar", distance.FarSimulationDistance)
+                .Flag("simClassic", distance.IsClassic);
+        }
+
+        /// <summary>
+        /// Loss backoff (M26) changed one player's send rate: "down", "up", "clear" (back at the
+        /// global rate after a clean run), or "exempt" (back at the global rate because stepping
+        /// down did not improve their delivery; never stepped again this session). "delivered" is
+        /// the smoothed share of packets reaching them now, "atStart" what it was at their first
+        /// step down, and "rate" the rate they are on after the change.
+        /// </summary>
+        internal static void OnLossBackoff(long uid, string action, int steps, int rateBytesPerSec, float delivered, float deliveredAtStart) {
+            if (!ServerRole) { return; }
+
+            EmitServer(Line.Begin("loss_backoff")
+                .Num("t", NowMs, "0.#")
+                .Id("uid", uid)
+                .Str("action", action)
+                .Int("steps", steps)
+                .Int("rate", rateBytesPerSec)
+                .Num("delivered", delivered, "0.###")
+                .Num("atStart", deliveredAtStart, "0.###")
+                .End());
         }
 
         internal static void ForgetPeer(long uid) {

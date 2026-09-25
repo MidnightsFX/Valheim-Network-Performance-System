@@ -280,6 +280,19 @@ namespace NetworkPerformanceSystem.Runtime {
             }
         }
 
+        /// <summary>
+        /// The simulation distance the game negotiated for this peer, as near/far with a "c" for
+        /// classic (the full square rather than the disc-clipped ring). It is how far that player
+        /// loads, so it bounds what they can be simulating - and it is per peer, capped at the
+        /// server's. "-" is a peer that has not reported one yet; the mod uses the server's own
+        /// value for it until it does.
+        /// </summary>
+        private static string DescribeSimulationDistance(ZNetPeer peer) {
+            SimulationDistance distance = peer.m_simulationDistance;
+            if (distance.TotalSimulationDistance <= 0) { return "-"; }
+            return $"{distance.NearSimulationDistance}/{distance.FarSimulationDistance}{(distance.IsClassic ? "c" : "")}";
+        }
+
         private static void AppendPeerTable(StringBuilder sb) {
             List<ZNetPeer> peers = ZNet.instance.GetPeers();
             sb.AppendLine();
@@ -290,7 +303,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 return;
             }
 
-            sb.AppendLine("  name                 rtt     jitter  window    for rate   queue   skipped");
+            sb.AppendLine("  name                 rtt     jitter  sim     window    for rate   queue   skipped");
             for (int i = 0; i < peers.Count; i++) {
                 ZNetPeer peer = peers[i];
                 long uid = peer.m_uid;
@@ -314,7 +327,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     skipped = $"{pct:F1}% ({entry.SendsSkippedByBackpressure}/{entry.SendAttempts})";
                 }
 
-                sb.AppendLine($"  {Pad(name, 20)} {Pad(rtt, 7)} {Pad(jitter, 7)} {Pad(window, 9)} {Pad(rate, 10)} {Pad(queue, 7)} {skipped}");
+                sb.AppendLine($"  {Pad(name, 20)} {Pad(rtt, 7)} {Pad(jitter, 7)} {Pad(DescribeSimulationDistance(peer), 7)} {Pad(window, 9)} {Pad(rate, 10)} {Pad(queue, 7)} {skipped}");
             }
 
             if (Collecting) {
@@ -392,6 +405,9 @@ namespace NetworkPerformanceSystem.Runtime {
         /// it while it runs, and the manual remedy when it does not.</summary>
         private static string LossAction(long uid) {
             if (!LossBackoff.Wanted) { return "LOSSY - lower Send Rate KBps"; }
+            if (LossBackoff.TryGetView(uid, out LossBackoff.View exempt) && exempt.Exempt) {
+                return "LOSSY - not the send rate (slowing down did not help); kept at full rate";
+            }
             if (LossBackoff.TryGetView(uid, out LossBackoff.View view) && view.Steps > 0) {
                 return view.AtFloor
                     ? $"LOSSY - held at the {LossBackoff.FloorBytesPerSec / 1024} KB/s back-off floor"
@@ -526,7 +542,8 @@ namespace NetworkPerformanceSystem.Runtime {
 
             int floor = LossBackoff.FloorBytesPerSec;
             sb.AppendLine($"  rule             under {ValConfig.LossBackoffThreshold.Value * 100f:F0}% delivered for {ValConfig.LossBackoffHoldSeconds.Value}s: a quarter off that player's rate, never below {floor / 1024} KB/s;");
-            sb.AppendLine($"                   clean for {ValConfig.LossBackoffRecoverSeconds.Value}s: one step back up, until it follows Send Rate KBps again");
+            sb.AppendLine($"                   clean for {ValConfig.LossBackoffRecoverSeconds.Value}s: one step back up, until it follows Send Rate KBps again;");
+            sb.AppendLine($"                   still losing at the floor and no better than when it started: straight back to Send Rate KBps, and never stepped down again this session");
             if (floor >= pinned) {
                 sb.AppendLine($"  floor {floor / 1024} KB/s is not below the send rate {pinned / 1024} KB/s: nothing to step down to");
             }
@@ -536,7 +553,7 @@ namespace NetworkPerformanceSystem.Runtime {
             bool any = false;
             for (int i = 0; i < peers.Count; i++) {
                 if (!LossBackoff.TryGetView(peers[i].m_uid, out LossBackoff.View view)) { continue; }
-                if (view.Steps == 0 && !view.Lossy) { continue; }
+                if (view.Steps == 0 && !view.Lossy && !view.Exempt) { continue; }
                 if (!any) {
                     sb.AppendLine("  name                 delivered  rate now   global    steps  backed off for");
                     any = true;
@@ -544,13 +561,17 @@ namespace NetworkPerformanceSystem.Runtime {
                 string name = string.IsNullOrEmpty(peers[i].m_playerName) ? "(connecting)" : peers[i].m_playerName;
                 string delivered = view.HasSample ? $"{view.Delivered * 100f:F1}%" : "-";
                 string rateNow = view.Steps > 0 ? $"{view.OverrideBytesPerSec / 1024}KB/s" : $"{pinned / 1024}KB/s";
-                string since = view.Steps > 0 ? Elapsed(now - view.BackedOffSince) : "(hold running)";
-                sb.AppendLine($"  {Pad(name, 20)} {Pad(delivered, 10)} {Pad(rateNow, 10)} {Pad($"{pinned / 1024}KB/s", 9)} {Pad(view.Steps.ToString(), 6)} {since}");
+                string since = view.Exempt ? $"exempt {Elapsed(now - view.ExemptSince)} - loss not caused by the rate"
+                             : view.Steps > 0 ? Elapsed(now - view.BackedOffSince)
+                             : "(hold running)";
+                string steps = view.Exempt ? "-" : view.Steps.ToString();
+                sb.AppendLine($"  {Pad(name, 20)} {Pad(delivered, 10)} {Pad(rateNow, 10)} {Pad($"{pinned / 1024}KB/s", 9)} {Pad(steps, 6)} {since}");
             }
             if (!any) {
                 sb.AppendLine("  (nobody backed off)");
             }
-            sb.AppendLine($"  session totals   {LossBackoff.TotalStepsDown} steps down, {LossBackoff.TotalStepsUp} steps up, {LossBackoff.TotalCleared} back at the global rate");
+            sb.AppendLine($"  session totals   {LossBackoff.TotalStepsDown} steps down, {LossBackoff.TotalStepsUp} steps up, {LossBackoff.TotalCleared} back at the global rate, " +
+                          $"{LossBackoff.TotalExempted} exempted (slowing down did not help; {LossBackoff.ExemptPlayerCount} player(s) this session)");
         }
 
         private static string Elapsed(float seconds) {
@@ -1013,6 +1034,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine("  stale owner off (an update written before its sender heard of an ownership change puts the old owner back, as vanilla)");
             } else {
                 sb.AppendLine($"  stale owner {OwnerRevisionGuard.Kept} ownership changes kept against an older update that would have undone them ({OwnerRevisionGuard.KeptCreatures} creatures; {OwnerRevisionGuard.Seen} outdated updates in all, since start)");
+                sb.AppendLine($"              {OwnerRevisionGuard.DataRefused} creature updates from a former owner dropped instead of shown to everyone; {OwnerRevisionGuard.CorrectionsForced} corrections sent straight back to the former owner");
             }
 
             // The failure this split exists to make visible: a growing backlog of ZDOs with no

@@ -157,5 +157,32 @@ namespace NetworkPerformanceSystem.Runtime {
                 ? portals
                 : null;
         }
+
+        /// <summary>
+        /// Whether this zone's objects live in bucket 0 - which every zone outside the 512x512
+        /// sector grid shares (roughly beyond 16km from the world centre on either axis), along
+        /// with the grid's own corner zone (-256, -256).
+        ///
+        /// Mods do build playable space out there, and a dedicated server's reference position can
+        /// be put there too. For such a zone SectorObjects answers with every object in every
+        /// such zone, so anything that visits zones one at a time and trusts the zone it asked
+        /// about - rather than each object's position - sees the same objects once per zone and
+        /// judges them by the wrong one. ZDOMan.FindSectorObjects avoids it by remembering the
+        /// sector indices it has visited; callers of SectorObjects must do the same, or skip
+        /// these zones and walk SharedBucketObjects once instead.
+        /// </summary>
+        internal static bool InSharedBucket(Vector2s zone) {
+            return ZoneSystem.SectorToIndex(zone).Sector == ZoneSystem.SectorZero.Sector;
+        }
+
+        /// <summary>Every object in bucket 0, whatever zone it is really in. See InSharedBucket.</summary>
+        internal static List<ZDO> SharedBucketObjects(ZDOMan man) {
+            return man.m_objectsBySector[ZoneSystem.SectorZero.Sector];
+        }
+
+        /// <summary>Every portal in bucket 0, whatever zone it is really in. See InSharedBucket.</summary>
+        internal static List<ZDO> SharedBucketPortals(ZDOMan man) {
+            return man.m_portalObjects.TryGetValue(ZoneSystem.SectorZero, out List<ZDO> portals) ? portals : null;
+        }
     }
 }

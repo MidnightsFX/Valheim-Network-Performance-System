@@ -133,8 +133,32 @@ namespace NetworkPerformanceSystem.Runtime {
 
         /// <summary>Every zone inside at least one candidate's scan square this pass. Scanning each
         /// zone exactly once is what keeps the pass duplicate-free without a per-ZDO dictionary:
-        /// a ZDO lives in exactly one sector list, so it can only be visited once.</summary>
+        /// a ZDO lives in exactly one sector list, so it can only be visited once.
+        ///
+        /// Except that zones outside the sector grid all share one list (ZoneCompat.InSharedBucket),
+        /// so those zones are not walked one by one. Their objects are walked once, from the
+        /// shared list, each judged by the zone it is really in - see GroupSharedBucket.</summary>
         private static readonly HashSet<Vector2s> ZonesToScan = new HashSet<Vector2s>();
+
+        /// <summary>
+        /// Objects and portals from the shared out-of-grid list, grouped by the zone each one is
+        /// really in, for the zones in ZonesToScan and no others. Rebuilt every pass that scans
+        /// such a zone, from lists kept in SharedBucketPool.
+        ///
+        /// Walking that list once per zone is what flipped the same objects between a dedicated
+        /// server and nobody on every pass: a server whose reference position a mod had put ~1000km
+        /// out scanned 25 zones that all answered with the same 170 objects, nine of them "the
+        /// server is present" and sixteen "nobody is", so each object was rescued three times and
+        /// released three times a pass, all session. Grouping by position also keeps playable
+        /// space that mods build outside the grid arbitrated like anywhere else.
+        /// </summary>
+        private static readonly Dictionary<Vector2s, List<ZDO>> SharedBucketObjects = new Dictionary<Vector2s, List<ZDO>>();
+        private static readonly Dictionary<Vector2s, List<ZDO>> SharedBucketPortals = new Dictionary<Vector2s, List<ZDO>>();
+        private static readonly List<List<ZDO>> SharedBucketPool = new List<List<ZDO>>();
+        private static int _sharedBucketListsInUse;
+
+        /// <summary>Some zone in ZonesToScan is outside the sector grid this pass.</summary>
+        private static bool _scanSharedBucket;
 
         private static readonly Dictionary<ZDOID, OwnershipRecord> OwnerHistory = new Dictionary<ZDOID, OwnershipRecord>();
 
@@ -430,6 +454,7 @@ namespace NetworkPerformanceSystem.Runtime {
             if (Candidates.Count == 0) { LastPassMs = 0f; return; }
 
             CollectZonesToScan();
+            GroupSharedBucket(zdoMan);
             TallyOwnedLoad(zdoMan, loadPenalty > 0f);
 
             SectorCache.Clear();
@@ -462,6 +487,10 @@ namespace NetworkPerformanceSystem.Runtime {
             // GetSector, nothing needs a per-ZDO SectorCache probe, and there is no considered
             // list to fill and then index back out. The verdict is fetched once per zone.
             foreach (Vector2s zone in ZonesToScan) {
+                // Its list is every out-of-grid object, not this zone's; they are judged below,
+                // once each, by the zone they are really in.
+                if (_scanSharedBucket && ZoneCompat.InSharedBucket(zone)) { continue; }
+
                 List<ZDO> objects = ZoneObjects(zdoMan, zone);
                 List<ZDO> portals = ZonePortals(zdoMan, zone);
                 bool hasObjects = objects != null && objects.Count > 0;
@@ -474,6 +503,15 @@ namespace NetworkPerformanceSystem.Runtime {
                 // only sit apart because the game moved them to their own store.
                 if (hasObjects) { ApplyVerdict(objects, zone, verdict, sessionId, now, minHold, margin); }
                 if (hasPortals) { ApplyVerdict(portals, zone, verdict, sessionId, now, minHold, margin); }
+            }
+
+            if (_scanSharedBucket) {
+                foreach (KeyValuePair<Vector2s, List<ZDO>> group in SharedBucketObjects) {
+                    ApplyVerdict(group.Value, group.Key, VerdictFor(group.Key), sessionId, now, minHold, margin);
+                }
+                foreach (KeyValuePair<Vector2s, List<ZDO>> group in SharedBucketPortals) {
+                    ApplyVerdict(group.Value, group.Key, VerdictFor(group.Key), sessionId, now, minHold, margin);
+                }
             }
 
             ApplyUpgrades(now);
@@ -639,11 +677,16 @@ namespace NetworkPerformanceSystem.Runtime {
             // makes host ownership safe rather than a Serverside-Simulations-style trade. A
             // dedicated server only instantiates objects around its own reference position, so
             // restricting it to zones it has actually loaded means it can never win a ZDO it
-            // would then fail to simulate. On a dedicated server that position is the world
-            // origin, so the practical consequence is: contested objects anywhere else go to the
-            // lowest-RTT peer present, and contested objects in the origin zones go to the host
+            // would then fail to simulate. On a vanilla dedicated server that position is the
+            // world origin, so the practical consequence is: contested objects anywhere else go to
+            // the lowest-RTT peer present, and contested objects in the origin zones go to the host
             // whenever two or more players are there (its cost is the theoretical minimum for
             // every viewer). That last part is intended - see the Allow Host As Owner config.
+            //
+            // Mods can move it, and do: one recorded server had it about 1000km out, far outside
+            // the sector grid. That is handled like any other candidate outside the grid - see
+            // GroupSharedBucket - and it simply owns whatever is really near it, which is usually
+            // nothing.
             SimulationDistance hostDistance = ZoneCompat.Local();
             Vector3 hostPos = ZNet.instance.GetReferencePosition();
             Candidates.Add(new Candidate {
@@ -729,6 +772,7 @@ namespace NetworkPerformanceSystem.Runtime {
         /// </summary>
         private static void CollectZonesToScan() {
             ZonesToScan.Clear();
+            _scanSharedBucket = false;
 
             // The same (2 * near + 1)^2 square FindSectorObjects walks for that peer's near ring -
             // just collected across all candidates first, so overlapping squares cost nothing
@@ -741,10 +785,62 @@ namespace NetworkPerformanceSystem.Runtime {
                 int area = candidate.NearRadius;
                 for (int dx = -area; dx <= area; dx++) {
                     for (int dy = -area; dy <= area; dy++) {
-                        ZonesToScan.Add(new Vector2s(centre.x + dx, centre.y + dy));
+                        Vector2s zone = new Vector2s(centre.x + dx, centre.y + dy);
+                        if (ZonesToScan.Add(zone) && !_scanSharedBucket && ZoneCompat.InSharedBucket(zone)) {
+                            _scanSharedBucket = true;
+                        }
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// Sorts the shared out-of-grid list into SharedBucketObjects and SharedBucketPortals by
+        /// each object's real zone, keeping only zones some candidate scans. One walk of the list
+        /// per pass, and only on a pass that scans such a zone at all - which on a server with
+        /// nobody outside the grid is never, and costs one flag test.
+        ///
+        /// The groups are copies, so the verdicts applied to them later in the pass read a stable
+        /// list: a pass changes owners, and nothing in it moves an object between sectors.
+        /// </summary>
+        private static void GroupSharedBucket(ZDOMan zdoMan) {
+            foreach (List<ZDO> list in SharedBucketObjects.Values) { list.Clear(); }
+            foreach (List<ZDO> list in SharedBucketPortals.Values) { list.Clear(); }
+            SharedBucketObjects.Clear();
+            SharedBucketPortals.Clear();
+            _sharedBucketListsInUse = 0;
+
+            if (!_scanSharedBucket) { return; }
+            GroupByRealZone(ZoneCompat.SharedBucketObjects(zdoMan), SharedBucketObjects);
+            GroupByRealZone(ZoneCompat.SharedBucketPortals(zdoMan), SharedBucketPortals);
+        }
+
+        private static void GroupByRealZone(List<ZDO> source, Dictionary<Vector2s, List<ZDO>> groups) {
+            if (source == null) { return; }
+
+            for (int i = 0; i < source.Count; i++) {
+                ZDO zdo = source[i];
+                if (zdo == null) { continue; }
+
+                Vector2s zone = ZoneSystem.GetZone(zdo.GetPosition());
+                if (!ZonesToScan.Contains(zone)) { continue; }                // nobody is anywhere near it
+
+                if (!groups.TryGetValue(zone, out List<ZDO> group)) {
+                    group = RentSharedBucketList();
+                    groups[zone] = group;
+                }
+                group.Add(zdo);
+            }
+        }
+
+        private static List<ZDO> RentSharedBucketList() {
+            if (_sharedBucketListsInUse < SharedBucketPool.Count) {
+                return SharedBucketPool[_sharedBucketListsInUse++];
+            }
+            List<ZDO> list = new List<ZDO>();
+            SharedBucketPool.Add(list);
+            _sharedBucketListsInUse++;
+            return list;
         }
 
         /// <summary>
@@ -791,9 +887,12 @@ namespace NetworkPerformanceSystem.Runtime {
             if (!tallyLoad) { return; }
 
             foreach (Vector2s zone in ZonesToScan) {
+                if (_scanSharedBucket && ZoneCompat.InSharedBucket(zone)) { continue; }   // once, below
                 TallyZone(ZoneObjects(zdoMan, zone));
                 TallyZone(ZonePortals(zdoMan, zone));
             }
+            foreach (List<ZDO> group in SharedBucketObjects.Values) { TallyZone(group); }
+            foreach (List<ZDO> group in SharedBucketPortals.Values) { TallyZone(group); }
         }
 
         private static void TallyZone(List<ZDO> objects) {
@@ -1923,6 +2022,11 @@ namespace NetworkPerformanceSystem.Runtime {
             Candidates.Clear();
             CandidateIndex.Clear();
             ZonesToScan.Clear();
+            SharedBucketObjects.Clear();
+            SharedBucketPortals.Clear();
+            SharedBucketPool.Clear();
+            _sharedBucketListsInUse = 0;
+            _scanSharedBucket = false;
             OwnerHistory.Clear();
             PendingSimulated.Clear();
             PendingInteractive.Clear();

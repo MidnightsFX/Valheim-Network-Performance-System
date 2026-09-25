@@ -241,7 +241,7 @@ namespace NetworkPerformanceSystem {
 
             // Arbitration persistance
             RejectStaleOwnerUpdates = BindServerConfig("Ownership", "Reject Stale Owner Updates", true,
-                "Prevents previous owners network updates immediately taking an owned object back. Disabling this effectively neuters the arbiter.");
+                "Prevents previous owners network updates immediately taking an owned object back, and tells that player straight away who owns it now. A creature's movement from its previous owner is dropped rather than shown to everyone else. Disabling this effectively neuters the arbiter.");
             ShipOwnershipFollowsHelmsman = BindServerConfig("Ownership", "Ship Ownership Follows Helmsman", true,
                 "Hand a ship to whoever takes its helm, so the player steering simulates it on their own machine instead of watching it relayed through the host from another player.");
 
@@ -278,7 +278,7 @@ namespace NetworkPerformanceSystem {
 
             // Packet loss backoff for poor connections
             EnableLossBackoff = BindServerConfig("Steam Transport", "Enable Loss Backoff", true,
-                "Slow the server down for one player whose connection is losing what it is sent, without touching anyone else's rate.");
+                "Slow the server down for one player whose connection is losing what it is sent, without touching anyone else's rate. A player still losing as much at Loss Backoff Floor KBps goes back to full speed and is not slowed down again until the server restarts.");
             LossBackoffThreshold = BindServerConfig("Steam Transport", "Loss Backoff Threshold", 0.95f,
                 "The share of the server's packets that must reach a player, as a fraction. Below it for Loss Backoff Hold Seconds, that player's connection is stepped down. This is also the line nps_stats marks as LOSSY.",
                 false, 0.5f, 0.999f);

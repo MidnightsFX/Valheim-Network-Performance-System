@@ -14,12 +14,13 @@ namespace NetworkPerformanceSystem.Patches {
     /// shared by the last two:
     ///
     ///     zdo.OwnerRevision = ownerRevision;                 -> OwnerRevisionGuard.StoreOwnerRevision
-    ///     zdo.DataRevision = dataRevision;
+    ///     zdo.DataRevision = dataRevision;                   -> OwnerRevisionGuard.StoreDataRevision
     ///     zdo.SetOwnerInternal(owner);                       -> OwnerRevisionGuard.ApplyOwner
-    ///     zdo.InternalSetPosition(position);
+    ///     zdo.InternalSetPosition(position);                 -> OwnerRevisionGuard.ApplyPosition
     ///     peer.m_zdos[id] = new PeerZDOInfo(zdo.DataRevision,
     ///                                       zdo.OwnerRevision,   -> OwnerRevisionGuard.RevisionHeldBySender
     ///                                       time);
+    ///     zdo.Deserialize(data);                             -> OwnerRevisionGuard.ApplyData
     ///
     /// Each replacement takes exactly what the instruction it replaces took off the stack and
     /// leaves exactly what it left, so nothing around them changes. The owner-only block writes
@@ -27,8 +28,9 @@ namespace NetworkPerformanceSystem.Patches {
     /// game, and it is what delivers the correction to the peer whose update was refused.
     ///
     /// Anchored on shape rather than position: the one OwnerRevision store followed three
-    /// instructions later by a DataRevision store, the first SetOwnerInternal after it, and the
-    /// first OwnerRevision read after that which feeds a PeerZDOInfo constructor. The client and
+    /// instructions later by a DataRevision store, the first SetOwnerInternal after it, the first
+    /// InternalSetPosition after that, the first OwnerRevision read after that which feeds a
+    /// PeerZDOInfo constructor, and the first Deserialize after the read. The client and
     /// dedicated-server builds of game 1.0.14 compile this method identically. Anything else - a
     /// game update, or another mod having rewritten the block first - stands the guard down and
     /// leaves the method untouched.
@@ -43,12 +45,19 @@ namespace NetworkPerformanceSystem.Patches {
         private const string OwnerRevisionGetter = "get_OwnerRevision";
         private const string DataRevisionSetter = "set_DataRevision";
         private const string SetOwnerInternalName = "SetOwnerInternal";
+        private const string InternalSetPositionName = "InternalSetPosition";
+        private const string DeserializeName = "Deserialize";
         private const string PeerInfoTypeName = "PeerZDOInfo";
 
         /// <summary>How far apart the store and the SetOwnerInternal call may be - two stores and
         /// their loads in vanilla. Generous enough for a harmless reordering, tight enough that it
         /// cannot wander into the next block.</summary>
         private const int MaxStoreToOwnerGap = 8;
+
+        /// <summary>How far apart consecutive calls further down the block may be. In vanilla the
+        /// position store is three instructions after SetOwnerInternal and Deserialize four after
+        /// the PeerZDOInfo read; the same margin as above keeps a match inside this block.</summary>
+        private const int MaxNeighbourGap = 8;
 
         [HarmonyPrepare]
         private static bool Prepare() {
@@ -67,7 +76,7 @@ namespace NetworkPerformanceSystem.Patches {
         private static IEnumerable<CodeInstruction> GuardOwnerRevision(IEnumerable<CodeInstruction> instructions) {
             List<CodeInstruction> codes = new List<CodeInstruction>(instructions);
 
-            if (!TryFindSites(codes, out int store, out int setOwner, out int read, out string miss)) {
+            if (!TryFindSites(codes, out Sites sites, out string miss)) {
                 PatchGuard.Disable(Mechanism.OwnerRevisionGuard,
                     $"ZDOMan.RPC_ZDOData does not have the expected shape ({miss}). Either the game updated or another mod rewrote " +
                     "this method first. An update written before its sender heard of an ownership change still puts the old owner back, as vanilla. " +
@@ -75,25 +84,43 @@ namespace NetworkPerformanceSystem.Patches {
                 return codes;
             }
 
-            IlMatch.ReplaceInPlace(codes, store,
-                new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(OwnerRevisionGuard), nameof(OwnerRevisionGuard.StoreOwnerRevision))));
-            IlMatch.ReplaceInPlace(codes, setOwner,
-                new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(OwnerRevisionGuard), nameof(OwnerRevisionGuard.ApplyOwner))));
-            IlMatch.ReplaceInPlace(codes, read,
-                new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(OwnerRevisionGuard), nameof(OwnerRevisionGuard.RevisionHeldBySender))));
+            Replace(codes, sites.Store, nameof(OwnerRevisionGuard.StoreOwnerRevision));
+            Replace(codes, sites.DataStore, nameof(OwnerRevisionGuard.StoreDataRevision));
+            Replace(codes, sites.SetOwner, nameof(OwnerRevisionGuard.ApplyOwner));
+            Replace(codes, sites.Position, nameof(OwnerRevisionGuard.ApplyPosition));
+            Replace(codes, sites.Read, nameof(OwnerRevisionGuard.RevisionHeldBySender));
+            Replace(codes, sites.Deserialize, nameof(OwnerRevisionGuard.ApplyData));
 
-            Logger.LogInfo("Stale owner updates guard active (3 sites rewritten in ZDOMan.RPC_ZDOData).");
+            Logger.LogInfo("Stale owner updates guard active (6 sites rewritten in ZDOMan.RPC_ZDOData).");
             return codes;
         }
 
+        private static void Replace(List<CodeInstruction> codes, int index, string guardMethod) {
+            IlMatch.ReplaceInPlace(codes, index,
+                new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(OwnerRevisionGuard), guardMethod)));
+        }
+
+        /// <summary>Indices of the six instructions to replace, in block order.</summary>
+        internal struct Sites {
+            internal int Store;
+            internal int DataStore;
+            internal int SetOwner;
+            internal int Position;
+            internal int Read;
+            internal int Deserialize;
+        }
+
         /// <summary>
-        /// Finds the three instructions to replace, or says which one is missing. Internal so the
+        /// Finds the six instructions to replace, or says which one is missing. Internal so the
         /// offline harness can run it against the real method's instruction list from both builds.
         /// </summary>
-        internal static bool TryFindSites(List<CodeInstruction> codes, out int store, out int setOwner, out int read, out string miss) {
-            store = -1;
-            setOwner = -1;
-            read = -1;
+        internal static bool TryFindSites(List<CodeInstruction> codes, out Sites sites, out string miss) {
+            sites = default;
+            int store = -1;
+            int setOwner = -1;
+            int position = -1;
+            int read = -1;
+            int deserialize = -1;
 
             // The full-apply store: an OwnerRevision store with a DataRevision store three
             // instructions later. The owner-only block stores OwnerRevision after SetOwnerInternal
@@ -118,18 +145,45 @@ namespace NetworkPerformanceSystem.Patches {
                 return false;
             }
 
-            // The revision read that feeds the sender's PeerZDOInfo: an OwnerRevision read, then
-            // the time local, then the constructor.
-            for (int i = setOwner + 1; i + 2 < codes.Count; i++) {
-                if (IsCall(codes[i], OwnerRevisionGetter) && IsPeerInfoCtor(codes[i + 2])) { read = i; break; }
-            }
-            if (read < 0) {
-                miss = "no OwnerRevision read feeding a PeerZDOInfo after the full-apply SetOwnerInternal";
+            position = NextCall(codes, setOwner, InternalSetPositionName);
+            if (position < 0) {
+                miss = $"no InternalSetPosition within {MaxNeighbourGap} instructions of the full-apply SetOwnerInternal";
                 return false;
             }
 
+            // The revision read that feeds the sender's PeerZDOInfo: an OwnerRevision read, then
+            // the time local, then the constructor.
+            for (int i = position + 1; i + 2 < codes.Count; i++) {
+                if (IsCall(codes[i], OwnerRevisionGetter) && IsPeerInfoCtor(codes[i + 2])) { read = i; break; }
+            }
+            if (read < 0) {
+                miss = "no OwnerRevision read feeding a PeerZDOInfo after the full-apply InternalSetPosition";
+                return false;
+            }
+
+            deserialize = NextCall(codes, read, DeserializeName);
+            if (deserialize < 0) {
+                miss = $"no Deserialize within {MaxNeighbourGap} instructions of the PeerZDOInfo read";
+                return false;
+            }
+
+            sites = new Sites {
+                Store = store,
+                DataStore = store + 3,
+                SetOwner = setOwner,
+                Position = position,
+                Read = read,
+                Deserialize = deserialize,
+            };
             miss = null;
             return true;
+        }
+
+        private static int NextCall(List<CodeInstruction> codes, int after, string memberName) {
+            for (int i = after + 1; i < codes.Count && i <= after + MaxNeighbourGap; i++) {
+                if (IsCall(codes[i], memberName)) { return i; }
+            }
+            return -1;
         }
 
         private static bool IsCall(CodeInstruction code, string memberName) {
@@ -149,8 +203,8 @@ namespace NetworkPerformanceSystem.Patches {
 
         [HarmonyPatch(typeof(ZDOMan), "RPC_ZDOData")]
         [HarmonyPrefix]
-        private static void ArmGuard() {
-            OwnerRevisionGuard.Arm();
+        private static void ArmGuard(ZRpc rpc) {
+            OwnerRevisionGuard.Arm(rpc);
         }
 
         [HarmonyPatch(typeof(ZDOMan), "RPC_ZDOData")]

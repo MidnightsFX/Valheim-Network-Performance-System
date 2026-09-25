@@ -40,7 +40,7 @@ Works on dedicated servers and on player-hosted games.
 
 An easy way to start is enabling the nps_stats display Run `nps_stats_collect` (needs `devcommands`, since sampling costs a Steam call per peer per tick), play, then `nps_stats`.
 
-A player the link-pressure table marks as `LOSSY` is already being dealt with: the server steps that one player's send rate down until their connection stops losing packets, and back up once it is clean, without changing anyone else's rate (`Steam Transport / Enable Loss Backoff`). The "Loss backoff" block shows who is backed off and by how much.
+A player the link-pressure table marks as `LOSSY` is already being dealt with: the server steps that one player's send rate down until their connection stops losing packets, and back up once it is clean, without changing anyone else's rate (`Steam Transport / Enable Loss Backoff`). A player whose loss is no better at the lowest rate has a connection problem the rate cannot fix: they go back to full speed and are left there until the server restarts. The "Loss backoff" block shows who is backed off and by how much.
 
 
 > **Lag, rubber-banding, hits not landing? Send a report.**

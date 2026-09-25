@@ -1,5 +1,11 @@
 # Changelog
 
+**1.9.0**
+- Creatures no longer get stuck with a player who walked away and came back.
+- Fixed objects outside the normal world area changing owner several times every two seconds.
+- A player whose packet loss does not improve when the server slows down for them goes back to full speed, and is not slowed down again until the server restarts.
+- Peer simulation distance is now included in ownership calculation decisions
+
 **1.8.0**
 - Improves how tightly a players position is tracked to better arbitrate ownership
 	- The server follows each player's character directly, as it arrives with the game's own object updates. New `Reference Position` setting **Use Character Position** (default on). Works for players without the mod and costs nothing on the wire.

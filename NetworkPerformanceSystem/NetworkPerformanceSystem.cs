@@ -35,7 +35,7 @@ namespace NetworkPerformanceSystem
     {
         public const string PluginGUID = "MidnightsFX.NetworkPerformanceSystem";
         public const string PluginName = "NetworkPerformanceSystem";
-        public const string PluginVersion = "1.9.0";
+        public const string PluginVersion = "1.10.0";
 
         internal static ManualLogSource Log;
         internal static Harmony HarmonyInstance;
@@ -60,6 +60,9 @@ namespace NetworkPerformanceSystem
             // Configs are not written until after they are all wired up, they exist in memory before this.
             // Flushing all of the configs at once is a significant speedup in mod load time
             ValConfig.SaveOnSet(true);
+            // Hand edits to the file on disk apply without a restart - the only way to change a
+            // setting on a dedicated server with no admin in game.
+            ValConfig.WatchConfigFile();
         }
 
         public void Start() {

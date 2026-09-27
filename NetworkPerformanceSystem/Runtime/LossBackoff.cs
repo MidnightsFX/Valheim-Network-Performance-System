@@ -41,6 +41,22 @@ namespace NetworkPerformanceSystem.Runtime {
     /// who reconnect most, and each reconnect is a new peer id. A player the floor did help, even
     /// if not all the way to the threshold, keeps it.
     ///
+    /// The floor is not the only proof, and waiting for it is expensive: the 2026-09-27 recording
+    /// had a 115ms player walked down six steps over a minute with delivery never moving, and at
+    /// the floor their updates queued for 164ms (216ms at worst) where they had waited 15-27ms at
+    /// full rate. A connection that was already carrying more than the rate it is now held to -
+    /// actually sent and delivered, not just allowed - cannot be losing packets to that rate. So
+    /// the same verdict is taken as soon as a step lands below what the connection carried in the
+    /// lossy stretch that started the back-off, and a full Hold there has not improved delivery.
+    /// A player whose link really is narrower than the rate still gets the whole descent: their
+    /// carried figure is their bottleneck, and the rate only falls below it once it can help.
+    ///
+    /// Loss from an outage at this end is nobody's connection's. When every peer goes quiet at
+    /// once PeerLiveness calls it a local fault, and Steam's delivery figures go on carrying the
+    /// packets it cost for about twenty seconds after traffic resumes - long enough for Hold to
+    /// step down players whose links were fine. So samples are ignored, and any run in progress
+    /// dropped, during such a fault and for LocalFaultGraceSeconds after it.
+    ///
     /// An override is a fraction of the global rate at the moment it was written, and a
     /// connection-scope value stops following Global writes - so SteamTransport.Apply calls
     /// Reconcile after any global change and every live override is rewritten from the new rate,
@@ -72,6 +88,11 @@ namespace NetworkPerformanceSystem.Runtime {
         /// band: the smoothed figure wanders by about that much on a steady link.</summary>
         internal const float ImprovementMargin = 0.02f;
 
+        /// <summary>How long after a local fault clears its samples are still ignored. Steam's
+        /// delivery figure held an outage's loss for about twenty seconds after traffic resumed
+        /// in the 2026-09-27 recording.</summary>
+        internal const float LocalFaultGraceSeconds = 30f;
+
         /// <summary>Same smoothing as LatencyRegistry: settles in three or four seconds at two
         /// samples a second.</summary>
         private const float SampleAlpha = 0.25f;
@@ -92,6 +113,10 @@ namespace NetworkPerformanceSystem.Runtime {
             internal float LastChangeAt = float.NegativeInfinity;    // any write: down, up, clear, rewrite
             internal float BackedOffSince;
             internal float DeliveredAtStart;                         // Delivered when the first step was taken
+            internal float Carried;                                  // EWMA of bytes/sec sent x share delivered
+            internal bool HasCarried;
+            internal float RunCarriedPeak;                           // highest Carried in the current lossy run
+            internal float CarriedAtStart;                           // RunCarriedPeak when the first step was taken
             internal bool FloorLogged;
             internal bool Exempt;                                    // loss shown not to be the rate's; never stepped again
             internal float ExemptSince;
@@ -156,11 +181,29 @@ namespace NetworkPerformanceSystem.Runtime {
             return deliveredNow >= deliveredAtStart + ImprovementMargin;
         }
 
+        /// <summary>
+        /// Whether a player who is still lossy a full Hold after their last step has shown their
+        /// loss is not the rate's, and goes back to the global rate for good. Either there is no
+        /// lower step left (the floor), or the rate they have been held at is already below what
+        /// their connection carried when the back-off began (carriedAtStart, bytes/sec; 0 when
+        /// unknown, which leaves only the floor) - and in both cases only when delivery is no
+        /// better than it was then. Pure.
+        /// </summary>
+        internal static bool ShouldGiveUp(int steps, int rateInForce, int nextRate, float carriedAtStart,
+                                          float delivered, float deliveredAtStart) {
+            if (steps <= 0) { return false; }
+            if (Improved(delivered, deliveredAtStart)) { return false; }
+            bool atFloor = nextRate >= rateInForce;
+            bool belowCarried = rateInForce < carriedAtStart;
+            return atFloor || belowCarried;
+        }
+
         // -- the decision ------------------------------------------------------------------
 
-        /// <summary>One delivery sample for one peer, from the ping postfix (~2/s). Negative means
-        /// Steam has no figure yet and is not a sample.</summary>
-        internal static void Observe(ZNetPeer peer, float qualityRemote) {
+        /// <summary>One delivery sample for one peer, from the ping postfix (~2/s). Negative
+        /// quality means Steam has no figure yet and is not a sample. outBytesPerSec is what Steam
+        /// is sending this connection now, resends included.</summary>
+        internal static void Observe(ZNetPeer peer, float qualityRemote, float outBytesPerSec) {
             if (peer == null || peer.m_uid == 0L || qualityRemote < 0f) { return; }
             if (!Wanted) { return; }
             if (!RttProbe.TryGetConnectionHandle(peer.m_socket, out uint handle)) { return; }
@@ -172,8 +215,23 @@ namespace NetworkPerformanceSystem.Runtime {
             // the old value died with the old connection. Nothing to clear.
             if (e.Handle != 0 && e.Handle != handle) { Drop(e); }
 
+            // An outage at this end, or its tail: the figure measures the outage. Not smoothed in,
+            // and whatever run was building starts over once the grace is past.
+            if (PeerLiveness.LocalFaultWithin(LocalFaultGraceSeconds)) {
+                e.RunKind = Run.None;
+                e.RunSince = now;
+                e.RunSamples = 0;
+                return;
+            }
+
             e.Delivered = e.HasSample ? e.Delivered + (qualityRemote - e.Delivered) * SampleAlpha : qualityRemote;
             e.HasSample = true;
+
+            // Delivered bytes, not sent: resends of lost packets are not something the connection
+            // carried.
+            float carried = Mathf.Max(0f, outBytesPerSec) * qualityRemote;
+            e.Carried = e.HasCarried ? e.Carried + (carried - e.Carried) * SampleAlpha : carried;
+            e.HasCarried = true;
 
             float threshold = ValConfig.LossBackoffThreshold.Value;
             Run kind = e.Delivered < threshold ? Run.Lossy
@@ -183,8 +241,10 @@ namespace NetworkPerformanceSystem.Runtime {
                 e.RunKind = kind;
                 e.RunSince = now;
                 e.RunSamples = 0;
+                e.RunCarriedPeak = 0f;
             }
             e.RunSamples++;
+            if (kind == Run.Lossy && e.Carried > e.RunCarriedPeak) { e.RunCarriedPeak = e.Carried; }
 
             // Still measured, so nps_stats can show what they get at full rate; never acted on.
             if (e.Exempt) { return; }
@@ -205,14 +265,16 @@ namespace NetworkPerformanceSystem.Runtime {
         private static void StepDown(Entry e, ZNetPeer peer, uint handle, int pinned, int floor, float threshold, float hold, float now) {
             int current = e.Steps == 0 ? pinned : e.OverrideBytes;
             int next = RateFor(pinned, e.Steps + 1, floor);
+
+            // Still lossy a full Hold after the last step. Asked on every sample from here on, so
+            // a player a step helped at first and then stopped helping is let go as soon as their
+            // delivery falls back.
+            if (ShouldGiveUp(e.Steps, current, next, e.CarriedAtStart, e.Delivered, e.DeliveredAtStart)) {
+                GiveUp(e, peer, handle, pinned, current, next >= current, now);
+                return;
+            }
+
             if (next >= current) {
-                // At the floor and still lossy a full Hold after the last step. Asked on every
-                // sample from here on, so a player the floor helped at first and then stopped
-                // helping is let go as soon as their delivery falls back.
-                if (e.Steps > 0 && !Improved(e.Delivered, e.DeliveredAtStart)) {
-                    GiveUp(e, peer, handle, pinned, floor, now);
-                    return;
-                }
                 if (e.FloorLogged) { return; }
                 e.FloorLogged = true;
                 Logger.LogInfo(e.Steps == 0
@@ -228,6 +290,7 @@ namespace NetworkPerformanceSystem.Runtime {
             if (e.Steps == 1) {
                 e.BackedOffSince = now;
                 e.DeliveredAtStart = e.Delivered;
+                e.CarriedAtStart = e.RunCarriedPeak;
                 BackedOffNow++;
             }
             Logger.LogInfo($"Loss backoff: {Name(peer)} delivering {Pct(e.Delivered)} (under {Pct(threshold)} for {hold:F0}s); " +
@@ -236,13 +299,14 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
-        /// Stepping down did not help: the player is at the floor, still under the threshold, and
-        /// delivering no better than when it started. Their loss is not the rate's doing, so the
-        /// override is removed - full rate again, the same loss, but faster updates - and they are
-        /// exempt for the rest of the session. A refused clear is handled by Refused like any
-        /// other write, and nothing here is marked until the clear has gone through.
+        /// Stepping down did not help: the player is at the floor or below what their connection
+        /// was already carrying, still under the threshold, and delivering no better than when it
+        /// started (ShouldGiveUp). Their loss is not the rate's doing, so the override is removed -
+        /// full rate again, the same loss, but faster updates - and they are exempt for the rest of
+        /// the session. A refused clear is handled by Refused like any other write, and nothing
+        /// here is marked until the clear has gone through.
         /// </summary>
-        private static void GiveUp(Entry e, ZNetPeer peer, uint handle, int pinned, int floor, float now) {
+        private static void GiveUp(Entry e, ZNetPeer peer, uint handle, int pinned, int rateInForce, bool atFloor, float now) {
             if (!Clear(e, peer, handle)) { return; }
 
             int steps = e.Steps;
@@ -256,8 +320,11 @@ namespace NetworkPerformanceSystem.Runtime {
             TotalExempted++;
             ExemptPlayers.Add(PlayerKey(peer));
 
+            string where = atFloor
+                ? $"at the {Kb(rateInForce)} floor"
+                : $"at {Kb(rateInForce)}, below the {Kb((int)e.CarriedAtStart)} their connection was already carrying,";
             Logger.LogWarning($"Loss backoff: {Name(peer)} has packet loss that slowing down did not improve - delivering {Pct(e.Delivered)} " +
-                              $"at the {Kb(floor)} floor after {steps} steps over {backedOffFor:F0}s, against {Pct(e.DeliveredAtStart)} when the back-off started. " +
+                              $"{where} after {steps} steps over {backedOffFor:F0}s, against {Pct(e.DeliveredAtStart)} when the back-off started. " +
                               $"Back at the global {Kb(pinned)}, and their rate will not be lowered again this session.");
             Record(peer, "exempt", e, pinned);
         }
@@ -294,7 +361,7 @@ namespace NetworkPerformanceSystem.Runtime {
         /// periodic rate samples.</summary>
         private static void Record(ZNetPeer peer, string action, Entry e, int rateBytesPerSec) {
             if (!Monitoring.Active) { return; }
-            Monitoring.OnLossBackoff(peer.m_uid, action, e.Steps, rateBytesPerSec, e.Delivered, e.DeliveredAtStart);
+            Monitoring.OnLossBackoff(peer.m_uid, action, e.Steps, rateBytesPerSec, e.Delivered, e.DeliveredAtStart, e.CarriedAtStart);
         }
 
         // -- propagation -------------------------------------------------------------------

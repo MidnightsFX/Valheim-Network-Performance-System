@@ -27,10 +27,12 @@ NPS addresses these issues in a number of ways
 
 **Server-only works.** Vanilla clients get the send window, ownership, scheduler, station-request and creature-hit
 fixes with nothing installed on their end, and the server follows where they actually are rather than where they
-were two seconds ago.
+were two seconds ago. The server also sends settled or distant creatures to each player less often.
 
 **Installing on clients too** adds latency compensation, live position reporting and the clean exit
 from a dead session for those clients, and lets a ship they own pass to whoever takes its helm.
+Creatures they simulate stop re-sending themselves while standing still, which matters most next
+to a pen of tamed animals.
 Mixed groups are fine — benefits are per-player, and a client without the mod behaves
 exactly as vanilla. There is **no version lock**: nobody gets kicked for not having it.
 
@@ -40,7 +42,7 @@ Works on dedicated servers and on player-hosted games.
 
 An easy way to start is enabling the nps_stats display Run `nps_stats_collect` (needs `devcommands`, since sampling costs a Steam call per peer per tick), play, then `nps_stats`.
 
-A player the link-pressure table marks as `LOSSY` is already being dealt with: the server steps that one player's send rate down until their connection stops losing packets, and back up once it is clean, without changing anyone else's rate (`Steam Transport / Enable Loss Backoff`). A player whose loss is no better at the lowest rate has a connection problem the rate cannot fix: they go back to full speed and are left there until the server restarts. The "Loss backoff" block shows who is backed off and by how much.
+A player the link-pressure table marks as `LOSSY` is already being dealt with: the server steps that one player's send rate down until their connection stops losing packets, and back up once it is clean, without changing anyone else's rate (`Steam Transport / Enable Loss Backoff`). A player whose loss does not improve - once their rate is below what their connection was already carrying, or at the lowest rate - has a connection problem the rate cannot fix: they go back to full speed and are left there until the server restarts. Loss measured during an outage at the server's end is ignored. The "Loss backoff" block shows who is backed off and by how much.
 
 
 > **Lag, rubber-banding, hits not landing? Send a report.**
@@ -75,9 +77,10 @@ can record what the network was doing so it can be diagnosed rather than guessed
 
 **What is recorded:** each time a creature changes owner and whether the change held, messages
 delivered to a player who no longer owned the target, how regularly each player's creatures report
-in, and each player's ping and connection quality once a second. Clients that have the mod add
-what only they can see: what a creature was doing when it changed hands, who it was fighting, how
-far it jumped on screen, and frame rate. That costs each client up to 2 KB per second of upload,
+in, and each player's ping, connection quality, and how much the server sends to and receives from
+them once a second. Clients that have the mod add what only they can see: what a creature was doing
+when it changed hands, who it was fighting, how far it jumped on screen, what killed each creature
+they were simulating, how often the creatures they simulate change, and frame rate. That costs each client up to 2 KB per second of upload,
 sent in small batches that are held back whenever the connection is busy with the game's own
 traffic, so recording never delays it.
 

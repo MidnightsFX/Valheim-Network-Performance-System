@@ -52,6 +52,32 @@ namespace NetworkPerformanceSystem.Runtime {
             /// too; it is Mount above so that riding one is still direct control, and IsCreature
             /// counts both.</summary>
             Creature = 7,
+
+            /// <summary>A creature on the players' side that is not a tame: what a staff raises or
+            /// summons - the Staff of the Wild's roots (faction Players), the Trollstav's troll
+            /// (PlayerSpawned). It fights beside whoever raised it, and the game ties it to them
+            /// in no way the host can read except one: it was created on their machine, so its
+            /// ZDOID carries their session id. Its owner of choice is therefore that session,
+            /// while it is connected (FollowerKind). A summon that is also a Tameable - the Dead
+            /// Raiser's skeleton - is Mount, and names its summoner in s_follow instead.
+            ///
+            /// Enemy summons are not this: a Charred Warlock's twitchers are faction Demon and stay
+            /// ordinary creatures.</summary>
+            Summon = 8,
+        }
+
+        /// <summary>How a creature can be tied to a player it should stay with. See
+        /// OwnershipArbiter.LeaderFor.</summary>
+        internal enum Follower : byte {
+            None,
+
+            /// <summary>A Tameable. Following a player when its s_follow holds their name -
+            /// Tameable.RPC_Command writes it, and a staff's SpawnAbility commands its summon on
+            /// spawn, which is how the Dead Raiser's skeletons arrive already following.</summary>
+            Tame,
+
+            /// <summary>A player-side summon; its summoner is the session in its ZDOID.</summary>
+            Summon,
         }
 
         private static readonly Dictionary<int, PrefabClass> ClassCache = new Dictionary<int, PrefabClass>();
@@ -157,7 +183,22 @@ namespace NetworkPerformanceSystem.Runtime {
         /// </summary>
         internal static bool IsCreature(ZDO zdo) {
             PrefabClass cls = Classify(zdo);
-            return cls == PrefabClass.Creature || cls == PrefabClass.Mount;
+            return cls == PrefabClass.Creature || cls == PrefabClass.Mount || cls == PrefabClass.Summon;
+        }
+
+        /// <summary>Whether this creature can have a player it should stay with, and which kind of
+        /// tie to look for. One cached classification; the arbiter reads the tie itself.</summary>
+        internal static Follower FollowerKind(ZDO zdo) {
+            switch (Classify(zdo)) {
+                case PrefabClass.Mount: return Follower.Tame;
+                case PrefabClass.Summon: return Follower.Summon;
+                default: return Follower.None;
+            }
+        }
+
+        /// <summary>The factions a creature a player raised is given. Pure.</summary>
+        internal static bool IsPlayerSide(Character.Faction faction) {
+            return faction == Character.Faction.Players || faction == Character.Faction.PlayerSpawned;
         }
 
         /// <summary>
@@ -248,8 +289,14 @@ namespace NetworkPerformanceSystem.Runtime {
                     else if (go.GetComponent<Vagon>() != null) { result = PrefabClass.Cart; }
                     else if (go.GetComponent<Tameable>() != null) { result = PrefabClass.Mount; }
                     else if (go.GetComponent<Container>() != null) { result = PrefabClass.Container; }
-                    else if (go.GetComponent<Character>() != null) { result = PrefabClass.Creature; }
-                    else if (IsInteractable(go)) { result = PrefabClass.Interactive; }
+                    else {
+                        Character character = go.GetComponent<Character>();
+                        if (character != null) {
+                            result = IsPlayerSide(character.m_faction) ? PrefabClass.Summon : PrefabClass.Creature;
+                        } else if (IsInteractable(go)) {
+                            result = PrefabClass.Interactive;
+                        }
+                    }
                 } else {
                     // Unknown prefab (content mod not loaded here, or a stale ZDO). Do not cache a
                     // verdict we cannot justify - treat it as ordinary this time and look again

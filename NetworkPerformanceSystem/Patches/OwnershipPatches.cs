@@ -63,6 +63,8 @@ namespace NetworkPerformanceSystem.Patches {
             RoutedRpcFilter.Reset();
             RpcOwnerRouter.Reset();
             OwnerRevisionGuard.Reset();
+            QuietCreatures.Reset();
+            CreaturePacing.Reset();
             // Diagnostics are session-scoped too: an nps_stats_collect left running must not
             // silently keep sampling on the next server, and telemetry must not carry over.
             NetworkStats.Reset();

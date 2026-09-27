@@ -122,6 +122,27 @@ namespace NetworkPerformanceSystem.Runtime {
         private static float _frameSeconds;
         private static float _worstFrameSeconds;
 
+        /// <summary>
+        /// How often the creatures simulated here change, which is how often each of them is sent
+        /// whole to the host and on to everyone in range. Sampled once a second: each owned
+        /// creature's DataRevision against the previous sample, summed over the creatures owned at
+        /// both. Two tables swapped each sample, so it allocates nothing once warm.
+        /// </summary>
+        private static Dictionary<ZDOID, uint> _revisionsBefore = new Dictionary<ZDOID, uint>();
+        private static Dictionary<ZDOID, uint> _revisionsNow = new Dictionary<ZDOID, uint>();
+        private static long _creatureRevisionSteps;
+        private static double _creatureRevisionMs;
+        private static double _lastRevisionSampleMs;
+        private static int _creaturesSampled;
+
+        // QuietCreatures' running totals at the last c_self, so each record carries its window.
+        private static long _quietPositionAtReport;
+        private static long _quietVelocityAtReport;
+        private static long _quietRigidbodyAtReport;
+        private static long _quietBodyAtReport;
+        private static long _quietTiltAtReport;
+        private static long _quietSkippedAtReport;
+
         internal static void OnStarted() {
             Monitoring.EmitClient(Monitoring.Line.Begin("c_session")
                 .Num("ct", Monitoring.NowMs, "0.#")
@@ -133,6 +154,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Flag("comp", ValConfig.EnableLatencyCompensation.Value)
                 .Num("compStrength", ValConfig.LatencyCompensationStrength.Value, "0.##")
                 .End());
+            MarkQuietTotals();
         }
 
         // -- hooks -------------------------------------------------------------------------
@@ -175,6 +197,91 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Flag("local", zdo.IsOwner())
                 .Flag("player", target.IsPlayer())
                 .End());
+        }
+
+        /// <summary>
+        /// A creature this machine simulates has died. Only the owner can say how: the killing
+        /// hit is kept in Character.m_lastHit on this machine and nowhere else, and the owner
+        /// destroys the ZDO straight afterwards, so every other machine - the host included -
+        /// only ever sees the creature vanish. A creature that despawns or grows up vanishes the
+        /// same way, which is why the host cannot tell a death from its own records.
+        ///
+        /// The game also calls OnDeath from the death animation on machines that are only
+        /// watching; those return here. "hitType" is the game's own label for the killing hit -
+        /// a burning tick reads Burning, while a fire's own damage area reads EnemyHit with no
+        /// attacker, so "dmg" and "se" are what tell that one apart. "sinceFlipMs" is present
+        /// when the creature changed owner within the last minute, as this machine saw it.
+        /// </summary>
+        internal static void OnDeath(Character target) {
+            ZNetView view = target.m_nview;
+            if (view == null || !view.IsValid() || !view.IsOwner()) { return; }
+
+            ZDO zdo = view.GetZDO();
+            double now = Monitoring.NowMs;
+            Vector3 pos = target.transform.position;
+            HitData hit = target.m_lastHit;
+
+            JsonLine line = Monitoring.Line.Begin("c_death")
+                .Num("ct", now, "0.#")
+                .Str("zdo", Monitoring.ZdoId(zdo.m_uid))
+                .Str("prefab", Monitoring.PrefabName(zdo))
+                .Num("x", Mathf.Round(pos.x), "0")
+                .Num("y", Mathf.Round(pos.y), "0")
+                .Num("z", Mathf.Round(pos.z), "0")
+                .Flag("tamed", target.IsTamed());
+            if (LastFlipMs.TryGetValue(zdo.m_uid, out double flippedAt)) {
+                line.Num("sinceFlipMs", now - flippedAt, "0");
+            }
+
+            if (hit == null) {
+                line.Str("hitType", "None");                                 // health went to 0 without a hit
+            } else {
+                line.Str("hitType", hit.m_hitType.ToString())
+                    .Raw("dmg", DescribeDamage(hit.m_damage));
+
+                if (!hit.m_attacker.IsNone()) {
+                    line.Str("attacker", Monitoring.ZdoId(hit.m_attacker));
+                    ZDO attacker = ZDOMan.instance.GetZDO(hit.m_attacker);
+                    if (attacker != null) { line.Str("attackerPrefab", Monitoring.PrefabName(attacker)); }
+                }
+
+                StatusEffect effect = hit.m_statusEffectHash != 0 && ObjectDB.instance != null
+                    ? ObjectDB.instance.GetStatusEffect(hit.m_statusEffectHash)
+                    : null;
+                if (effect != null) { line.Str("se", effect.name); }
+            }
+
+            Monitoring.EmitClient(line.End());
+        }
+
+        private static readonly System.Text.StringBuilder DamageScratch = new System.Text.StringBuilder(128);
+
+        /// <summary>The killing hit's damage as applied, one member per type that did any. Pure.</summary>
+        internal static string DescribeDamage(HitData.DamageTypes damage) {
+            System.Text.StringBuilder sb = DamageScratch;
+            sb.Length = 0;
+            sb.Append('{');
+            AppendDamage(sb, "damage", damage.m_damage);
+            AppendDamage(sb, "blunt", damage.m_blunt);
+            AppendDamage(sb, "slash", damage.m_slash);
+            AppendDamage(sb, "pierce", damage.m_pierce);
+            AppendDamage(sb, "chop", damage.m_chop);
+            AppendDamage(sb, "pickaxe", damage.m_pickaxe);
+            AppendDamage(sb, "fire", damage.m_fire);
+            AppendDamage(sb, "frost", damage.m_frost);
+            AppendDamage(sb, "lightning", damage.m_lightning);
+            AppendDamage(sb, "poison", damage.m_poison);
+            AppendDamage(sb, "spirit", damage.m_spirit);
+            AppendDamage(sb, "nonPlayer", damage.m_nonPlayer);
+            sb.Append('}');
+            return sb.ToString();
+        }
+
+        private static void AppendDamage(System.Text.StringBuilder sb, string key, float value) {
+            if (!(value > 0f) || float.IsInfinity(value)) { return; }       // NaN fails the first test
+            if (sb.Length > 1) { sb.Append(','); }
+            sb.Append('"').Append(key).Append("\":")
+              .Append(value.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture));
         }
 
         /// <summary>A creature somebody else owns moved further in one tick than smoothing
@@ -253,6 +360,7 @@ namespace NetworkPerformanceSystem.Runtime {
             if (now - _lastTargetPollMs >= TargetPollMs) {
                 _lastTargetPollMs = now;
                 PollTargets(now);
+                SampleCreatureRevisions(now);
             }
 
             if (now - _lastSelfReportMs >= SelfReportMs) {
@@ -446,10 +554,43 @@ namespace NetworkPerformanceSystem.Runtime {
             for (int i = 0; i < Scratch.Count; i++) { Targets.Remove(Scratch[i]); }
         }
 
+        /// <summary>Every owned AI creature, tame or wild - wider than PollTargets, which only
+        /// looks at MonsterAI because only those hunt players.</summary>
+        private static void SampleCreatureRevisions(double now) {
+            long steps = 0;
+            _revisionsNow.Clear();
+
+            List<BaseAI> instances = BaseAI.BaseAIInstances;
+            for (int i = 0; i < instances.Count; i++) {
+                BaseAI ai = instances[i];
+                if (ai == null) { continue; }
+                ZNetView view = ai.m_nview;
+                if (view == null || !view.IsValid() || !view.IsOwner()) { continue; }
+
+                ZDO zdo = view.GetZDO();
+                uint revision = zdo.DataRevision;
+                if (_revisionsBefore.TryGetValue(zdo.m_uid, out uint before) && revision >= before) {
+                    steps += revision - before;
+                }
+                _revisionsNow[zdo.m_uid] = revision;
+            }
+
+            if (_lastRevisionSampleMs > 0d) {
+                _creatureRevisionSteps += steps;
+                _creatureRevisionMs += now - _lastRevisionSampleMs;
+            }
+            _lastRevisionSampleMs = now;
+            _creaturesSampled = _revisionsNow.Count;
+
+            Dictionary<ZDOID, uint> swap = _revisionsBefore;
+            _revisionsBefore = _revisionsNow;
+            _revisionsNow = swap;
+        }
+
         private static void ReportSelf(double now) {
             Vector2s zone = ZoneSystem.GetZone(ZNet.instance.GetReferencePosition());
 
-            Monitoring.EmitClient(Monitoring.Line.Begin("c_self")
+            JsonLine line = Monitoring.Line.Begin("c_self")
                 .Num("ct", now, "0.#")
                 .Num("fps", _frameSeconds > 0f ? _frames / _frameSeconds : 0f, "0.#")
                 .Num("worstFrameMs", _worstFrameSeconds * 1000f, "0.#")
@@ -457,12 +598,52 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Int("characters", Character.GetAllCharacters().Count)
                 .Int("changeQueue", ZDOMan.instance.GetClientChangeQueue())
                 .Int("zx", zone.x)
-                .Int("zy", zone.y)
-                .End());
+                .Int("zy", zone.y);
+
+            // Creature churn: revision steps per second over every creature simulated here, and
+            // how many there were. crRevs / crN is the per-creature update rate this machine
+            // offers the network.
+            line.Num("crRevs", _creatureRevisionMs > 0d ? _creatureRevisionSteps * 1000d / _creatureRevisionMs : 0d, "0.#")
+                .Int("crN", _creaturesSampled);
+            if (AllocationRelief.TryGetZdoRates(out int zdoSent, out int zdoRecv)) {
+                line.Int("zdoSent", zdoSent)
+                    .Int("zdoRecv", zdoRecv);
+            }
+
+            // What QuietCreatures let through this window, per field, and what it skipped. The
+            // writes it let through are a subset of crRevs; the rest of crRevs is every other
+            // writer (health, noise, world time, animation...).
+            line.Flag("quiet", QuietCreatures.Active)
+                .Int("qpPos", Window(QuietCreatures.PositionWritten, _quietPositionAtReport))
+                .Int("qpVel", Window(QuietCreatures.VelocityWritten, _quietVelocityAtReport))
+                .Int("qpRb", Window(QuietCreatures.RigidbodyWritten, _quietRigidbodyAtReport))
+                .Int("qpBody", Window(QuietCreatures.BodyWritten, _quietBodyAtReport))
+                .Int("qpTilt", Window(QuietCreatures.TiltWritten, _quietTiltAtReport))
+                .Int("qSkip", Window(QuietCreatures.TotalSkipped, _quietSkippedAtReport));
+
+            Monitoring.EmitClient(line.End());
 
             _frames = 0;
             _frameSeconds = 0f;
             _worstFrameSeconds = 0f;
+            _creatureRevisionSteps = 0;
+            _creatureRevisionMs = 0d;
+            MarkQuietTotals();
+        }
+
+        /// <summary>A running total's growth since the last report. A total below its mark was
+        /// reset in between (session end), and all of it is this window's.</summary>
+        private static long Window(long total, long atReport) {
+            return total >= atReport ? total - atReport : total;
+        }
+
+        private static void MarkQuietTotals() {
+            _quietPositionAtReport = QuietCreatures.PositionWritten;
+            _quietVelocityAtReport = QuietCreatures.VelocityWritten;
+            _quietRigidbodyAtReport = QuietCreatures.RigidbodyWritten;
+            _quietBodyAtReport = QuietCreatures.BodyWritten;
+            _quietTiltAtReport = QuietCreatures.TiltWritten;
+            _quietSkippedAtReport = QuietCreatures.TotalSkipped;
         }
 
         internal static void Reset() {
@@ -482,6 +663,15 @@ namespace NetworkPerformanceSystem.Runtime {
             _frames = 0;
             _frameSeconds = 0f;
             _worstFrameSeconds = 0f;
+            _revisionsBefore.Clear();
+            _revisionsNow.Clear();
+            _creatureRevisionSteps = 0;
+            _creatureRevisionMs = 0d;
+            _lastRevisionSampleMs = 0d;
+            _creaturesSampled = 0;
+            // Monitoring can start mid-session with QuietCreatures' totals already running, so the
+            // first window starts from wherever they stand now.
+            MarkQuietTotals();
         }
     }
 }

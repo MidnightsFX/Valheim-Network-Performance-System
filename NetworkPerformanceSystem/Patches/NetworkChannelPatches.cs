@@ -81,8 +81,9 @@ namespace NetworkPerformanceSystem.Patches {
             if (RttProbe.TryGetLinkStatus(peer.m_socket, out RttProbe.LinkStatus link)) {
                 LatencyRegistry.NoteSteamSendRate(peer.m_uid, link.SendRateBytesPerSec);
                 SteamTransport.NoteObservedRate(peer.m_uid, link.SendRateBytesPerSec);
-                // M26: the same status carries the share of our packets that reached this peer.
-                LossBackoff.Observe(peer, link.QualityRemote);
+                // M26: the same status carries the share of our packets that reached this peer,
+                // and how much we are sending them.
+                LossBackoff.Observe(peer, link.QualityRemote, link.OutBytesPerSec);
             }
         }
 
@@ -155,6 +156,7 @@ namespace NetworkPerformanceSystem.Patches {
             LiveRefPos.ForgetPeer(netPeer.m_uid);
             SteamTransport.ForgetPeer(netPeer.m_uid);
             LossBackoff.ForgetPeer(netPeer.m_uid);
+            CreaturePacing.ForgetPeer(netPeer.m_uid);
             // Keyed by connection, not uid: a peer dropped mid-handshake may never have had one.
             ZdoDataGuard.Forget(netPeer.m_rpc);
         }

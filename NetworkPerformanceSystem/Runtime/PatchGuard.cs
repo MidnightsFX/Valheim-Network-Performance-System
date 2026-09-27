@@ -34,6 +34,8 @@ namespace NetworkPerformanceSystem.Runtime {
         EarlyZdoData,      // M24 - ZNet.OnNewConnection holds ZDOData until ZDOMan.AddPeer registers its handler
         OwnerRevisionGuard,// M25 - ZDOMan.RPC_ZDOData keeps the host's owner when a peer's update carries an older owner revision
         LossBackoff,       // M26 - ZRpc.ReceivePing delivery share per peer drives a per-connection Steam send-rate override
+        QuietCreatures,    // M27 - ZSyncTransform.OwnerSync / Character.SyncVelocity / Character.UpdateGroundTilt: a creature's owner skips writes too small to see
+        CreaturePacing,    // M28 - ZDOMan.CreateSyncList: the host sends settled or distant creatures to each peer less often
     }
 
     /// <summary>

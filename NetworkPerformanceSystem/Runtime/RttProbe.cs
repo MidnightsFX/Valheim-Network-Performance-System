@@ -124,8 +124,8 @@ namespace NetworkPerformanceSystem.Runtime {
         /// the game-server interface for dedicated servers) is respected rather than bypassed.</summary>
         [MethodImpl(MethodImplOptions.NoInlining)]
         private static bool QueryClient(ZSteamSocket steam, out int pingMs) {
-            steam.GetConnectionQuality(out float _, out float _, out pingMs, out float _, out float _);
-            return pingMs > 0;
+            steam.GetConnectionQuality(out float qualityLocal, out float _, out pingMs, out float _, out float _);
+            return AcceptPing(ref pingMs, qualityLocal);
         }
 
         /// <summary>The same SteamNetConnectionRealTimeStatus_t read vanilla does, through the
@@ -140,7 +140,35 @@ namespace NetworkPerformanceSystem.Runtime {
                 return false;
             }
             pingMs = status.m_nPing;
-            return pingMs > 0;
+            return AcceptPing(ref pingMs, status.m_flConnectionQualityLocal);
+        }
+
+        /// <summary>Stands in for a ping Steam rounded down to 0: the lowest figure
+        /// LatencyRegistry accepts, and an honest one for a connection under a millisecond.</summary>
+        internal const int SubMillisecondPingMs = 1;
+
+        /// <summary>
+        /// Whether Steam's ping for a connection is a measurement, with a LAN player counted as
+        /// one. Pure.
+        ///
+        /// Steam reports whole milliseconds, and -1 until it has measured the connection. A
+        /// player on the server's own network is under a millisecond away, so it reads 0 - which
+        /// used to be taken as "no figure". The arbiter prices an unmeasured peer at Unmeasured
+        /// Peer RTT Ms (150 by default), so the fastest players on the server lost every creature
+        /// they shared with a remote one, then pulled it back through the proximity layer the
+        /// moment they were the only one near it, over and over.
+        ///
+        /// A 0 is believed only alongside a connection quality above zero. Steam reports -1 for
+        /// that until it has end-to-end figures for the connection, and vanilla's accessor
+        /// reports 0 when its status read fails, so neither can pass for a LAN player.
+        /// </summary>
+        internal static bool AcceptPing(ref int pingMs, float qualityLocal) {
+            if (pingMs > 0) { return true; }
+            if (pingMs == 0 && qualityLocal > 0f) {
+                pingMs = SubMillisecondPingMs;
+                return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -170,6 +198,8 @@ namespace NetworkPerformanceSystem.Runtime {
             internal int SendRateBytesPerSec;  // the fixed rate Steam paces this connection at
             internal float QualityLocal;       // share of the remote's packets that reached us
             internal float QualityRemote;      // share of our packets that reached the remote - loss on the way to them
+            internal float OutBytesPerSec;     // what we are actually sending them now, resends included - at most the rate
+            internal float InBytesPerSec;      // what they are sending us now
         }
 
         /// <summary>Consecutive calls on which neither interface produced a status. This read runs
@@ -400,6 +430,8 @@ namespace NetworkPerformanceSystem.Runtime {
             status.SendRateBytesPerSec = raw.m_nSendRateBytesPerSecond;
             status.QualityLocal = raw.m_flConnectionQualityLocal;
             status.QualityRemote = raw.m_flConnectionQualityRemote;
+            status.OutBytesPerSec = raw.m_flOutBytesPerSec;
+            status.InBytesPerSec = raw.m_flInBytesPerSec;
         }
 
         /// <summary>See through socket wrappers to the transport underneath. Steady state is the

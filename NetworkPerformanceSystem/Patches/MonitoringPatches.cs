@@ -46,6 +46,10 @@ namespace NetworkPerformanceSystem.Patches {
             Patch(typeof(Character), "RPC_Damage", nameof(RpcDamagePrefix), null);
             Patch(typeof(Character), nameof(Character.Damage), nameof(DamagePrefix), null);
 
+            // Deaths, from the machine simulating the creature - the only one that knows what
+            // killed it. Player overrides OnDeath without calling it, so this is creatures only.
+            Patch(typeof(Character), nameof(Character.OnDeath), nameof(OnDeathPrefix), null);
+
             if (hostHooks) {
                 // First, so it sees where the sender addressed the message before the station
                 // router or the relay filter has had a say.
@@ -156,6 +160,12 @@ namespace NetworkPerformanceSystem.Patches {
 
         private static void DamagePrefix(Character __instance) {
             MonitoringClient.OnDamageSent(__instance);
+        }
+
+        // A prefix because OnDeath ends by destroying the ZDO; before it runs, everything the
+        // record wants is still there to read.
+        private static void OnDeathPrefix(Character __instance) {
+            MonitoringClient.OnDeath(__instance);
         }
 
         // -- ZSyncTransform.SyncPosition ---------------------------------------------------

@@ -133,6 +133,22 @@ namespace NetworkPerformanceSystem.Runtime {
         /// </summary>
         internal static bool LocalFaultSuspected { get; private set; }
 
+        /// <summary>When the last local fault cleared, on the stall-aware clock. Only meaningful
+        /// once _localFaultEnded is set.</summary>
+        private static float _localFaultEndedAt;
+        private static bool _localFaultEnded;
+
+        /// <summary>
+        /// Whether a local fault is in progress, or cleared less than this many seconds ago. For
+        /// readers of per-connection statistics that outlive the outage: Steam's delivery figure
+        /// for a connection still carries the packets an outage at this end cost it for about
+        /// twenty seconds after traffic resumes, and that loss is nobody's connection's.
+        /// </summary>
+        internal static bool LocalFaultWithin(float seconds) {
+            if (LocalFaultSuspected) { return true; }
+            return _localFaultEnded && _observed - _localFaultEndedAt < seconds;
+        }
+
         /// <summary>
         /// True when this peer is present in the peer list but has stopped being a peer in every
         /// way that matters. The one question the rest of the mod asks.
@@ -216,6 +232,10 @@ namespace NetworkPerformanceSystem.Runtime {
             bool allQuiet = Peers.Count > 1 && GhostsNow == Peers.Count;
             if (allQuiet != LocalFaultSuspected) {
                 LocalFaultSuspected = allQuiet;
+                if (!allQuiet) {
+                    _localFaultEnded = true;
+                    _localFaultEndedAt = _observed;
+                }
                 Logger.LogWarning(allQuiet
                     ? $"All {Peers.Count} peers went quiet at once - treating that as a fault at this end rather "
                       + "than as everybody leaving. Nobody is being evicted from ownership until one answers."
@@ -286,6 +306,8 @@ namespace NetworkPerformanceSystem.Runtime {
             Seen.Clear();
             GhostsNow = 0;
             LocalFaultSuspected = false;
+            _localFaultEnded = false;
+            _localFaultEndedAt = 0f;
             _observed = 0f;
             _lastTickWall = 0f;
             _haveTick = false;

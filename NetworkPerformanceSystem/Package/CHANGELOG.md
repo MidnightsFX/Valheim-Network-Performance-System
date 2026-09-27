@@ -1,5 +1,16 @@
 # Changelog
 
+**1.10.0**
+- Pets following a player, and creatures summoned with a staff, now stay on that player's machine instead of being moved to whoever has the lowest ping. New `Ownership` setting **Followers Stay With Their Player** (default on).
+- Players on the same local network as the server now have their ping measured. Steam reports them at 0 ms, which was read as "no measurement", so they were treated as 150 ms and kept losing creatures to players further away.
+- Network monitoring now records how each creature died: what killed it, the damage types, where it was, and whether it had just changed owner.
+- A player standing on the edge between two areas no longer makes the server hand every object in the next area over back and forth each time they step - over a thousand at a time in a built-up base, each one re-sent to everyone nearby. Objects now stay with a player while that player still has them loaded. New `Ownership` setting **Keep Objects While Loaded** (default on).
+- Loss backoff stops sooner for a player whose packet loss is not caused by the send rate. Once their rate is below what their connection was already carrying, and their loss has not improved, they go straight back to full speed. Before, they were slowed all the way to the floor first, and their updates queued for up to a fifth of a second on the way.
+- A network outage at the server no longer makes loss backoff slow down players whose connections were fine.
+- Idle creatures, tamed animals in pens especially, no longer re-send themselves many times a second for movements too small to see. A player looking after a few dozen of them could spend their whole upload on it, and everyone nearby had to download all of it. New `Creature Updates` setting **Quiet Idle Creatures** (default on). It works on each player's game that has the mod, using the server's setting.
+- The server now sends a creature that has settled down to each player at most 10 times a second (5 beyond 32 m), and one moving more than 64 m away at most 15 times a second, instead of on every update. This also reduces what players without the mod cost everyone else. New `Creature Updates` setting **Pace Creature Sends** (default on).
+- Network monitoring now records additional details
+
 **1.9.0**
 - Creatures no longer get stuck with a player who walked away and came back.
 - Fixed objects outside the normal world area changing owner several times every two seconds.

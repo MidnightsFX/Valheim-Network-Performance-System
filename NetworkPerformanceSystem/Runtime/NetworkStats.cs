@@ -217,6 +217,8 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendThirdPartyThresholds(sb);
             AppendScheduler(sb);
             AppendSyncListCache(sb);
+            AppendQuietCreatures(sb);
+            AppendCreaturePacing(sb);
             AppendRoutedRpc(sb);
             AppendOwnerRpc(sb);
             AppendReferencePositions(sb);
@@ -276,6 +278,8 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.EarlyZdoData: return ValConfig.EnableEarlyZdoDataGuard.Value;
                 case Mechanism.OwnerRevisionGuard: return ValConfig.RejectStaleOwnerUpdates.Value;
                 case Mechanism.LossBackoff: return ValConfig.EnableSteamTransportTuning.Value && ValConfig.EnableLossBackoff.Value;
+                case Mechanism.QuietCreatures: return ValConfig.QuietIdleCreatures.Value;
+                case Mechanism.CreaturePacing: return ValConfig.PaceCreatureSends.Value;
                 default: return true;
             }
         }
@@ -819,6 +823,62 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  cache window     {ValConfig.SyncListCacheMs.Value:F0}ms (invalidated early on zone change or any destroy)");
         }
 
+        /// <summary>What the owner-side dead band is saving, on whatever this machine simulates -
+        /// so on every role. "Skipped" is a whole-ZDO send that did not happen, to the host and on
+        /// from it to every other player in range.</summary>
+        private static void AppendQuietCreatures(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Idle creature updates (creatures simulated here, since start):");
+            string reason = PatchGuard.GetDisableReason(Mechanism.QuietCreatures);
+            if (reason != null) {
+                sb.AppendLine($"  stood down: {reason}");
+                return;
+            }
+            if (!ValConfig.QuietIdleCreatures.Value) {
+                sb.AppendLine("  off (every change to a creature's position, velocity or tilt is sent, however small)");
+                return;
+            }
+
+            AppendWrittenRow(sb, "position", QuietCreatures.PositionWritten, QuietCreatures.PositionSkipped);
+            AppendWrittenRow(sb, "velocity", QuietCreatures.VelocityWritten, QuietCreatures.VelocitySkipped);
+            AppendWrittenRow(sb, "body (rb)", QuietCreatures.RigidbodyWritten, QuietCreatures.RigidbodySkipped);
+            AppendWrittenRow(sb, "body vel", QuietCreatures.BodyWritten, QuietCreatures.BodySkipped);
+            AppendWrittenRow(sb, "tilt", QuietCreatures.TiltWritten, QuietCreatures.TiltSkipped);
+        }
+
+        private static void AppendWrittenRow(StringBuilder sb, string label, long written, long skipped) {
+            long total = written + skipped;
+            string share = total > 0 ? $" ({100f * skipped / total:F0}% skipped)" : "";
+            sb.AppendLine($"  {label,-10} {written} sent, {skipped} skipped{share}");
+        }
+
+        /// <summary>What the host's per-player pacing is holding back. Host only: it is the host's
+        /// send list that is filtered.</summary>
+        private static void AppendCreaturePacing(StringBuilder sb) {
+            if (!NpsEnv.IsHost()) { return; }
+
+            sb.AppendLine();
+            sb.AppendLine("Creature send pacing (since start):");
+            string reason = PatchGuard.GetDisableReason(Mechanism.CreaturePacing);
+            if (reason != null) {
+                sb.AppendLine($"  stood down: {reason}");
+                return;
+            }
+            if (!ValConfig.PaceCreatureSends.Value) {
+                sb.AppendLine("  off (every changed creature goes to every player in range on every send)");
+                return;
+            }
+
+            long listed = CreaturePacing.Listed;
+            long deferred = CreaturePacing.Deferred;
+            string share = listed > 0 ? $" ({100f * deferred / listed:F0}%)" : "";
+            sb.AppendLine($"  held back        {deferred} of {listed} creature sends{share}");
+            sb.AppendLine($"    settled <={CreaturePacing.NearMetres:F0}m  {CreaturePacing.DeferredIdleNear} (at most {1f / CreaturePacing.IdleNearInterval:F0}/s)");
+            sb.AppendLine($"    settled >{CreaturePacing.NearMetres:F0}m   {CreaturePacing.DeferredIdleFar} (at most {1f / CreaturePacing.IdleFarInterval:F0}/s)");
+            sb.AppendLine($"    moving >{CreaturePacing.FarMetres:F0}m    {CreaturePacing.DeferredMovingFar} (at most {1f / CreaturePacing.MovingFarInterval:F0}/s)");
+            sb.AppendLine($"  moving now       {CreaturePacing.MovingAt(Time.time)} (moving, or stopped less than {CreaturePacing.SettleSeconds:F1}s ago - sent in full within {CreaturePacing.FarMetres:F0}m)");
+        }
+
         /// <summary>The send scheduler's effective output. On a small server this simply confirms
         /// the configured rate; on a large one it is the number that says whether the host is
         /// CPU-bound on the send path - the frame budget trades per-peer rate for frame time, and
@@ -994,6 +1054,9 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  unowned     {OwnershipArbiter.LastPassUnownedOnEntry} on entry");
             sb.AppendLine($"  rescued     {OwnershipArbiter.LastPassRescued} (had no present owner - never capped)");
             sb.AppendLine($"  released    {OwnershipArbiter.LastPassReleased} (no eligible owner in range)");
+            sb.AppendLine(ValConfig.OwnershipKeepWhileLoaded.Value
+                ? $"  kept loaded {OwnershipArbiter.LastPassLoadedKept} (nobody standing near them, left with an owner who still has them loaded instead of released)"
+                : "  kept loaded off (objects are released the moment their owner steps a zone away, as in vanilla)");
             sb.AppendLine($"  optimised   {OwnershipArbiter.LastPassOptimised} (moving objects, given to a better-placed owner; includes the pulls below)");
             sb.AppendLine($"  deferred    {OwnershipArbiter.LastPassDeferred} (moving objects only, hit the per-pass cap of {OwnershipArbiter.LastPassCap})");
 
@@ -1009,6 +1072,12 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine($"  proximity   {OwnershipArbiter.LastPassProximityKept} kept with the only player near them, {OwnershipArbiter.LastPassProximityPulled} pulled to that player, {OwnershipArbiter.LastPassProximityRescued} rescues sent to that player instead of the lowest-latency one (within {ValConfig.CreatureProximityRadius.Value:F0}m)");
             } else {
                 sb.AppendLine("  proximity   off (creatures are placed by latency alone, however far away the lowest-latency player is)");
+            }
+            if (ValConfig.OwnershipArbitrateCreatures.Value && ValConfig.OwnershipFollowersStayWithLeader.Value) {
+                sb.AppendLine($"  followers   {OwnershipArbiter.LastPassLeaderKept} kept with the player they follow or were summoned by, {OwnershipArbiter.LastPassLeaderReturned} returned to them, {OwnershipArbiter.LastPassLeaderRescued} rescued to them" +
+                              $" (since start {OwnershipArbiter.TotalLeaderReturned} returned, {OwnershipArbiter.TotalLeaderRescued} rescued)");
+            } else {
+                sb.AppendLine("  followers   off (pets following a player and summons are placed like any other creature)");
             }
 
             // Tier 2 prints a "vanilla" line when it is off rather than nothing at all: a silently

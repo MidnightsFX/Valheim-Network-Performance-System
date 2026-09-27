@@ -38,6 +38,10 @@ namespace NetworkPerformanceSystem {
         // opens, before the server's config has arrived.
         public static ConfigEntry<bool> EnableEarlyZdoDataGuard;
 
+        // How often ConfigFileWatcher checks this machine's copy of the file. Local, because it is
+        // about this machine's disk, not how the game plays.
+        public static ConfigEntry<float> ConfigPollIntervalSeconds;
+
         // Add Server synced config entries under here
 
         // M2/M2c - bandwidth-delay-product send window
@@ -73,6 +77,12 @@ namespace NetworkPerformanceSystem {
         // M3 creatures - creatures are arbitrated as simulated objects, first, and kept while loaded
         public static ConfigEntry<bool> OwnershipArbitrateCreatures;
 
+        // M3 followers - a tame following a player, or a summon, stays on that player's machine
+        public static ConfigEntry<bool> OwnershipFollowersStayWithLeader;
+
+        // M3 ring keep - an object nobody is standing near stays with an owner who still has it loaded
+        public static ConfigEntry<bool> OwnershipKeepWhileLoaded;
+
         // M25 - the host's ownership changes are not undone by a peer's older update
         public static ConfigEntry<bool> RejectStaleOwnerUpdates;
 
@@ -95,6 +105,10 @@ namespace NetworkPerformanceSystem {
         // M9 - per-peer sector scan cache
         public static ConfigEntry<bool> EnableSyncListCache;
         public static ConfigEntry<float> SyncListCacheMs;
+
+        // M27/M28 - creatures that are not doing anything cost less on the wire
+        public static ConfigEntry<bool> QuietIdleCreatures;
+        public static ConfigEntry<bool> PaceCreatureSends;
 
         // M8 - Steam transport configuration
         public static ConfigEntry<bool> EnableSteamTransportTuning;
@@ -157,6 +171,48 @@ namespace NetworkPerformanceSystem {
             cfg.Save();
         }
 
+        // Called after SaveOnSet(true), so the stamp taken here is of the file as that flush left it
+        // rather than one poll away from looking edited.
+        public static void WatchConfigFile() {
+            ConfigFileWatcher.Register(cfg.ConfigFilePath, OnConfigFileChanged);
+            ConfigFileWatcher.Initialize();
+        }
+
+        // Non-null only while ReloadFromDisk is reloading, so its log line can name what changed.
+        private static List<string> reloadChanges;
+
+        // Jotunn's own rule for when the file on disk is in charge: no session yet, or this process is
+        // the server. A connected client's synced values are the server's and must not be replaced by
+        // its local copy. On a server, Reload raises ConfigReloaded, which Jotunn answers by sending
+        // every changed synced value to the connected players; the SettingChanged handlers bound below
+        // run as they do for an in-game edit, and on the main thread because this is polled from Update.
+        private static void OnConfigFileChanged(string _) {
+            if (ZNet.instance != null && !ZNet.instance.IsServer()) { return; }
+            ReloadFromDisk();
+        }
+
+        // Split from the ZNet check so it can be run outside the game, where no Unity object exists.
+        internal static void ReloadFromDisk() {
+            // Reload assigns each changed value through its setter. With SaveOnConfigSet on, every one
+            // of those rewrites the whole file mid-reload, and the rewrite looks like another edit.
+            bool saveOnSet = cfg.SaveOnConfigSet;
+            cfg.SaveOnConfigSet = false;
+            List<string> changed = new List<string>();
+            reloadChanges = changed;
+            try {
+                cfg.Reload();
+            } finally {
+                reloadChanges = null;
+                cfg.SaveOnConfigSet = saveOnSet;
+            }
+
+            if (changed.Count == 0) {
+                Logger.LogInfo("Config file changed on disk and was reloaded; no setting changed.");
+            } else {
+                Logger.LogInfo($"Config file changed on disk and was reloaded; {changed.Count} setting(s) changed: {string.Join(", ", changed)}");
+            }
+        }
+
         private void CreateConfigValues(ConfigFile Config) {
             // Debugmode
             EnableDebugMode = Config.Bind("Client config", "EnableDebugMode", false,
@@ -183,6 +239,10 @@ namespace NetworkPerformanceSystem {
                 new ConfigDescription("When the server turns on monitoring, this allows your client to upload data. As the client, this is your hard-opt out, server can't override it."));
             EnableEarlyZdoDataGuard = Config.Bind("Client config", "EnableEarlyZdoDataGuard", true,
                 new ConfigDescription("Buffers updates that land before their associated receiving RCPs, prevents data loss on connection.", null,
+                new ConfigurationManagerAttributes { IsAdvanced = true }));
+            ConfigPollIntervalSeconds = Config.Bind("Config File", "Poll Interval Seconds", 30f,
+                new ConfigDescription("Seconds between checks for edits to this file on disk. An edit is applied without a restart on a server, or in the main menu; a server then sends its new values to the connected players. Lower reacts faster to a hand edit.",
+                new AcceptableValueRange<float>(1f, 300f),
                 new ConfigurationManagerAttributes { IsAdvanced = true }));
 
             // Bandwidth sizing
@@ -238,6 +298,10 @@ namespace NetworkPerformanceSystem {
                 "How close, in metres, a player has to be to a creature to count as near it for Creature Proximity Ownership. Two players both inside this distance of one creature are sharing a fight; two players further apart than about twice this are not.", false, 16f, 96f);
             OwnershipArbitrateCreatures = BindServerConfig("Ownership", "Arbitrate Creatures", true,
                 "Give creatures first call on ownership arbitration. Game defaults to creatures having low priority for network updates.");
+            OwnershipFollowersStayWithLeader = BindServerConfig("Ownership", "Followers Stay With Their Player", true,
+                "A tame that is following a player, or a creature a player summoned with a staff, is simulated on that player's machine, so it keeps up with them and fights beside them without lag. A ridden animal still goes to its rider. Needs Arbitrate Creatures.");
+            OwnershipKeepWhileLoaded = BindServerConfig("Ownership", "Keep Objects While Loaded", true,
+                "Leave an object with its owner while that player still has it loaded, instead of releasing it the moment they step one zone away and claiming it again when they step back. A player standing on a zone edge otherwise flips every object in the next zone over each time they move - over a thousand at a time in a built-up base. Creatures already work this way.");
 
             // Arbitration persistance
             RejectStaleOwnerUpdates = BindServerConfig("Ownership", "Reject Stale Owner Updates", true,
@@ -265,6 +329,12 @@ namespace NetworkPerformanceSystem {
             SyncListCacheMs = BindServerConfig("Sync List Cache", "Cache Ms", 100f,
                 "How long a peer's sector scan may be reused, in milliseconds. This is the longest delay an object moving sectors from one player to another would have before being considered for ownership change etc. Vanilla rebuilds this every frame.",
                 false, 0f, 500f);
+
+            // Creature updates
+            QuietIdleCreatures = BindServerConfig("Creature Updates", "Quiet Idle Creatures", true,
+                "A creature standing still stops sending itself for movements too small to see - under 2 cm, 0.05 m/s, or 1 degree of tilt. Without this, the physics engine's constant tiny wobble makes whoever simulates a creature re-send all of it up to 30 times a second, and the server passes each copy on to everyone nearby; a pen of tamed animals can fill a player's upload. Fighting creatures are not affected. Runs on each player's game that has this mod, using the server's setting.");
+            PaceCreatureSends = BindServerConfig("Creature Updates", "Pace Creature Sends", true,
+                "Server side. Send a creature that has settled down to each player at most 10 times a second (5 beyond 32 m), and one moving more than 64 m away at most 15 times a second, instead of on every update. Creatures that are fighting, hunting, being ridden or changing owner still go out at once. Also covers players who do not have this mod.");
 
             // Steam Socket
             EnableSteamTransportTuning = BindServerConfig("Steam Transport", "Enable Transport Tuning", true,
@@ -394,6 +464,7 @@ namespace NetworkPerformanceSystem {
         }
 
         private static void OnAnySettingChanged(object sender, SettingChangedEventArgs e) {
+            reloadChanges?.Add($"[{e.ChangedSetting.Definition.Section}] {e.ChangedSetting.Definition.Key} = {e.ChangedSetting.BoxedValue}");
             Runtime.Monitoring.OnSettingChanged(e.ChangedSetting);
         }
 

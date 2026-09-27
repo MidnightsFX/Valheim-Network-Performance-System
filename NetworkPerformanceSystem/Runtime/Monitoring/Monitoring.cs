@@ -20,6 +20,7 @@ namespace NetworkPerformanceSystem.Runtime {
         Helm,            // M20: a ship handed to the player who took its helm
         Remote,          // arrived in a packet - some other machine changed the owner
         DragBack,        // arrived in a packet and undid a change this host had just made
+        Leader,          // arbiter: a follower (tame following a player, or a summon) returned to its player
     }
 
     /// <summary>
@@ -472,6 +473,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Int("unowned", OwnershipArbiter.LastPassUnownedOnEntry)
                 .Int("rescued", OwnershipArbiter.LastPassRescued)
                 .Int("released", OwnershipArbiter.LastPassReleased)
+                .Int("loadedKept", OwnershipArbiter.LastPassLoadedKept)
                 .Int("optimised", OwnershipArbiter.LastPassOptimised)
                 .Int("deferred", OwnershipArbiter.LastPassDeferred)
                 .Int("cap", OwnershipArbiter.LastPassCap)
@@ -604,7 +606,15 @@ namespace NetworkPerformanceSystem.Runtime {
                         .Int("inFlight", link.InFlightBytes)
                         .Int("sendRate", link.SendRateBytesPerSec)
                         .Num("qLocal", link.QualityLocal, "0.###")
-                        .Num("qRemote", link.QualityRemote, "0.###");
+                        .Num("qRemote", link.QualityRemote, "0.###")
+                        .Num("outBps", link.OutBytesPerSec, "0")
+                        .Num("inBps", link.InBytesPerSec, "0");
+                }
+
+                // Running totals, not rates: the analysis differences consecutive records.
+                if (CreaturePacing.TryGetPeerCounts(peer.m_uid, out long paceDeferred, out long paceListed)) {
+                    line.Int("paceDef", paceDeferred)
+                        .Int("paceList", paceListed);
                 }
 
                 EmitServer(line.End());
@@ -630,9 +640,11 @@ namespace NetworkPerformanceSystem.Runtime {
         /// global rate after a clean run), or "exempt" (back at the global rate because stepping
         /// down did not improve their delivery; never stepped again this session). "delivered" is
         /// the smoothed share of packets reaching them now, "atStart" what it was at their first
-        /// step down, and "rate" the rate they are on after the change.
+        /// step down, "carried" the most their connection was delivering (bytes/sec) in the lossy
+        /// stretch before that step, and "rate" the rate they are on after the change.
         /// </summary>
-        internal static void OnLossBackoff(long uid, string action, int steps, int rateBytesPerSec, float delivered, float deliveredAtStart) {
+        internal static void OnLossBackoff(long uid, string action, int steps, int rateBytesPerSec, float delivered, float deliveredAtStart,
+                                           float carriedAtStart) {
             if (!ServerRole) { return; }
 
             EmitServer(Line.Begin("loss_backoff")
@@ -643,6 +655,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Int("rate", rateBytesPerSec)
                 .Num("delivered", delivered, "0.###")
                 .Num("atStart", deliveredAtStart, "0.###")
+                .Int("carried", Mathf.RoundToInt(carriedAtStart))
                 .End());
         }
 

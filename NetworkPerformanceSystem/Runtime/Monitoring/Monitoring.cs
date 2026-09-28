@@ -164,6 +164,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     _lastPeerSampleMs = now;
                     SamplePeers(now);
                 }
+                TrafficLedger.Tick(now, ZNet.instance != null ? ZNet.instance.GetPeers().Count : 0);
                 ReportWriterState();
             }
 
@@ -219,6 +220,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             HandoffWatch.Reset();
             MonitoringClient.Reset();
+            TrafficLedger.Reset();
             _hasPendingCause = false;
             _pendingCandidates = null;
         }
@@ -282,7 +284,10 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         internal static string PrefabName(ZDO zdo) {
-            int hash = zdo.GetPrefab();
+            return PrefabNameByHash(zdo.GetPrefab());
+        }
+
+        internal static string PrefabNameByHash(int hash) {
             if (PrefabNames.TryGetValue(hash, out string name)) { return name; }
 
             GameObject prefab = ZNetScene.instance != null ? ZNetScene.instance.GetPrefab(hash) : null;
@@ -662,6 +667,7 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static void ForgetPeer(long uid) {
             HandoffWatch.ForgetPeer(uid);
             MonitoringUpload.ForgetPeer(uid);
+            TrafficLedger.ForgetPeer(uid);
         }
     }
 }

@@ -50,10 +50,24 @@ namespace NetworkPerformanceSystem.Patches {
             // killed it. Player overrides OnDeath without calling it, so this is creatures only.
             Patch(typeof(Character), nameof(Character.OnDeath), nameof(OnDeathPrefix), null);
 
+            // Method names for TrafficLedger, from the two calls that still have the string. Every
+            // role: a routed RPC only clients send is named by the clients' c_names records.
+            Patch(typeof(ZRpc), nameof(ZRpc.Invoke), new[] { typeof(string), typeof(object[]) }, nameof(RpcInvokeNamePrefix), null);
+            Patch(typeof(ZRoutedRpc), nameof(ZRoutedRpc.InvokeRoutedRPC), new[] { typeof(long), typeof(ZDOID), typeof(string), typeof(object[]) },
+                  nameof(RoutedInvokeNamePrefix), null);
+
             if (hostHooks) {
                 // First, so it sees where the sender addressed the message before the station
                 // router or the relay filter has had a say.
                 Patch(typeof(ZRoutedRpc), "RouteRPC", nameof(RouteRpcPrefix), null, Priority.First);
+
+                // What each connection carries (TrafficLedger). Every package in and out, the
+                // ZDOs inside ZDOData, and which peer SendZDOs is writing for while it runs.
+                Patch(typeof(ZRpc), "HandlePackage", nameof(PackageReceivedPrefix), null);
+                Patch(typeof(ZRpc), "SendPackage", nameof(PackageSentPrefix), null);
+                Patch(typeof(ZDO), nameof(ZDO.Deserialize), null, nameof(ZdoDeserializedPostfix));
+                Patch(typeof(ZDO), nameof(ZDO.Serialize), null, nameof(ZdoSerializedPostfix));
+                Patch(typeof(ZDOMan), nameof(ZDOMan.SendZDOs), nameof(SendZdosPrefix), nameof(SendZdosPostfix));
             }
 
             if (viewerHooks) {
@@ -73,8 +87,13 @@ namespace NetworkPerformanceSystem.Patches {
         }
 
         private static void Patch(Type type, string method, string prefix, string postfix, int priority = Priority.Normal) {
+            Patch(type, method, null, prefix, postfix, priority);
+        }
+
+        /// <summary>With <paramref name="parameters"/>, for a method that has overloads.</summary>
+        private static void Patch(Type type, string method, Type[] parameters, string prefix, string postfix, int priority = Priority.Normal) {
             try {
-                MethodInfo original = AccessTools.Method(type, method);
+                MethodInfo original = AccessTools.Method(type, method, parameters);
                 if (original == null) {
                     Logger.LogWarning($"Network monitoring: {type.Name}.{method} was not found, so what it would have recorded is missing from this session.");
                     return;
@@ -150,6 +169,47 @@ namespace NetworkPerformanceSystem.Patches {
             if (!Monitoring.IsWatchedRpc(rpcData.m_methodHash)) { return; }
 
             Monitoring.OnRoutedRpc(rpcData);
+        }
+
+        // -- TrafficLedger ------------------------------------------------------------------
+
+        private static void RpcInvokeNamePrefix(string method) {
+            TrafficNames.Learn(method);
+        }
+
+        private static void RoutedInvokeNamePrefix(string methodName) {
+            TrafficNames.Learn(methodName);
+        }
+
+        // Before the handler reads anything: the package is still at its start, and nothing here
+        // moves its position.
+        private static void PackageReceivedPrefix(ZRpc __instance, ZPackage package) {
+            TrafficLedger.OnReceived(__instance, package);
+        }
+
+        // Before the socket sees it: a PlayFab socket appends to the package it is given.
+        private static void PackageSentPrefix(ZRpc __instance, ZPackage pkg) {
+            TrafficLedger.OnSent(__instance, pkg);
+        }
+
+        // RPC_ZDOData calls Deserialize once for each ZDO it applies, with that ZDO's own data in
+        // the package; the bracket set in ZdoDataPrefix says whose packet it came in.
+        private static void ZdoDeserializedPostfix(ZDO __instance, ZPackage pkg) {
+            if (!Monitoring.InZdoData) { return; }
+            TrafficLedger.OnZdoReceived(Monitoring.PacketPeerUid, __instance, pkg.Size());
+        }
+
+        // SendZDOs is the only caller of ZDO.Serialize, and clears the package before each ZDO.
+        private static void ZdoSerializedPostfix(ZDO __instance, ZPackage pkg) {
+            TrafficLedger.OnZdoSent(__instance, pkg.Size());
+        }
+
+        private static void SendZdosPrefix(ZDOMan.ZDOPeer peer) {
+            TrafficLedger.SendingTo = peer?.m_peer != null ? peer.m_peer.m_uid : 0L;
+        }
+
+        private static void SendZdosPostfix() {
+            TrafficLedger.SendingTo = 0L;
         }
 
         // -- Character ---------------------------------------------------------------------

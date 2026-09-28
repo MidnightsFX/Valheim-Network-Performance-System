@@ -8,21 +8,30 @@ namespace NetworkPerformanceSystem.Runtime {
     ///
     /// Vanilla hard-codes 10240 bytes in ZDOMan.SendZDOs. That number is not a queue limit - on
     /// Steam sockets GetSendQueueSize() includes m_cbSentUnackedReliable, so it is a congestion
-    /// window, and throughput through a fixed window is window/RTT:
+    /// window. And the window is only topped up when SendZDOs runs, once per send interval, so
+    /// what it has to cover is one round trip plus the wait for the next top-up. Throughput is
+    /// about window / (RTT + interval); at a 50ms interval, against a 150 KB/s link (simulated
+    /// with vanilla's refill rule):
     ///
-    ///     20ms  -> 512 KB/s     (well above what the transport allows anyway)
-    ///     67ms  -> 153 KB/s     (exactly Valheim's pinned Steam send rate)
-    ///     250ms ->  41 KB/s     (27% of it)
+    ///     20ms  -> 145 KB/s
+    ///     64ms  -> 100 KB/s     (two thirds of Valheim's pinned Steam send rate)
+    ///     250ms ->  33 KB/s
     ///
-    /// So vanilla is correctly sized up to about 67ms and starves everything beyond, regardless of
-    /// how good the distant player's connection actually is. Worse, it fails hard rather than
-    /// gracefully: over the threshold SendZDOs returns false and that peer receives nothing at all
-    /// that tick, which is the freeze-then-teleport symptom.
+    /// So vanilla starves anyone much past 20ms, regardless of how good the distant player's
+    /// connection actually is. Worse, it fails hard rather than gracefully: over the threshold
+    /// SendZDOs returns false and that peer receives nothing at all that tick, which is the
+    /// freeze-then-teleport symptom.
     ///
-    /// Sizing by bandwidth-delay product fixes the distant peer and is a no-op for the local one
-    /// by construction. That second half matters: simply raising the constant for everyone - which
-    /// is what every other mod in this space does - hands a 20ms peer tens of kilobytes of standing
-    /// queue, which is latency added to a player who did not have a problem.
+    /// Sizing by rate x (RTT x factor + interval) fixes the distant peer and is a no-op for the
+    /// local one by construction. The factor is headroom for the RTT estimate only; the interval
+    /// is this mod's own schedule and needs none. The interval was left out at first, which
+    /// held a 64ms player to about 116 KB/s in both directions - the 2026-09-28 recording had
+    /// both of its 64ms players topping out at 93-107 KB/s while LAN players reached 148. A
+    /// window this size keeps up to about half an interval of data waiting at Steam while the
+    /// link is full, which vanilla's 10240 already does to a LAN player. Simply raising the
+    /// constant for everyone - which is what every other mod in this space does - hands a 20ms
+    /// peer tens of kilobytes of standing queue, which is latency added to a player who did not
+    /// have a problem.
     ///
     /// The bandwidth half of the product is the rate Steam paces this connection at, read back
     /// from the transport once a second (see M8: it is a fixed rate, not an estimate, so there is
@@ -99,10 +108,21 @@ namespace NetworkPerformanceSystem.Runtime {
 
             LatencyRegistry.TryGetSteamSendRate(uid, out int observed);
             rate = PickRate(observed, SteamTransport.PinnedSendRateBytesPerSec);
-            window = Compute(rate, LatencyRegistry.MeasuredRttMs(uid),
+            window = Compute(rate, LatencyRegistry.MeasuredRttMs(uid), SendIntervalMs(),
                              ValConfig.SendWindowBdpFactor.Value, ValConfig.SendWindowMaxBytes.Value);
             return true;
         }
+
+        /// <summary>How long this machine waits between sends to one peer: M2b's interval while it
+        /// runs, otherwise vanilla's 0.05s gate (or ReturnToSender's, which is the same).</summary>
+        internal static float SendIntervalMs() {
+            if (PatchGuard.IsActive(Mechanism.SendScheduler) && ValConfig.EnableSchedulerFix.Value) {
+                return Mathf.Max(0.01f, ValConfig.SendIntervalSeconds.Value) * 1000f;
+            }
+            return VanillaSendIntervalMs;
+        }
+
+        internal const float VanillaSendIntervalMs = 50f;
 
         /// <summary>
         /// Which rate to size for, most specific first: what Steam reports for this very
@@ -116,9 +136,9 @@ namespace NetworkPerformanceSystem.Runtime {
             return SteamTransport.VanillaSendRateBytesPerSec;
         }
 
-        /// <summary>rate x RTT x factor, clamped to [vanilla, max]. Pure.</summary>
-        internal static int Compute(float rateBytesPerSec, float rttMs, float bdpFactor, int maxBytes) {
-            float bdp = rateBytesPerSec * (rttMs / 1000f) * bdpFactor;
+        /// <summary>rate x (RTT x factor + send interval), clamped to [vanilla, max]. Pure.</summary>
+        internal static int Compute(float rateBytesPerSec, float rttMs, float intervalMs, float bdpFactor, int maxBytes) {
+            float bdp = rateBytesPerSec * (rttMs * bdpFactor + intervalMs) / 1000f;
             return Mathf.Clamp(
                 Mathf.RoundToInt(bdp),
                 VanillaWindowBytes,

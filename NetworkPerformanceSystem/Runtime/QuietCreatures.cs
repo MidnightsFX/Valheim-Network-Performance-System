@@ -27,6 +27,19 @@ namespace NetworkPerformanceSystem.Runtime {
     ///     must reach 0.10 m/s before it is written, so noise around the snap threshold cannot
     ///     toggle it every tick; otherwise 0.05 m/s of change.
     ///   * ground tilt (s_tiltrot): 1 degree.
+    ///   * facing (the ZDO's rotation): 1 degree, and only while the stored velocity is zero, as
+    ///     for position. A grounded character re-applies its facing every frame and the game
+    ///     stores it whenever the euler angles differ at all.
+    ///   * the rigidbody's angular velocity (s_bodyAVelHash), written every frame alongside the
+    ///     linear one for the prefabs that sync their rigidbody: the velocity rules, in rad/s.
+    ///   * animator floats (forward, sideways and turn speed, and anything else ZSyncAnimation
+    ///     .SetFloat carries): 0.05, and under 0.05 written as exactly zero. The game only asks
+    ///     for a 0.01 change against the local animator, then stores the value bit for bit, and
+    ///     forward speed is taken from the same never-sleeping rigidbody.
+    ///
+    /// The last three came from the 2026-09-28 recording: the first five sites were skipping
+    /// 81-88% of what they were asked to write, yet each creature was still changing 52-80 times
+    /// a second, 45-65 of them through writes nothing here covered.
     ///
     /// Creatures only (OwnershipPolicy.IsCreature - tames, summons and wild ones; never players,
     /// ships, carts or items), and never one that is alert or has a target: a fight keeps every
@@ -36,7 +49,7 @@ namespace NetworkPerformanceSystem.Runtime {
     /// mod, or the host - under the server's setting. It needs nothing from the server and the
     /// receivers are unchanged vanilla: they simply get fewer updates.
     ///
-    /// The five entry points replace the game's own ZDO calls at their call sites
+    /// The eight entry points replace the game's own ZDO calls at their call sites
     /// (QuietCreaturesPatches), taking exactly what those calls took off the stack. Everything
     /// that decides lives in the pure functions below, which name no Unity component, so the
     /// offline harness can table them.
@@ -47,6 +60,8 @@ namespace NetworkPerformanceSystem.Runtime {
         internal const float SnapSpeed = 0.05f;
         internal const float StartSpeed = 0.10f;
         internal const float VelocityDeadband = 0.05f;
+        internal const float AnimatorSnap = 0.05f;
+        internal const float AnimatorDeadband = 0.05f;
 
         /// <summary>cos(0.5 degrees). The angle between two rotations is 2 x acos(|dot|), so they
         /// are within one degree of each other exactly when |dot| is at least this.</summary>
@@ -68,9 +83,17 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static long BodySkipped;
         internal static long TiltWritten;
         internal static long TiltSkipped;
+        internal static long RotationWritten;
+        internal static long RotationSkipped;
+        internal static long AngularWritten;
+        internal static long AngularSkipped;
+        internal static long AnimatorWritten;
+        internal static long AnimatorSkipped;
 
-        internal static long TotalWritten => PositionWritten + VelocityWritten + RigidbodyWritten + BodyWritten + TiltWritten;
-        internal static long TotalSkipped => PositionSkipped + VelocitySkipped + RigidbodySkipped + BodySkipped + TiltSkipped;
+        internal static long TotalWritten => PositionWritten + VelocityWritten + RigidbodyWritten + BodyWritten + TiltWritten
+                                             + RotationWritten + AngularWritten + AnimatorWritten;
+        internal static long TotalSkipped => PositionSkipped + VelocitySkipped + RigidbodySkipped + BodySkipped + TiltSkipped
+                                             + RotationSkipped + AngularSkipped + AnimatorSkipped;
 
         /// <summary>Read on every call, so the setting can be switched mid-session.</summary>
         internal static bool Active =>
@@ -147,6 +170,47 @@ namespace NetworkPerformanceSystem.Runtime {
             zdo.Set(hash, tilt);
         }
 
+        /// <summary>Replaces ZDO.SetRotation(Quaternion) in ZSyncTransform.OwnerSync.</summary>
+        internal static void SetRotation(ZDO zdo, Quaternion rotation) {
+            if (Applies(zdo)) {
+                Vector3 storedVelocity = zdo.GetVec3(ZDOVars.s_velHash, Vector3.zero);
+                if (!ShouldWriteRotation(storedVelocity, zdo.GetRotation(), rotation)) {
+                    RotationSkipped++;
+                    return;
+                }
+                RotationWritten++;
+            }
+            zdo.SetRotation(rotation);
+        }
+
+        /// <summary>Replaces the s_bodyAVelHash write in ZSyncTransform.OwnerSync - the angular half
+        /// of the unconditional per-frame rigidbody write.</summary>
+        internal static void SetRigidbodyAngularVelocity(ZDO zdo, int hash, Vector3 angularVelocity) {
+            if (Applies(zdo)) {
+                if (!DecideVelocity(zdo.GetVec3(hash, Vector3.zero), angularVelocity, out Vector3 write)) {
+                    AngularSkipped++;
+                    return;
+                }
+                AngularWritten++;
+                angularVelocity = write;
+            }
+            zdo.Set(hash, angularVelocity);
+        }
+
+        /// <summary>Replaces the ZDO write in ZSyncAnimation.SetFloat(int, float). The key is the
+        /// animator parameter's hash offset by the game's 438569, not a ZDOVars field.</summary>
+        internal static void SetAnimatorFloat(ZDO zdo, int key, float value) {
+            if (Applies(zdo)) {
+                if (!DecideScalar(zdo.GetFloat(key, float.NaN), value, out float write)) {
+                    AnimatorSkipped++;
+                    return;
+                }
+                AnimatorWritten++;
+                value = write;
+            }
+            zdo.Set(key, value);
+        }
+
         /// <summary>
         /// Whether this write is one to consider at all. Active first: it is the cheap test, and
         /// every changed write through these call sites - items and projectiles included - pays
@@ -216,6 +280,36 @@ namespace NetworkPerformanceSystem.Runtime {
             return dot < TiltDeadbandDot;
         }
 
+        /// <summary>Whether a new facing goes out: always while the stored velocity says the
+        /// creature is moving, otherwise once it has turned a degree from the stored one.</summary>
+        internal static bool ShouldWriteRotation(Vector3 storedVelocity, Quaternion stored, Quaternion current) {
+            return !IsZero(storedVelocity) || TiltChanged(stored, current);
+        }
+
+        /// <summary>
+        /// Whether a new animator float goes out, and what is written. Nothing stored yet (NaN)
+        /// always goes out. Under AnimatorSnap it is written as exactly zero, and skipped when
+        /// that is already what is stored, so a creature coming to a halt always lands on zero;
+        /// otherwise it has to differ from the stored value by AnimatorDeadband.
+        /// </summary>
+        internal static bool DecideScalar(float stored, float current, out float write) {
+            if (float.IsNaN(stored)) {
+                write = current;
+                return true;
+            }
+            if (current > -AnimatorSnap && current < AnimatorSnap) {
+                write = 0f;
+                return stored != 0f;
+            }
+            float delta = current - stored;
+            if (delta > -AnimatorDeadband && delta < AnimatorDeadband) {
+                write = stored;
+                return false;
+            }
+            write = current;
+            return true;
+        }
+
         private static bool IsZero(Vector3 v) {
             return v.x == 0f && v.y == 0f && v.z == 0f;
         }
@@ -231,6 +325,12 @@ namespace NetworkPerformanceSystem.Runtime {
             BodySkipped = 0;
             TiltWritten = 0;
             TiltSkipped = 0;
+            RotationWritten = 0;
+            RotationSkipped = 0;
+            AngularWritten = 0;
+            AngularSkipped = 0;
+            AnimatorWritten = 0;
+            AnimatorSkipped = 0;
         }
     }
 }

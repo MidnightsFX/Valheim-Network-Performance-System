@@ -18,7 +18,8 @@ namespace NetworkPerformanceSystem.Patches {
     ///     above has already taken it, so this one only ever acts on what the host itself sent.
     ///     It runs ahead of the relay filter's prefix on the same method and both honour
     ///     __runOriginal, so a request is delivered by exactly one of them.
-    ///   * ZDOMan.Update (postfix) - flushes held forwards after that frame's ZDO sends.
+    ///   * ZDOMan.Update (postfix) - flushes held forwards after that frame's ZDO sends, and
+    ///     hands back the items of any that can no longer be delivered.
     /// </summary>
     [HarmonyPatch]
     internal static class RpcOwnerRouterPatches {

@@ -109,6 +109,8 @@ namespace NetworkPerformanceSystem {
         // M27/M28 - creatures that are not doing anything cost less on the wire
         public static ConfigEntry<bool> QuietIdleCreatures;
         public static ConfigEntry<bool> PaceCreatureSends;
+        // M29 - creatures that are fighting go out first on a full uplink
+        public static ConfigEntry<bool> SendFightingCreaturesFirst;
 
         // M8 - Steam transport configuration
         public static ConfigEntry<bool> EnableSteamTransportTuning;
@@ -249,9 +251,9 @@ namespace NetworkPerformanceSystem {
             EnableSendWindowSizing = BindServerConfig("Send Window", "Enable BDP Window Sizing", true,
                 "Size each peer's in-flight ZDO window from their measured round-trip time and the rate Steam sends to them at. Low-latency peers are unaffected; high-latency peers stop being throttled by their distance.");
             SendWindowBdpFactor = BindServerConfig("Send Window", "BDP Factor", 1.25f,
-                "Multiplier on the bandwidth-delay 1.0 allows exactly one round-trip of data in flight at Steam's send rate.", false, 1f, 3f);
+                "Multiplier on the round-trip part of the window. 1.0 allows exactly one round trip of data in flight at Steam's send rate, on top of the one send interval of data every window carries so the link stays busy until the next send.", false, 1f, 3f);
             SendWindowMaxBytes = BindServerConfig("Send Window", "Max Window Bytes", 65536,
-                "Upper bound on the send window. A player needs send rate x round-trip time x BDP Factor to receive at the full rate: at the default 150 KB/s this cap covers about 340ms of ping. Raise it together with Steam Transport's Send Rate KBps.", true, 10240, 262144);
+                "Upper bound on the send window. A player needs send rate x (round-trip time x BDP Factor + Send Interval Seconds) to receive at the full rate: at the default 150 KB/s this cap covers about 300ms of ping. Raise it together with Steam Transport's Send Rate KBps.", true, 10240, 262144);
 
             // Scheduler
             EnableSchedulerFix = BindServerConfig("Send Scheduler", "Enable Scheduler Fix", true,
@@ -319,7 +321,7 @@ namespace NetworkPerformanceSystem {
             LimitTargetedRelayByDistance = BindServerConfig("Routed RPC", "Limit Relay By Distance", true,
                 "Also stop relaying object RPCs (building damage and fragments, ward flashes, animation triggers, footsteps) to players who are too far away to have that object loaded, even if they visited it earlier in the session.");
             EnableStationRpcRouting = BindServerConfig("Routed RPC", "Route Station Requests To Owner", true,
-                "Deliver fermenter, smelter, cooking station, fireplace, shield generator and ballista item requests (add item / ore / fuel / ammo, tap, empty) to whoever owns the object right now. Prevents RPCs being dropped and items being eaten.");
+                "Deliver fermenter, smelter, cooking station, fireplace, shield generator and ballista item requests (add item / ore / fuel / ammo, tap, empty) to whoever owns the object right now. Prevents RPCs being dropped and items being eaten. An ore, fuel, food or ammo item that still cannot be delivered is dropped at the station instead of being lost.");
             EnableCreatureHitRouting = BindServerConfig("Routed RPC", "Route Creature Hits To Owner", true,
                 "Deliver hits on creatures to whoever is simulating the creature right now, prevents silently dropping hits.");
 
@@ -332,9 +334,11 @@ namespace NetworkPerformanceSystem {
 
             // Creature updates
             QuietIdleCreatures = BindServerConfig("Creature Updates", "Quiet Idle Creatures", true,
-                "A creature standing still stops sending itself for movements too small to see - under 2 cm, 0.05 m/s, or 1 degree of tilt. Without this, the physics engine's constant tiny wobble makes whoever simulates a creature re-send all of it up to 30 times a second, and the server passes each copy on to everyone nearby; a pen of tamed animals can fill a player's upload. Fighting creatures are not affected. Runs on each player's game that has this mod, using the server's setting.");
+                "A creature standing still stops sending itself for movements too small to see - under 2 cm, 0.05 m/s, or 1 degree of tilt or turn - and for animation speed changes under 0.05. Without this, the physics engine's constant tiny wobble makes whoever simulates a creature re-send all of it up to 30 times a second, and the server passes each copy on to everyone nearby; a pen of tamed animals can fill a player's upload. Fighting creatures are not affected. Runs on each player's game that has this mod, using the server's setting.");
             PaceCreatureSends = BindServerConfig("Creature Updates", "Pace Creature Sends", true,
                 "Server side. Send a creature that has settled down to each player at most 10 times a second (5 beyond 32 m), and one moving more than 64 m away at most 15 times a second, instead of on every update. Creatures that are fighting, hunting, being ridden or changing owner still go out at once. Also covers players who do not have this mod.");
+            SendFightingCreaturesFirst = BindServerConfig("Creature Updates", "Send Fighting Creatures First", true,
+                "When a player's upload is full, send the creatures they are simulating that are alert or chasing someone ahead of everything else they have changed, right after players and ships. Without this they wait their turn behind every fire, smelter and dropped item that player also simulates, and freeze for everyone else for a second or more. Changes only the order, never what is sent. Runs on each player's game that has this mod, using the server's setting.");
 
             // Steam Socket
             EnableSteamTransportTuning = BindServerConfig("Steam Transport", "Enable Transport Tuning", true,

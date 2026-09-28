@@ -141,7 +141,11 @@ namespace NetworkPerformanceSystem.Runtime {
         private static long _quietRigidbodyAtReport;
         private static long _quietBodyAtReport;
         private static long _quietTiltAtReport;
+        private static long _quietRotationAtReport;
+        private static long _quietAngularAtReport;
+        private static long _quietAnimatorAtReport;
         private static long _quietSkippedAtReport;
+        private static long _fightingMovedAtReport;
 
         internal static void OnStarted() {
             Monitoring.EmitClient(Monitoring.Line.Begin("c_session")
@@ -155,6 +159,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Num("compStrength", ValConfig.LatencyCompensationStrength.Value, "0.##")
                 .End());
             MarkQuietTotals();
+            TrafficNames.ReportAllAgain();
         }
 
         // -- hooks -------------------------------------------------------------------------
@@ -366,6 +371,7 @@ namespace NetworkPerformanceSystem.Runtime {
             if (now - _lastSelfReportMs >= SelfReportMs) {
                 _lastSelfReportMs = now;
                 ReportSelf(now);
+                TrafficNames.ReportLearned(now);
             }
 
             if (now - _lastSnapWindowMs >= SnapWindowMs) {
@@ -619,7 +625,14 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Int("qpRb", Window(QuietCreatures.RigidbodyWritten, _quietRigidbodyAtReport))
                 .Int("qpBody", Window(QuietCreatures.BodyWritten, _quietBodyAtReport))
                 .Int("qpTilt", Window(QuietCreatures.TiltWritten, _quietTiltAtReport))
+                .Int("qpRot", Window(QuietCreatures.RotationWritten, _quietRotationAtReport))
+                .Int("qpAVel", Window(QuietCreatures.AngularWritten, _quietAngularAtReport))
+                .Int("qpAnim", Window(QuietCreatures.AnimatorWritten, _quietAnimatorAtReport))
                 .Int("qSkip", Window(QuietCreatures.TotalSkipped, _quietSkippedAtReport));
+
+            // How many of this machine's fighting creatures FightingCreaturesFirst moved ahead of
+            // something else in its uploads this window: non-zero means the order was contested.
+            line.Int("ffMoved", Window(FightingCreaturesFirst.CreaturesMoved, _fightingMovedAtReport));
 
             Monitoring.EmitClient(line.End());
 
@@ -643,7 +656,11 @@ namespace NetworkPerformanceSystem.Runtime {
             _quietRigidbodyAtReport = QuietCreatures.RigidbodyWritten;
             _quietBodyAtReport = QuietCreatures.BodyWritten;
             _quietTiltAtReport = QuietCreatures.TiltWritten;
+            _quietRotationAtReport = QuietCreatures.RotationWritten;
+            _quietAngularAtReport = QuietCreatures.AngularWritten;
+            _quietAnimatorAtReport = QuietCreatures.AnimatorWritten;
             _quietSkippedAtReport = QuietCreatures.TotalSkipped;
+            _fightingMovedAtReport = FightingCreaturesFirst.CreaturesMoved;
         }
 
         internal static void Reset() {

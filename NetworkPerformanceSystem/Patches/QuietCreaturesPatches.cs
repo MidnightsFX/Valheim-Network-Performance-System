@@ -10,14 +10,17 @@ namespace NetworkPerformanceSystem.Patches {
     /// <summary>
     /// M27 - wiring for QuietCreatures. See it for why; this file is only the hooks.
     ///
-    /// Six of the game's own ZDO writes are pointed at QuietCreatures instead, each by swapping
+    /// Nine of the game's own ZDO writes are pointed at QuietCreatures instead, each by swapping
     /// the one call instruction for a static call that takes exactly what it took off the stack:
     ///
     ///     ZSyncTransform.OwnerSync   zDO.SetPosition(position)                    -> SetPosition
     ///                                zDO.Set(ZDOVars.s_velHash, velocity)         -> SetTransformVelocity
+    ///                                zDO.SetRotation(rotation)                    -> SetRotation
     ///                                GetZDO().Set(ZDOVars.s_bodyVelHash, ...)     -> SetRigidbodyVelocity
+    ///                                GetZDO().Set(ZDOVars.s_bodyAVelHash, ...)    -> SetRigidbodyAngularVelocity
     ///     Character.SyncVelocity     GetZDO().Set(ZDOVars.s_bodyVelocity, ...)    -> SetBodyVelocity
     ///     Character.UpdateGroundTilt GetZDO().Set(ZDOVars.s_tiltrot, rotation)    -> SetTilt (both sites)
+    ///     ZSyncAnimation.SetFloat    GetZDO().Set(438569 + hash, value)           -> SetAnimatorFloat
     ///
     /// Call sites rather than a prefix on ZDO.Set: that would put a test in front of every Vector3
     /// and Quaternion write in the game, with no way to know which of them it was looking at. The
@@ -27,15 +30,17 @@ namespace NetworkPerformanceSystem.Patches {
     /// Anchored on shape, not position: a ZDO call of the right name and parameter types, keyed by
     /// the ZDOVars field loaded just before it. OwnerSync writes s_velHash twice - once for the
     /// transform, once for the relative velocity of a parented object - and the transform one is
-    /// the first within a few instructions of the SetPosition. The client and dedicated-server
-    /// builds of the game compile all three methods identically. Anything else stands the
-    /// mechanism down with what was found, and the methods are left untouched.
+    /// the first within a few instructions of the SetPosition. SetFloat's write has no ZDOVars key
+    /// (the key is computed), and is the only ZDO.Set(int, float) in that method. The client and
+    /// dedicated-server builds of the game compile all four methods identically. Anything else
+    /// stands the mechanism down with what was found, and the methods are left untouched.
     /// </summary>
     [HarmonyPatch]
     internal static class QuietCreaturesPatches {
 
         private const string SetName = "Set";
         private const string SetPositionName = "SetPosition";
+        private const string SetRotationName = "SetRotation";
 
         /// <summary>How far back from a Set call its key may be loaded. Two instructions for a
         /// local value, four for a value read off a field of a field (m_body.linearVelocity).</summary>
@@ -50,12 +55,20 @@ namespace NetworkPerformanceSystem.Patches {
         internal struct OwnerSyncSites {
             internal int Position;
             internal int Velocity;
+            internal int Rotation;
             internal int RigidbodyVelocity;
+            internal int RigidbodyAngularVelocity;
+        }
+
+        /// <summary>The animator float overload, SetFloat(int, float). Its (string, float) sibling
+        /// only hashes the name and calls this one.</summary>
+        private static MethodInfo AnimatorSetFloat() {
+            return AccessTools.Method(typeof(ZSyncAnimation), "SetFloat", new[] { typeof(int), typeof(float) });
         }
 
         /// <summary>
-        /// Checks all three methods before Harmony touches any of them, so a shape change in one
-        /// never leaves the other two rewritten on their own. Each transpiler still checks again:
+        /// Checks all four methods before Harmony touches any of them, so a shape change in one
+        /// never leaves the others rewritten on their own. Each transpiler still checks again:
         /// another mod's transpiler may reach the method first and change what it sees.
         /// </summary>
         [HarmonyPrepare]
@@ -63,9 +76,10 @@ namespace NetworkPerformanceSystem.Patches {
             MethodInfo ownerSync = AccessTools.Method(typeof(ZSyncTransform), "OwnerSync");
             MethodInfo syncVelocity = AccessTools.Method(typeof(Character), "SyncVelocity");
             MethodInfo groundTilt = AccessTools.Method(typeof(Character), "UpdateGroundTilt");
-            if (ownerSync == null || syncVelocity == null || groundTilt == null) {
+            MethodInfo setFloat = AnimatorSetFloat();
+            if (ownerSync == null || syncVelocity == null || groundTilt == null || setFloat == null) {
                 PatchGuard.Disable(Mechanism.QuietCreatures,
-                    "ZSyncTransform.OwnerSync, Character.SyncVelocity or Character.UpdateGroundTilt was not found. " +
+                    "ZSyncTransform.OwnerSync, Character.SyncVelocity, Character.UpdateGroundTilt or ZSyncAnimation.SetFloat was not found. " +
                     "Either the game updated or another mod replaced it. Idle creatures keep re-sending themselves, as vanilla.");
                 return false;
             }
@@ -73,7 +87,8 @@ namespace NetworkPerformanceSystem.Patches {
             string miss;
             if (!TryFindOwnerSyncSites(PatchProcessor.GetOriginalInstructions(ownerSync), out _, out miss)
                 || !TryFindKeyedSets(PatchProcessor.GetOriginalInstructions(syncVelocity), typeof(Vector3), nameof(ZDOVars.s_bodyVelocity), 1, out _, out miss)
-                || !TryFindKeyedSets(PatchProcessor.GetOriginalInstructions(groundTilt), typeof(Quaternion), nameof(ZDOVars.s_tiltrot), ExpectedTiltSites, out _, out miss)) {
+                || !TryFindKeyedSets(PatchProcessor.GetOriginalInstructions(groundTilt), typeof(Quaternion), nameof(ZDOVars.s_tiltrot), ExpectedTiltSites, out _, out miss)
+                || !TryFindAnimatorFloatSite(PatchProcessor.GetOriginalInstructions(setFloat), out _, out miss)) {
                 PatchGuard.Disable(Mechanism.QuietCreatures,
                     $"The game's creature sync methods do not have the expected shape ({miss}). Either the game updated " +
                     "or another mod rewrote them. Idle creatures keep re-sending themselves, as vanilla.");
@@ -93,8 +108,24 @@ namespace NetworkPerformanceSystem.Patches {
 
             Replace(codes, sites.Position, nameof(QuietCreatures.SetPosition));
             Replace(codes, sites.Velocity, nameof(QuietCreatures.SetTransformVelocity));
+            Replace(codes, sites.Rotation, nameof(QuietCreatures.SetRotation));
             Replace(codes, sites.RigidbodyVelocity, nameof(QuietCreatures.SetRigidbodyVelocity));
-            Logger.LogInfo("Idle creature updates: 3 sites rewritten in ZSyncTransform.OwnerSync.");
+            Replace(codes, sites.RigidbodyAngularVelocity, nameof(QuietCreatures.SetRigidbodyAngularVelocity));
+            Logger.LogInfo("Idle creature updates: 5 sites rewritten in ZSyncTransform.OwnerSync.");
+            return codes;
+        }
+
+        [HarmonyPatch(typeof(ZSyncAnimation), "SetFloat", new[] { typeof(int), typeof(float) })]
+        [HarmonyTranspiler]
+        private static IEnumerable<CodeInstruction> QuietAnimatorFloat(IEnumerable<CodeInstruction> instructions) {
+            List<CodeInstruction> codes = new List<CodeInstruction>(instructions);
+            if (!TryFindAnimatorFloatSite(codes, out int site, out string miss)) {
+                StandDown("ZSyncAnimation.SetFloat", miss, codes);
+                return codes;
+            }
+
+            Replace(codes, site, nameof(QuietCreatures.SetAnimatorFloat));
+            Logger.LogInfo("Idle creature updates: 1 site rewritten in ZSyncAnimation.SetFloat.");
             return codes;
         }
 
@@ -143,22 +174,12 @@ namespace NetworkPerformanceSystem.Patches {
 
         // -- anchors: internal so the offline harness can run them against both builds ------
 
-        /// <summary>The three OwnerSync writes, or which one is missing.</summary>
+        /// <summary>The five OwnerSync writes, or which one is missing.</summary>
         internal static bool TryFindOwnerSyncSites(List<CodeInstruction> codes, out OwnerSyncSites sites, out string miss) {
             sites = default;
 
-            int position = -1;
-            int positions = 0;
-            for (int i = 0; i < codes.Count; i++) {
-                if (IsZdoCall(codes[i], SetPositionName, typeof(Vector3))) {
-                    if (position < 0) { position = i; }
-                    positions++;
-                }
-            }
-            if (positions != 1) {
-                miss = $"{positions} ZDO.SetPosition calls in OwnerSync, expected 1";
-                return false;
-            }
+            if (!TryFindOnlyCall(codes, SetPositionName, typeof(Vector3), out int position, out miss)) { return false; }
+            if (!TryFindOnlyCall(codes, SetRotationName, typeof(Quaternion), out int rotation, out miss)) { return false; }
 
             int velocity = -1;
             for (int i = position + 1; i < codes.Count && i <= position + MaxVelocityAfterPosition; i++) {
@@ -175,8 +196,49 @@ namespace NetworkPerformanceSystem.Patches {
             if (!TryFindKeyedSets(codes, typeof(Vector3), nameof(ZDOVars.s_bodyVelHash), 1, out List<int> body, out miss)) {
                 return false;
             }
+            if (!TryFindKeyedSets(codes, typeof(Vector3), nameof(ZDOVars.s_bodyAVelHash), 1, out List<int> angular, out miss)) {
+                return false;
+            }
 
-            sites = new OwnerSyncSites { Position = position, Velocity = velocity, RigidbodyVelocity = body[0] };
+            sites = new OwnerSyncSites {
+                Position = position,
+                Velocity = velocity,
+                Rotation = rotation,
+                RigidbodyVelocity = body[0],
+                RigidbodyAngularVelocity = angular[0],
+            };
+            miss = null;
+            return true;
+        }
+
+        /// <summary>The one ZDO.Set(int, float) in ZSyncAnimation.SetFloat(int, float).</summary>
+        internal static bool TryFindAnimatorFloatSite(List<CodeInstruction> codes, out int site, out string miss) {
+            return TryFindOnlyCall(codes, SetName, typeof(int), typeof(float), out site, out miss);
+        }
+
+        /// <summary>The single ZDO call of this name and signature, which must be exactly one.</summary>
+        private static bool TryFindOnlyCall(List<CodeInstruction> codes, string name, System.Type parameter, out int site, out string miss) {
+            return TryFindOnlyCall(codes, name, new[] { parameter }, out site, out miss);
+        }
+
+        private static bool TryFindOnlyCall(List<CodeInstruction> codes, string name, System.Type first, System.Type second, out int site, out string miss) {
+            return TryFindOnlyCall(codes, name, new[] { first, second }, out site, out miss);
+        }
+
+        private static bool TryFindOnlyCall(List<CodeInstruction> codes, string name, System.Type[] parameters, out int site, out string miss) {
+            site = -1;
+            int found = 0;
+            for (int i = 0; i < codes.Count; i++) {
+                if (IsZdoCall(codes[i], name, parameters)) {
+                    if (site < 0) { site = i; }
+                    found++;
+                }
+            }
+            if (found != 1) {
+                miss = $"{found} ZDO.{name}({string.Join(", ", System.Array.ConvertAll(parameters, p => p.Name))}) calls, expected 1";
+                site = -1;
+                return false;
+            }
             miss = null;
             return true;
         }

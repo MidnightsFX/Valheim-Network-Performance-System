@@ -19,7 +19,7 @@ NPS addresses these issues in a number of ways
 	- This higher ping players with decent bandwidth allow the server to send more aggressively to these players in compensation
 	- Object ownership can be dynamically adjusted around players with poor connections to provide the best experience for all players in the area
 - Objects which need network calls to interact with get ownership transferred ahead of time, delay scenarios much less likely
-- Objects that change ownership during active requests get their requests properly re-targeted against the new owner
+- Objects that change ownership during active requests get their requests properly re-targeted against the new owner, and an item that still cannot be delivered is dropped at the station instead of lost
 - Objects which are locally important (footsteps for example) are only network broadcast locally, instead of globally around the server
 - Server Garbage collection churn is significantly reduced compared to vanilla
 
@@ -77,10 +77,12 @@ can record what the network was doing so it can be diagnosed rather than guessed
 
 **What is recorded:** each time a creature changes owner and whether the change held, messages
 delivered to a player who no longer owned the target, how regularly each player's creatures report
-in, and each player's ping, connection quality, and how much the server sends to and receives from
-them once a second. Clients that have the mod add what only they can see: what a creature was doing
-when it changed hands, who it was fighting, how far it jumped on screen, what killed each creature
-they were simulating, how often the creatures they simulate change, and frame rate. That costs each client up to 2 KB per second of upload,
+in, each player's ping, connection quality, and how much the server sends to and receives from
+them once a second, and what that traffic is made of: which of the game's messages, which mods'
+messages (by the name the mod gives them), and which kinds of objects. Clients that have the mod add
+what only they can see: what a creature was doing when it changed hands, who it was fighting, how
+far it jumped on screen, what killed each creature they were simulating, how often the creatures
+they simulate change, frame rate, and the names of the messages their game sends. That costs each client up to 2 KB per second of upload,
 sent in small batches that are held back whenever the connection is busy with the game's own
 traffic, so recording never delays it.
 

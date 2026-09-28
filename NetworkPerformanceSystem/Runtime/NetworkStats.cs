@@ -218,6 +218,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendScheduler(sb);
             AppendSyncListCache(sb);
             AppendQuietCreatures(sb);
+            AppendFightingCreaturesFirst(sb);
             AppendCreaturePacing(sb);
             AppendRoutedRpc(sb);
             AppendOwnerRpc(sb);
@@ -835,15 +836,37 @@ namespace NetworkPerformanceSystem.Runtime {
                 return;
             }
             if (!ValConfig.QuietIdleCreatures.Value) {
-                sb.AppendLine("  off (every change to a creature's position, velocity or tilt is sent, however small)");
+                sb.AppendLine("  off (every change to a creature's position, velocity, facing, tilt or animation is sent, however small)");
                 return;
             }
 
             AppendWrittenRow(sb, "position", QuietCreatures.PositionWritten, QuietCreatures.PositionSkipped);
             AppendWrittenRow(sb, "velocity", QuietCreatures.VelocityWritten, QuietCreatures.VelocitySkipped);
+            AppendWrittenRow(sb, "facing", QuietCreatures.RotationWritten, QuietCreatures.RotationSkipped);
             AppendWrittenRow(sb, "body (rb)", QuietCreatures.RigidbodyWritten, QuietCreatures.RigidbodySkipped);
+            AppendWrittenRow(sb, "spin (rb)", QuietCreatures.AngularWritten, QuietCreatures.AngularSkipped);
             AppendWrittenRow(sb, "body vel", QuietCreatures.BodyWritten, QuietCreatures.BodySkipped);
             AppendWrittenRow(sb, "tilt", QuietCreatures.TiltWritten, QuietCreatures.TiltSkipped);
+            AppendWrittenRow(sb, "animation", QuietCreatures.AnimatorWritten, QuietCreatures.AnimatorSkipped);
+        }
+
+        /// <summary>What M29 changed in this machine's own uploads. Every role: whoever simulates a
+        /// fighting creature is the one uploading it.</summary>
+        private static void AppendFightingCreaturesFirst(StringBuilder sb) {
+            if (NpsEnv.IsHost()) { return; }                                  // the host's lists are not reordered
+
+            sb.AppendLine();
+            sb.AppendLine("Fighting creatures first (this game's uploads, since start):");
+            string reason = PatchGuard.GetDisableReason(Mechanism.FightingCreaturesFirst);
+            if (reason != null) {
+                sb.AppendLine($"  stood down: {reason}");
+                return;
+            }
+            if (!ValConfig.SendFightingCreaturesFirst.Value) {
+                sb.AppendLine("  off (creatures you are fighting queue behind everything else you have changed)");
+                return;
+            }
+            sb.AppendLine($"  moved forward    {FightingCreaturesFirst.CreaturesMoved} creature updates, in {FightingCreaturesFirst.ListsReordered} sends");
         }
 
         private static void AppendWrittenRow(StringBuilder sb, string label, long written, long skipped) {
@@ -966,7 +989,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine($"  {Pad("seen", 13)} {s.Seen} owner-addressed requests (add item/ore/fuel/ammo, tap, empty)");
                 sb.AppendLine($"  {Pad("re-targeted", 13)} {s.Retargeted} (sender named a stale owner - delivered to the current one)");
                 sb.AppendLine($"  {Pad("claimed", 13)} {s.Claimed} (no present owner - handed to the requesting player first)");
-                AppendHoldLines(sb, s);
+                AppendHoldLines(sb, s, items: true);
             }
 
             // Hits are the same machinery with a looser idea of "still there" and of who may take
@@ -981,7 +1004,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine($"  {Pad("seen", 13)} {c.Seen} hits on creatures sent through the server");
                 sb.AppendLine($"  {Pad("re-targeted", 13)} {c.Retargeted} (attacker's copy named a stale owner, or nobody - delivered to the one simulating it)");
                 sb.AppendLine($"  {Pad("claimed", 13)} {c.Claimed} (nobody was simulating it - handed to the attacker first)");
-                AppendHoldLines(sb, c);
+                AppendHoldLines(sb, c, items: false);
             }
 
             if (RpcOwnerRouter.Waiting > 0) {
@@ -989,10 +1012,19 @@ namespace NetworkPerformanceSystem.Runtime {
             }
         }
 
-        private static void AppendHoldLines(StringBuilder sb, RpcOwnerRouter.Counters counters) {
+        /// <summary>The waiting and its outcomes. Station requests can carry an item, which is
+        /// handed back rather than lost when it cannot be delivered, so they have two more lines.</summary>
+        private static void AppendHoldLines(StringBuilder sb, RpcOwnerRouter.Counters counters, bool items) {
             sb.AppendLine($"  {Pad("held", 13)} {counters.HeldCount} (waited for the owner to be sent its ownership; longest {counters.MaxHoldMs:F0}ms)");
-            sb.AppendLine($"  {Pad("expired", 13)} {counters.Expired} (owner not synced within {RpcOwnerRouter.HoldTimeoutSeconds:F0}s - forwarded regardless)");
-            sb.AppendLine($"  {Pad("dropped", 13)} {counters.Dropped} (object or player gone while waiting)");
+            if (items) {
+                sb.AppendLine($"  {Pad("parked", 13)} {counters.Parked} (item request with nobody at the station yet - waited for someone to arrive)");
+                sb.AppendLine($"  {Pad("expired", 13)} {counters.Expired} (not deliverable within {RpcOwnerRouter.HoldTimeoutSeconds:F0}s - an item is handed back, anything else forwarded regardless)");
+                sb.AppendLine($"  {Pad("handed back", 13)} {counters.Refunded} (item could not be delivered - dropped at the station instead of lost)");
+                sb.AppendLine($"  {Pad("dropped", 13)} {counters.Dropped} (object or player gone while waiting, and no item to hand back)");
+            } else {
+                sb.AppendLine($"  {Pad("expired", 13)} {counters.Expired} (owner not synced within {RpcOwnerRouter.HoldTimeoutSeconds:F0}s - forwarded regardless)");
+                sb.AppendLine($"  {Pad("dropped", 13)} {counters.Dropped} (object or player gone while waiting)");
+            }
         }
 
         /// <summary>
@@ -1152,10 +1184,32 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine($"  {Pad("ownership", 15)} {Monitoring.HandoffsRecorded} owner changes of simulated objects, {Monitoring.DragBacksRecorded} undone by the previous owner's packet");
                 sb.AppendLine($"  {Pad("misaddressed", 15)} {Monitoring.MisroutedRpcs} creature messages sent to a machine that did not own the target");
                 sb.AppendLine($"  {Pad("client batches", 15)} {MonitoringUpload.BatchesAccepted} accepted, {MonitoringUpload.BatchesRejected} rejected, {MonitoringUpload.LinesRejected} lines rejected");
+                AppendTraffic(sb);
             } else {
                 sb.AppendLine("  on - sending this game's records to the server");
                 sb.AppendLine($"  {Pad("dropped here", 15)} {MonitoringUpload.LocalRecordsDropped} (over the server's upload budget)");
                 sb.AppendLine($"  {Pad("held for link", 15)} {MonitoringUpload.SendsDeferredForLink} sends waited because the connection was already near its send window");
+            }
+        }
+
+        /// <summary>What each player's connection carried in the last traffic window, by message:
+        /// the connection's methods, with the heaviest prefabs inside ZDOData and the heaviest
+        /// routed methods inside RoutedRPC. Game bytes, before Steam's framing and resends.</summary>
+        private static void AppendTraffic(StringBuilder sb) {
+            List<ZNetPeer> peers = ZNet.instance.GetPeers();
+            bool any = false;
+            for (int i = 0; i < peers.Count; i++) {
+                if (!TrafficLedger.TryGetSummary(peers[i].m_uid, out string received, out string sent)) { continue; }
+                if (!any) {
+                    sb.AppendLine($"  {Pad("traffic", 15)} last window, KB/s of game messages (before Steam's framing):");
+                    any = true;
+                }
+                string name = string.IsNullOrEmpty(peers[i].m_playerName) ? peers[i].m_uid.ToString() : peers[i].m_playerName;
+                sb.AppendLine($"    {Pad(name, 20)} from {received ?? "nothing"}");
+                sb.AppendLine($"    {Pad("", 20)} to   {sent ?? "nothing"}");
+            }
+            if (!any) {
+                sb.AppendLine($"  {Pad("traffic", 15)} first window still filling ({TrafficLedger.ReportIntervalMs(peers.Count) / 1000d:F0}s)");
             }
         }
 

@@ -1,5 +1,17 @@
 # Changelog
 
+**1.11.0**
+- Improved send/recieve rate management
+- When a player's upload is full, the creatures they are fighting now go out ahead of everything else they are simulating, right after players and ships.
+- Quiet Idle Creatures now also skips a standing creature's turns of under a degree.
+- Network monitoring now records what each player's connection carries, message by message, in both directions: the game's own messages, each mod's messages by name, and the kinds of objects in world updates. While monitoring is on, `nps_stats` shows the latest totals for each player.
+	- This allows diagnosing noisy mods, or mods that flood the connection stream
+- Ore, fuel, food and ammo put into a station are no longer lost when the server cannot deliver them to the station's owner. The item is dropped at the station instead, for the player to pick up and put in again.
+	- A request made the moment a player reaches a station, before the server has seen them arrive, now waits up to 3 seconds for them and goes in as normal.
+	- Covers smelters and everything built like them (kiln, blast furnace, windmill, spinning wheel, eitr refinery), fermenters, cooking stations and ovens, fires and torches, and ballistas. A shield generator's fuel is covered when it takes only one kind.
+	- Server-side, and works for players without the mod. `nps_stats` gains "parked" and "handed back" lines in the "Station requests" block.
+- A cooking station item added by another mod without taking the station first is no longer put in twice.
+
 **1.10.0**
 - Pets following a player, and creatures summoned with a staff, now stay on that player's machine instead of being moved to whoever has the lowest ping. New `Ownership` setting **Followers Stay With Their Player** (default on).
 - Players on the same local network as the server now have their ping measured. Steam reports them at 0 ms, which was read as "no measurement", so they were treated as 150 ms and kept losing creatures to players further away.

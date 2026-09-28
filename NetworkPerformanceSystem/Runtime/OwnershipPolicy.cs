@@ -319,7 +319,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
         /// <summary>
         /// Does this prefab carry one of the components whose interaction is owner-addressed?
-        /// Answered from the prefab rather than the name, the same way RpcOwnerRouter.IsStation
+        /// Answered from the prefab rather than the name, the same way RpcOwnerRouter.Station
         /// is, so content mods that build on the vanilla components are covered.
         ///
         /// WearNTear - and Piece, which it always accompanies - excludes the prefab outright, and

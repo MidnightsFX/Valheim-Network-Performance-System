@@ -111,7 +111,7 @@ namespace NetworkPerformanceSystem.Patches {
             Replace(codes, sites.Rotation, nameof(QuietCreatures.SetRotation));
             Replace(codes, sites.RigidbodyVelocity, nameof(QuietCreatures.SetRigidbodyVelocity));
             Replace(codes, sites.RigidbodyAngularVelocity, nameof(QuietCreatures.SetRigidbodyAngularVelocity));
-            Logger.LogInfo("Idle creature updates: 5 sites rewritten in ZSyncTransform.OwnerSync.");
+            IlMatch.LogOnce("Idle creature updates: 5 sites rewritten in ZSyncTransform.OwnerSync.");
             return codes;
         }
 
@@ -125,7 +125,7 @@ namespace NetworkPerformanceSystem.Patches {
             }
 
             Replace(codes, site, nameof(QuietCreatures.SetAnimatorFloat));
-            Logger.LogInfo("Idle creature updates: 1 site rewritten in ZSyncAnimation.SetFloat.");
+            IlMatch.LogOnce("Idle creature updates: 1 site rewritten in ZSyncAnimation.SetFloat.");
             return codes;
         }
 
@@ -139,7 +139,7 @@ namespace NetworkPerformanceSystem.Patches {
             }
 
             Replace(codes, sites[0], nameof(QuietCreatures.SetBodyVelocity));
-            Logger.LogInfo("Idle creature updates: 1 site rewritten in Character.SyncVelocity.");
+            IlMatch.LogOnce("Idle creature updates: 1 site rewritten in Character.SyncVelocity.");
             return codes;
         }
 
@@ -153,7 +153,7 @@ namespace NetworkPerformanceSystem.Patches {
             }
 
             for (int i = 0; i < sites.Count; i++) { Replace(codes, sites[i], nameof(QuietCreatures.SetTilt)); }
-            Logger.LogInfo($"Idle creature updates: {sites.Count} sites rewritten in Character.UpdateGroundTilt.");
+            IlMatch.LogOnce($"Idle creature updates: {sites.Count} sites rewritten in Character.UpdateGroundTilt.");
             return codes;
         }
 

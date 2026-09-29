@@ -69,7 +69,7 @@ namespace NetworkPerformanceSystem.Patches {
                 rewritten++;
             }
 
-            Logger.LogInfo($"Send package reuse active ({rewritten} sites rewritten in ZDOMan.SendZDOs).");
+            IlMatch.LogOnce($"Send package reuse active ({rewritten} sites rewritten in ZDOMan.SendZDOs).");
             return codes;
         }
     }

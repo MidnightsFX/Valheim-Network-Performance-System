@@ -35,6 +35,13 @@ namespace NetworkPerformanceSystem.Patches {
     /// game update, or another mod having rewritten the block first - stands the guard down and
     /// leaves the method untouched.
     ///
+    /// That is also why the transpiler runs last. Other mods anchor on the same vanilla calls -
+    /// ZenMap matches <c>callvirt ZDO::Deserialize</c> to index every ZDO it receives - and
+    /// after ours has turned those calls into guard calls their matchers find nothing and
+    /// throw, which aborts that mod's whole PatchAll. Run after them, they see vanilla IL, and
+    /// what they insert next to these calls is within the gaps the anchors allow; if one of
+    /// them rewrites the block itself, it is the guard that stands down, with a warning.
+    ///
     /// The prefix and postfix bracket each call, arming the guard only on the host; a client
     /// applies the host's updates in full, as it must.
     /// </summary>
@@ -71,8 +78,14 @@ namespace NetworkPerformanceSystem.Patches {
             return true;
         }
 
+        /// <summary>ZenMap's Harmony ID. Its RPC_ZDOData transpiler is already at Priority.Last,
+        /// where a tie goes to whichever patched first - us - so it is named explicitly.</summary>
+        private const string ZenMapHarmonyId = "ZenDragon.ZenMap";
+
         [HarmonyPatch(typeof(ZDOMan), "RPC_ZDOData")]
         [HarmonyTranspiler]
+        [HarmonyPriority(Priority.Last)]
+        [HarmonyAfter(ZenMapHarmonyId)]
         private static IEnumerable<CodeInstruction> GuardOwnerRevision(IEnumerable<CodeInstruction> instructions) {
             List<CodeInstruction> codes = new List<CodeInstruction>(instructions);
 
@@ -91,7 +104,7 @@ namespace NetworkPerformanceSystem.Patches {
             Replace(codes, sites.Read, nameof(OwnerRevisionGuard.RevisionHeldBySender));
             Replace(codes, sites.Deserialize, nameof(OwnerRevisionGuard.ApplyData));
 
-            Logger.LogInfo("Stale owner updates guard active (6 sites rewritten in ZDOMan.RPC_ZDOData).");
+            IlMatch.LogOnce("Stale owner updates guard active (6 sites rewritten in ZDOMan.RPC_ZDOData).");
             return codes;
         }
 

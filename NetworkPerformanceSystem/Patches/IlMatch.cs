@@ -127,5 +127,26 @@ namespace NetworkPerformanceSystem.Patches {
             replacement.blocks.AddRange(codes[index].blocks);
             codes[index] = replacement;
         }
+
+        private static readonly HashSet<string> Reported = new HashSet<string>();
+
+        /// <summary>
+        /// Logs a transpiler's outcome once per distinct message. Harmony rebuilds a method from
+        /// its original IL and re-runs every transpiler on it each time any mod adds a patch
+        /// there, so ours runs again for every later patch - ZNet.RPC_PeerInfo is the connection
+        /// handshake every ServerSync mod hooks, and M10's line came out 39 times in one startup
+        /// log. Each run rewrites fresh IL, so nothing stacks; only the line repeats. A message
+        /// that differs from one already printed (a different site count, a miss after a hit) is
+        /// new information and still goes out.
+        /// </summary>
+        internal static void LogOnce(string message) {
+            if (Reported.Add(message)) { Logger.LogInfo(message); }
+        }
+
+        /// <summary>LogOnce for the misses that warn without disabling a mechanism. The ones that
+        /// disable go through PatchGuard.Disable, which already reports once per mechanism.</summary>
+        internal static void WarnOnce(string message) {
+            if (Reported.Add(message)) { Logger.LogWarning(message); }
+        }
     }
 }

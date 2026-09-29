@@ -116,7 +116,7 @@ namespace NetworkPerformanceSystem.Patches {
             }
 
             SendQueueView.OwnReadMarked = marked == ExpectedQueueReads;
-            Logger.LogInfo($"Send window sizing active ({rewritten} sites rewritten in ZDOMan.SendZDOs" +
+            IlMatch.LogOnce($"Send window sizing active ({rewritten} sites rewritten in ZDOMan.SendZDOs" +
                            (SendQueueView.OwnReadMarked ? ", queue read marked as the mod's own)." : ")."));
             return patched;
         }

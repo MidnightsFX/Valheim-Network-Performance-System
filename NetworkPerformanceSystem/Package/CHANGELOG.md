@@ -1,5 +1,8 @@
 # Changelog
 
+**1.11.1**
+- Compatibility improvements for ZenMods
+
 **1.11.0**
 - Improved send/recieve rate management
 - When a player's upload is full, the creatures they are fighting now go out ahead of everything else they are simulating, right after players and ships.

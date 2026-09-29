@@ -66,7 +66,7 @@ namespace NetworkPerformanceSystem.Patches {
                 codes.Insert(callIndex, loadZdo);
             }
 
-            Logger.LogInfo($"Latency compensation active ({sites.Count} extrapolation sites rewritten in ZSyncTransform.SyncPosition).");
+            IlMatch.LogOnce($"Latency compensation active ({sites.Count} extrapolation sites rewritten in ZSyncTransform.SyncPosition).");
             return codes;
         }
 

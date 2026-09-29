@@ -5,7 +5,6 @@
 - Fixes tamed animals falling out of raised pens
 	- Server-side, and works for players without the mod. `nps_stats` gains an "in order" line in the Ownership block.
 
-
 **1.11.0**
 - Improved send/recieve rate management
 - When a player's upload is full, the creatures they are fighting now go out ahead of everything else they are simulating, right after players and ships.

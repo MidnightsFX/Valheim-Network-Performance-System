@@ -377,6 +377,12 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static long TotalCreaturesRescued;
         internal static long TotalCreaturesOptimised;
 
+        /// <summary>Owner changes not pushed to a player because the host had never sent them the
+        /// object: it reaches them in the game's own order instead, behind the floors and walls
+        /// around it. Counted per player, not per object. See ForceSendIfHeld.</summary>
+        internal static int LastPassFirstSendsInOrder;
+        internal static long TotalFirstSendsInOrder;
+
         /// <summary>Everything else kept the same way: owned objects in a zone nobody is present
         /// in, left with an owner who still has them loaded rather than released (Keep Objects
         /// While Loaded). Each one is a release this pass did not make, and usually the rescue it
@@ -516,6 +522,7 @@ namespace NetworkPerformanceSystem.Runtime {
             LastPassProximityRescued = 0;
             LastPassCreaturesRescued = 0;
             LastPassCreaturesKept = 0;
+            LastPassFirstSendsInOrder = 0;
             LastPassLoadedKept = 0;
             LastPassLeaderKept = 0;
             LastPassLeaderRescued = 0;
@@ -1729,6 +1736,8 @@ namespace NetworkPerformanceSystem.Runtime {
         /// and nobody; the creature hit router catches those, but only an up-to-date copy lets the
         /// new owner's AI and the other players' view start from the right place. Buildings are
         /// not pushed: a login rescues thousands of them at once and none of them is being hit.
+        /// Nor is the creature pushed to a player who has no copy of it yet - which is the new
+        /// owner at every login - or it would land before the floor under it (ForceSendIfHeld).
         /// </summary>
         private static void RescueObject(ZDO zdo, long newOwner, bool creature, SectorVerdict verdict, long oldOwner, float now) {
             Rescue(zdo, newOwner, now);
@@ -1935,9 +1944,9 @@ namespace NetworkPerformanceSystem.Runtime {
             ZDOMan zdoMan = ZDOMan.instance;
             if (zdoMan == null) { return; }
             long self = zdoMan.m_sessionID;
-            if (leader != self) { zdoMan.ForceSendZDO(leader, zdo.m_uid); }
+            if (leader != self) { ForceSendIfHeld(zdoMan, leader, zdo.m_uid); }
             if (oldOwner != 0L && oldOwner != self && oldOwner != leader && CandidateIndex.ContainsKey(oldOwner)) {
-                zdoMan.ForceSendZDO(oldOwner, zdo.m_uid);
+                ForceSendIfHeld(zdoMan, oldOwner, zdo.m_uid);
             }
         }
 
@@ -2222,6 +2231,10 @@ namespace NetworkPerformanceSystem.Runtime {
         /// A creature's old owner may not be present - it can still be simulating the creature from
         /// the outer ring of what it loads (OwnerStillLoads) - so it is passed in as alsoTo and told
         /// too. 0 when there was no old owner, or it is in the Present set anyway.
+        ///
+        /// Of those, only the ones that already hold a copy are pushed to. The rest have no stale
+        /// owner id to correct, and the object reaches them in the game's order - see
+        /// ForceSendIfHeld.
         /// </summary>
         private static void ForceSendTo(SectorVerdict sector, ZDOID id, long alsoTo) {
             ZDOMan zdoMan = ZDOMan.instance;
@@ -2233,9 +2246,37 @@ namespace NetworkPerformanceSystem.Runtime {
             for (int i = 0; i < present.Count; i++) {
                 if (present[i] == alsoTo) { alsoToSent = true; }
                 if (present[i] == self) { continue; }   // the host's own copy is authoritative already
-                zdoMan.ForceSendZDO(present[i], id);
+                ForceSendIfHeld(zdoMan, present[i], id);
             }
-            if (!alsoToSent && CandidateIndex.ContainsKey(alsoTo)) { zdoMan.ForceSendZDO(alsoTo, id); }
+            if (!alsoToSent && CandidateIndex.ContainsKey(alsoTo)) { ForceSendIfHeld(zdoMan, alsoTo, id); }
+        }
+
+        /// <summary>
+        /// Push an object to the front of one player's next send - only if the host has sent it to
+        /// them before.
+        ///
+        /// A push corrects a copy that names the wrong owner. A player with no ZDOPeer.m_zdos entry
+        /// for the object has never been sent it, so has no copy to correct and no instance to
+        /// hit. Pushing it to them anyway does harm, because AddForceSendZdos inserts at index 0,
+        /// ahead of the order ServerSendCompare gives a first delivery: Terrain, then Solid, then
+        /// the rest. Floors and walls are Solid and creatures are Default, so a pushed creature
+        /// reaches the player who now owns it before the floor it stands on. That player's physics
+        /// runs with nothing under it, and it falls. From 1.8.0 this put penned animals on the
+        /// ground below their pens at every login (issue #5): the login rescue hands them to the
+        /// arriving player, who by definition holds no copy yet. Left alone, the object arrives in
+        /// the game's order and already names its new owner, so nothing is lost by not pushing.
+        ///
+        /// This is the host, so GetPeer is exactly what ZDOMan.ForceSendZDO(long, ZDOID) does.
+        /// </summary>
+        private static void ForceSendIfHeld(ZDOMan zdoMan, long uid, ZDOID id) {
+            ZDOMan.ZDOPeer peer = zdoMan.GetPeer(uid);
+            if (peer == null) { return; }
+            if (!peer.m_zdos.ContainsKey(id)) {
+                LastPassFirstSendsInOrder++;
+                TotalFirstSendsInOrder++;
+                return;
+            }
+            peer.ForceSendZDO(id);
         }
 
         private static void PruneHoldTable(float now) {
@@ -2379,6 +2420,8 @@ namespace NetworkPerformanceSystem.Runtime {
             LastPassCreaturesKept = 0;
             TotalCreaturesRescued = 0;
             TotalCreaturesOptimised = 0;
+            LastPassFirstSendsInOrder = 0;
+            TotalFirstSendsInOrder = 0;
             _creaturesEnabled = false;
             LastPassLoadedKept = 0;
             _keepWhileLoaded = false;

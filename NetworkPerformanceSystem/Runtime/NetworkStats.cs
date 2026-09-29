@@ -1094,7 +1094,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             // Creatures first, because until 1.8.0 none of the lines around this reached one.
             if (ValConfig.OwnershipArbitrateCreatures.Value) {
-                sb.AppendLine($"  creatures   {OwnershipArbiter.LastPassCreaturesRescued} rescued, {OwnershipArbiter.LastPassCreaturesOptimised} moved (first in the queue, pushed out at once), {OwnershipArbiter.LastPassCreaturesKept} kept by an owner who has stepped away but still has them loaded");
+                sb.AppendLine($"  creatures   {OwnershipArbiter.LastPassCreaturesRescued} rescued, {OwnershipArbiter.LastPassCreaturesOptimised} moved (first in the queue, pushed out at once to players who already have them), {OwnershipArbiter.LastPassCreaturesKept} kept by an owner who has stepped away but still has them loaded");
             } else {
                 sb.AppendLine("  creatures   not arbitrated (they keep whoever loaded them first, and are released at the edge of that player's area)");
             }
@@ -1124,6 +1124,7 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             sb.AppendLine($"  static held {OwnershipArbiter.LastPassStaticHeld} (present owner is not the lowest-latency one; kept because the object does not move)");
+            sb.AppendLine($"  in order    {OwnershipArbiter.LastPassFirstSendsInOrder} owner changes not pushed to a player who had never been sent the object; it reaches them behind the floors and walls around it (since start {OwnershipArbiter.TotalFirstSendsInOrder})");
             sb.AppendLine($"  pass time   {OwnershipArbiter.LastPassMs:F1}ms");
             sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued} ({OwnershipArbiter.TotalCreaturesRescued} creatures), optimised {OwnershipArbiter.TotalOptimised} ({OwnershipArbiter.TotalCreaturesOptimised} creatures), interactive {OwnershipArbiter.TotalInteractiveOptimised}, proximity pulled {OwnershipArbiter.TotalProximityPulled} / rescued {OwnershipArbiter.TotalProximityRescued}");
 

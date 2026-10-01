@@ -37,6 +37,7 @@ namespace NetworkPerformanceSystem.Runtime {
         QuietCreatures,    // M27 - ZSyncTransform.OwnerSync / Character.SyncVelocity / Character.UpdateGroundTilt / ZSyncAnimation.SetFloat: a creature's owner skips writes too small to see
         CreaturePacing,    // M28 - ZDOMan.CreateSyncList: the host sends settled or distant creatures to each peer less often
         FightingCreaturesFirst, // M29 - ZDOMan.CreateSyncList (client): a player's alert or targeting creatures go out right after players and ships
+        StatusEffectRepeats,    // M30 - SEMan.AddStatusEffect / ZRoutedRpc.RPC_RoutedRPC: a status effect asked for on somebody else's creature goes out a few times a second, and a flood of them is named in the log
     }
 
     /// <summary>

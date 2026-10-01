@@ -220,6 +220,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendQuietCreatures(sb);
             AppendFightingCreaturesFirst(sb);
             AppendCreaturePacing(sb);
+            AppendStatusEffectRepeats(sb);
             AppendRoutedRpc(sb);
             AppendOwnerRpc(sb);
             AppendReferencePositions(sb);
@@ -281,6 +282,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.LossBackoff: return ValConfig.EnableSteamTransportTuning.Value && ValConfig.EnableLossBackoff.Value;
                 case Mechanism.QuietCreatures: return ValConfig.QuietIdleCreatures.Value;
                 case Mechanism.CreaturePacing: return ValConfig.PaceCreatureSends.Value;
+                case Mechanism.StatusEffectRepeats: return ValConfig.LimitRepeatedStatusEffects.Value;
                 default: return true;
             }
         }
@@ -333,6 +335,13 @@ namespace NetworkPerformanceSystem.Runtime {
                 }
 
                 sb.AppendLine($"  {Pad(name, 20)} {Pad(rtt, 7)} {Pad(jitter, 7)} {Pad(DescribeSimulationDistance(peer), 7)} {Pad(window, 9)} {Pad(rate, 10)} {Pad(queue, 7)} {skipped}");
+            }
+
+            string connections = RttProbe.DescribeSocketPaths(peers);
+            if (connections != null) {
+                sb.AppendLine($"  {connections}");
+                sb.AppendLine("  (another mod wraps some players' connections. Found by Steam ID = read from their Steam connection");
+                sb.AppendLine("  instead; unreadable = not even that, so they count as Unmeasured Peer RTT Ms. The log names the wrapper.)");
             }
 
             if (Collecting) {
@@ -900,6 +909,31 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"    settled >{CreaturePacing.NearMetres:F0}m   {CreaturePacing.DeferredIdleFar} (at most {1f / CreaturePacing.IdleFarInterval:F0}/s)");
             sb.AppendLine($"    moving >{CreaturePacing.FarMetres:F0}m    {CreaturePacing.DeferredMovingFar} (at most {1f / CreaturePacing.MovingFarInterval:F0}/s)");
             sb.AppendLine($"  moving now       {CreaturePacing.MovingAt(Time.time)} (moving, or stopped less than {CreaturePacing.SettleSeconds:F1}s ago - sent in full within {CreaturePacing.FarMetres:F0}m)");
+        }
+
+        /// <summary>What M30 has seen and held. Every role: the requests are counted where they
+        /// are made, and again on the host for the ones players send it. The counting runs with
+        /// the limit off too, so the numbers say whether switching it on would do anything.</summary>
+        private static void AppendStatusEffectRepeats(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Status effects on other players' creatures (since start):");
+            string reason = PatchGuard.GetDisableReason(Mechanism.StatusEffectRepeats);
+            if (reason != null) {
+                sb.AppendLine($"  stood down: {reason}");
+                return;
+            }
+
+            bool limiting = ValConfig.LimitRepeatedStatusEffects.Value;
+            sb.AppendLine($"  asked here       {StatusEffectRepeats.LocalAsked}, {StatusEffectRepeats.LocalHeld} held back as repeats");
+            if (NpsEnv.IsHost()) {
+                sb.AppendLine($"  from players     {StatusEffectRepeats.RelayAsked}, {StatusEffectRepeats.RelayHeld} not passed on as repeats");
+            }
+            if (!limiting) {
+                sb.AppendLine("  limit off (counted only: every request is sent, and passed on)");
+            }
+            sb.AppendLine(StatusEffectRepeats.FloodsLogged > 0
+                ? $"  floods logged    {StatusEffectRepeats.FloodsLogged} (over {StatusEffectRepeats.FloodPerSecond} a second for one effect) - last: {StatusEffectRepeats.LastFlood}"
+                : $"  floods logged    0 (over {StatusEffectRepeats.FloodPerSecond} a second for one effect)");
         }
 
         /// <summary>The send scheduler's effective output. On a small server this simply confirms

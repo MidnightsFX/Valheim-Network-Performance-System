@@ -221,6 +221,7 @@ namespace NetworkPerformanceSystem.Runtime {
             HandoffWatch.Reset();
             MonitoringClient.Reset();
             TrafficLedger.Reset();
+            PeerSockets.Clear();
             _hasPendingCause = false;
             _pendingCandidates = null;
         }
@@ -581,11 +582,23 @@ namespace NetworkPerformanceSystem.Runtime {
             return 1000d * Math.Max(1, seconds);
         }
 
+        /// <summary>The socket object each peer had at its last sample and how it was read, so a
+        /// change is recorded once, when it happens, rather than inferred from which fields go
+        /// missing. A peer whose ping stops at join and never comes back was the question.</summary>
+        private sealed class PeerSocketSeen {
+            internal ISocket Socket;
+            internal RttProbe.SocketPath Path;
+        }
+
+        private static readonly Dictionary<long, PeerSocketSeen> PeerSockets = new Dictionary<long, PeerSocketSeen>();
+
         private static void SamplePeers(double now) {
             List<ZNetPeer> peers = ZNet.instance.GetPeers();
             for (int i = 0; i < peers.Count; i++) {
                 ZNetPeer peer = peers[i];
                 if (!peer.IsReady()) { continue; }
+
+                RttProbe.ResolveSteam(peer.m_socket, out RttProbe.SocketPath socketPath);
 
                 Vector3 refPos = peer.GetRefPos();
                 Vector2s zone = ZoneSystem.GetZone(refPos);
@@ -598,7 +611,8 @@ namespace NetworkPerformanceSystem.Runtime {
                     .Int("zx", zone.x)
                     .Int("zy", zone.y)
                     .Int("owned", OwnershipArbiter.OwnedCountFor(peer.m_uid))
-                    .Flag("ghost", PeerLiveness.IsGhost(peer.m_uid));
+                    .Flag("ghost", PeerLiveness.IsGhost(peer.m_uid))
+                    .Str("sock", RttProbe.PathName(socketPath));
                 AppendSimulationDistance(line, peer.m_simulationDistance);
 
                 if (LatencyRegistry.TryGetState(peer.m_uid, out LatencyRegistry.PeerLatency latency)) {
@@ -624,7 +638,42 @@ namespace NetworkPerformanceSystem.Runtime {
                 }
 
                 EmitServer(line.End());
+                NotePeerSocket(now, peer, socketPath);
             }
+        }
+
+        /// <summary>
+        /// A peer_sock record when a peer is first sampled, and again whenever the object in
+        /// peer.m_socket or the way it is read changes: what is wrapped around the transport,
+        /// how deep, and where the walk down it stopped. "no inner field" with the type's fields
+        /// listed says a wrapper this mod does not recognise; a Steam transport more than four
+        /// layers down says too many wrappers for Unwrap. Written after the peer line, since the
+        /// two share one line builder.
+        /// </summary>
+        private static void NotePeerSocket(double now, ZNetPeer peer, RttProbe.SocketPath path) {
+            // A closed connection waiting its turn to be dropped reads as lost, and a record of
+            // that would say a wrapper went unreadable when a player left.
+            if (peer.m_socket == null || !peer.m_socket.IsConnected()) { return; }
+
+            if (!PeerSockets.TryGetValue(peer.m_uid, out PeerSocketSeen seen)) {
+                seen = new PeerSocketSeen();
+                PeerSockets[peer.m_uid] = seen;
+            } else if (ReferenceEquals(seen.Socket, peer.m_socket) && seen.Path == path) {
+                return;
+            }
+            seen.Socket = peer.m_socket;
+            seen.Path = path;
+
+            RttProbe.SocketChain chain = RttProbe.DescribeChain(peer.m_socket);
+            JsonLine record = Line.Begin("peer_sock")
+                .Num("t", now, "0.#")
+                .Id("uid", peer.m_uid)
+                .Str("sock", RttProbe.PathName(path))
+                .Int("layers", chain.Wrappers)
+                .Str("stop", chain.Stop)
+                .Str("chain", chain.Layers);
+            if (chain.Fields != null) { record.Str("fields", chain.Fields); }
+            EmitServer(record.End());
         }
 
         /// <summary>
@@ -665,10 +714,30 @@ namespace NetworkPerformanceSystem.Runtime {
                 .End());
         }
 
+        /// <summary>
+        /// A player sent RPC_AddStatusEffect for one effect over StatusEffectRepeats.FloodPerSecond
+        /// times in one second (M30). "effect" is its name as the log gives it, "zdo" and "prefab"
+        /// the last character it was asked for, "asked" the requests in that second and "held" how
+        /// many of them the host did not pass on. At most one record a minute per player and effect.
+        /// </summary>
+        internal static void OnStatusEffectFlood(long uid, string effect, ZDOID target, int asked, int held) {
+            if (!ServerRole) { return; }
+
+            ZDO zdo = ZDOMan.instance != null ? ZDOMan.instance.GetZDO(target) : null;
+            JsonLine line = Line.Begin("se_flood")
+                .Num("t", NowMs, "0.#")
+                .Id("uid", uid)
+                .Str("effect", effect)
+                .Str("zdo", ZdoId(target));
+            if (zdo != null) { line.Str("prefab", PrefabName(zdo)); }
+            EmitServer(line.Int("asked", asked).Int("held", held).End());
+        }
+
         internal static void ForgetPeer(long uid) {
             HandoffWatch.ForgetPeer(uid);
             MonitoringUpload.ForgetPeer(uid);
             TrafficLedger.ForgetPeer(uid);
+            PeerSockets.Remove(uid);
         }
     }
 }

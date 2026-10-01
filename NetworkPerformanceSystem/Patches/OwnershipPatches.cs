@@ -66,6 +66,7 @@ namespace NetworkPerformanceSystem.Patches {
             QuietCreatures.Reset();
             CreaturePacing.Reset();
             FightingCreaturesFirst.Reset();
+            StatusEffectRepeats.Reset();
             // Diagnostics are session-scoped too: an nps_stats_collect left running must not
             // silently keep sampling on the next server, and telemetry must not carry over.
             NetworkStats.Reset();

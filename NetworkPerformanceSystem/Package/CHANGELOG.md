@@ -1,5 +1,11 @@
 # Changelog
 
+**1.12.0**
+- Fixes a flood of status effect messages that could fill a player's connection and stop the world loading for others.
+- Logs which status effect and player are responsible when such a flood happens.
+- Ping is now measured for players whose connection is wrapped by another mod.
+- Network monitoring records how each player's connection is read.
+
 **1.11.1**
 - Compatibility improvements for ZenMods
 - Fixes tamed animals falling out of raised pens

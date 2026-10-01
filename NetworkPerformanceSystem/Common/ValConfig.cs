@@ -102,6 +102,9 @@ namespace NetworkPerformanceSystem {
         // M12 creatures - hits on a creature delivered to whoever simulates it now
         public static ConfigEntry<bool> EnableCreatureHitRouting;
 
+        // M30 - a status effect asked for on somebody else's creature is not sent on every ask
+        public static ConfigEntry<bool> LimitRepeatedStatusEffects;
+
         // M9 - per-peer sector scan cache
         public static ConfigEntry<bool> EnableSyncListCache;
         public static ConfigEntry<float> SyncListCacheMs;
@@ -324,6 +327,8 @@ namespace NetworkPerformanceSystem {
                 "Deliver fermenter, smelter, cooking station, fireplace, shield generator and ballista item requests (add item / ore / fuel / ammo, tap, empty) to whoever owns the object right now. Prevents RPCs being dropped and items being eaten. An ore, fuel, food or ammo item that still cannot be delivered is dropped at the station instead of being lost.");
             EnableCreatureHitRouting = BindServerConfig("Routed RPC", "Route Creature Hits To Owner", true,
                 "Deliver hits on creatures to whoever is simulating the creature right now, prevents silently dropping hits.");
+            LimitRepeatedStatusEffects = BindServerConfig("Routed RPC", "Limit Repeated Status Effects", true,
+                "Send a status effect to a creature another player is simulating at most 4 times a second, instead of every time something asks for it. An area that gives a status effect keeps applying it, 50 times a second, to creatures that were yours when they walked in. Once one of them is handed to another player every one of those becomes a message, and a few animals in a base can fill a player's whole upload and stop the world loading for the player they were handed to. Runs on each player's game that has this mod, using the server's setting; the server also stops passing the repeats on from players who do not have it. The log names the effect either way.");
 
             // Cache list optimization
             EnableSyncListCache = BindServerConfig("Sync List Cache", "Enable Sector Scan Cache", true,

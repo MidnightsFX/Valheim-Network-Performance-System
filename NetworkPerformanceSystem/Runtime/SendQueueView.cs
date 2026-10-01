@@ -126,7 +126,9 @@ namespace NetworkPerformanceSystem.Runtime {
         /// frame at most, each already paying a Steam status call, and a scan needs no table to
         /// keep in step with connects and disconnects. ServerSync replaces peer.m_socket with a
         /// wrapper for the whole config handshake - exactly when its own wait loop is reading - so
-        /// a peer whose socket is not this one by reference is looked through.
+        /// a peer whose socket is not this one by reference is looked through, by the same
+        /// resolution the RTT probe uses: a peer whose window is sized from its Steam connection
+        /// has to be found here too, or its readers see the full window as queue.
         /// </summary>
         internal static long PeerUid(List<ZNetPeer> peers, ZSteamSocket socket) {
             for (int i = 0; i < peers.Count; i++) {
@@ -134,7 +136,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 ISocket peerSocket = peer?.m_socket;
                 if (peerSocket == null) { continue; }
                 if (ReferenceEquals(peerSocket, socket)
-                    || (!(peerSocket is ZSteamSocket) && ReferenceEquals(RttProbe.Unwrap(peerSocket), socket))) {
+                    || (!(peerSocket is ZSteamSocket) && ReferenceEquals(RttProbe.ResolveSteam(peerSocket, out RttProbe.SocketPath _), socket))) {
                     return peer.m_uid;
                 }
             }

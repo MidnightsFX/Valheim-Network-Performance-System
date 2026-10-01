@@ -14,6 +14,9 @@ namespace NetworkPerformanceSystem.Patches {
     /// scan and when vanilla did - and by then AddForceSendZdos has already put the forced ZDOs at
     /// the head, still marked in the peer's force-send set, which is how they are recognised and
     /// kept. The host branch only: the same IsServer() test vanilla branches on.
+    ///
+    /// It also carries M31's host half (QuietWildlife): fish and birds are filtered by the same
+    /// pass, so the postfix runs when either setting is on and each half obeys its own.
     /// </summary>
     [HarmonyPatch]
     internal static class CreaturePacingPatches {
@@ -42,10 +45,12 @@ namespace NetworkPerformanceSystem.Patches {
         [HarmonyPostfix]
         private static void PaceCreatures(ZDOMan.ZDOPeer peer, List<ZDO> toSync) {
             if (toSync == null || toSync.Count == 0 || peer?.m_peer == null) { return; }
-            if (!CreaturePacing.Active) { return; }
+            bool creatures = CreaturePacing.Active;
+            bool wildlife = QuietWildlife.RelayActive;
+            if (!creatures && !wildlife) { return; }
             if (ZNet.instance == null || !ZNet.instance.IsServer()) { return; }
 
-            CreaturePacing.Filter(peer, toSync, peer.m_peer.GetRefPos(), Time.time);
+            CreaturePacing.Filter(peer, toSync, peer.m_peer.GetRefPos(), Time.time, creatures, wildlife);
         }
     }
 }

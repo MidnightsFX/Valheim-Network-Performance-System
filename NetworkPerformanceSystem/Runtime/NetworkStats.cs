@@ -220,6 +220,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendQuietCreatures(sb);
             AppendFightingCreaturesFirst(sb);
             AppendCreaturePacing(sb);
+            AppendQuietWildlife(sb);
             AppendStatusEffectRepeats(sb);
             AppendRoutedRpc(sb);
             AppendOwnerRpc(sb);
@@ -283,6 +284,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.QuietCreatures: return ValConfig.QuietIdleCreatures.Value;
                 case Mechanism.CreaturePacing: return ValConfig.PaceCreatureSends.Value;
                 case Mechanism.StatusEffectRepeats: return ValConfig.LimitRepeatedStatusEffects.Value;
+                case Mechanism.QuietWildlife: return ValConfig.QuietWildlifeUpdates.Value;
                 default: return true;
             }
         }
@@ -911,6 +913,40 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  moving now       {CreaturePacing.MovingAt(Time.time)} (moving, or stopped less than {CreaturePacing.SettleSeconds:F1}s ago - sent in full within {CreaturePacing.FarMetres:F0}m)");
         }
 
+        /// <summary>What M31 is saving. The owner half on every role - whoever simulates a fish or
+        /// bird is the one writing it - and the relay half on the host.</summary>
+        private static void AppendQuietWildlife(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Fish and bird updates (since start):");
+            string reason = PatchGuard.GetDisableReason(Mechanism.QuietWildlife);
+            if (reason != null) {
+                sb.AppendLine($"  stood down: {reason}");
+                return;
+            }
+            if (!ValConfig.QuietWildlifeUpdates.Value) {
+                sb.AppendLine("  off (fish and birds are written and sent on every frame they move)");
+                return;
+            }
+
+            long frames = QuietWildlife.FramesHeld + QuietWildlife.FramesPassed;
+            string heldShare = frames > 0 ? $" ({100f * QuietWildlife.FramesHeld / frames:F0}%)" : "";
+            sb.AppendLine($"  frames held      {QuietWildlife.FramesHeld} of {frames} on fish and birds simulated here{heldShare}" +
+                          $" - written at most {1f / QuietWildlife.FishOwnerInterval:F0}/s (fish), {1f / QuietWildlife.BirdOwnerInterval:F0}/s (birds)");
+
+            if (!NpsEnv.IsHost()) { return; }
+            string relayReason = PatchGuard.GetDisableReason(Mechanism.CreaturePacing);
+            if (relayReason != null) {
+                sb.AppendLine($"  relay stood down with Pace Creature Sends' hook: {relayReason}");
+                return;
+            }
+            long listed = QuietWildlife.RelayListed;
+            long held = QuietWildlife.RelayHeld;
+            string relayShare = listed > 0 ? $" ({100f * held / listed:F0}%)" : "";
+            sb.AppendLine($"  relay held back  {held} of {listed} fish and bird sends{relayShare}");
+            sb.AppendLine($"    <={QuietWildlife.RelayNearMetres:F0}m          {QuietWildlife.RelayHeldNear} (at most {1f / QuietWildlife.FishRelayNearInterval:F0}/s fish, {1f / QuietWildlife.BirdRelayNearInterval:F0}/s birds)");
+            sb.AppendLine($"    >{QuietWildlife.RelayNearMetres:F0}m           {QuietWildlife.RelayHeldFar} (at most {1f / QuietWildlife.FishRelayFarInterval:F0}/s fish, {1f / QuietWildlife.BirdRelayFarInterval:F0}/s birds)");
+        }
+
         /// <summary>What M30 has seen and held. Every role: the requests are counted where they
         /// are made, and again on the host for the ones players send it. The counting runs with
         /// the limit off too, so the numbers say whether switching it on would do anything.</summary>
@@ -1136,6 +1172,7 @@ namespace NetworkPerformanceSystem.Runtime {
             // Same reasoning as tier 2 below: say "latency only" when it is off rather than say nothing.
             if (ValConfig.EnableCreatureProximityOwnership.Value) {
                 sb.AppendLine($"  proximity   {OwnershipArbiter.LastPassProximityKept} kept with the only player near them, {OwnershipArbiter.LastPassProximityPulled} pulled to that player, {OwnershipArbiter.LastPassProximityRescued} rescues sent to that player instead of the lowest-latency one (within {ValConfig.CreatureProximityRadius.Value:F0}m)");
+                sb.AppendLine($"              {OwnershipArbiter.LastPassProximityHeld} held with an owner still within {OwnershipPolicy.KeepDistanceMetres(ValConfig.CreatureProximityRadius.Value):F0}m when nobody was near them");
             } else {
                 sb.AppendLine("  proximity   off (creatures are placed by latency alone, however far away the lowest-latency player is)");
             }
@@ -1160,7 +1197,7 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  static held {OwnershipArbiter.LastPassStaticHeld} (present owner is not the lowest-latency one; kept because the object does not move)");
             sb.AppendLine($"  in order    {OwnershipArbiter.LastPassFirstSendsInOrder} owner changes not pushed to a player who had never been sent the object; it reaches them behind the floors and walls around it (since start {OwnershipArbiter.TotalFirstSendsInOrder})");
             sb.AppendLine($"  pass time   {OwnershipArbiter.LastPassMs:F1}ms");
-            sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued} ({OwnershipArbiter.TotalCreaturesRescued} creatures), optimised {OwnershipArbiter.TotalOptimised} ({OwnershipArbiter.TotalCreaturesOptimised} creatures), interactive {OwnershipArbiter.TotalInteractiveOptimised}, proximity pulled {OwnershipArbiter.TotalProximityPulled} / rescued {OwnershipArbiter.TotalProximityRescued}");
+            sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued} ({OwnershipArbiter.TotalCreaturesRescued} creatures), optimised {OwnershipArbiter.TotalOptimised} ({OwnershipArbiter.TotalCreaturesOptimised} creatures), interactive {OwnershipArbiter.TotalInteractiveOptimised}, proximity pulled {OwnershipArbiter.TotalProximityPulled} / rescued {OwnershipArbiter.TotalProximityRescued} / held {OwnershipArbiter.TotalProximityHeld}");
 
             // M25 is not part of the pass - it acts on every update the host receives - but what it
             // protects is exactly what the pass does, so it is reported here.

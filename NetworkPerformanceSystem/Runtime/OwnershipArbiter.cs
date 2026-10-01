@@ -360,12 +360,16 @@ namespace NetworkPerformanceSystem.Runtime {
         // The proximity layer: simulated objects with exactly one player near them. Kept counts
         // every such object left where it was, whether because that player already owned it or
         // because its owner was not yet far enough away to lose it - either way the cost function
-        // was not asked. Pulled counts moves actually applied, not queued.
+        // was not asked. Pulled counts moves actually applied, not queued. Held counts objects
+        // nobody was near that the cost function would have moved, left with an owner still
+        // within the keep distance (OwnershipPolicy.ProximityKeepFactor).
         internal static int LastPassProximityKept;
         internal static int LastPassProximityPulled;
         internal static int LastPassProximityRescued;
+        internal static int LastPassProximityHeld;
         internal static long TotalProximityPulled;
         internal static long TotalProximityRescued;
+        internal static long TotalProximityHeld;
 
         // Creatures. Rescued and optimised are subsets of the pass-wide counters above, split out
         // because creatures are the reason tier 1 exists and they were invisible to it before
@@ -411,11 +415,12 @@ namespace NetworkPerformanceSystem.Runtime {
         private static float _interactiveMargin;
         private static float _interactiveHold;
 
-        // The proximity layer's settings, read once per pass for the same reason. Both distances
+        // The proximity layer's settings, read once per pass for the same reason. The distances
         // are kept squared: the scan compares squares and never needs a root.
         private static bool _proximityEnabled;
         private static float _proximityRadiusSq;
         private static float _proximityPullSq;
+        private static float _proximityKeepSq;
 
         /// <summary>Arbitrate Creatures, read once per pass. Off leaves every creature on the
         /// static path exactly as before 1.8.0.</summary>
@@ -487,6 +492,8 @@ namespace NetworkPerformanceSystem.Runtime {
             float proximityPull = proximityRadius + OwnershipPolicy.ProximityPullMarginMetres;
             _proximityRadiusSq = proximityRadius * proximityRadius;
             _proximityPullSq = proximityPull * proximityPull;
+            float proximityKeep = OwnershipPolicy.KeepDistanceMetres(proximityRadius);
+            _proximityKeepSq = proximityKeep * proximityKeep;
             _creaturesEnabled = ValConfig.OwnershipArbitrateCreatures.Value;
             _followersEnabled = _creaturesEnabled && ValConfig.OwnershipFollowersStayWithLeader.Value;
             _keepWhileLoaded = ValConfig.OwnershipKeepWhileLoaded.Value;
@@ -520,6 +527,7 @@ namespace NetworkPerformanceSystem.Runtime {
             LastPassNearestRescued = 0;
             LastPassProximityKept = 0;
             LastPassProximityRescued = 0;
+            LastPassProximityHeld = 0;
             LastPassCreaturesRescued = 0;
             LastPassCreaturesKept = 0;
             LastPassFirstSendsInOrder = 0;
@@ -586,7 +594,7 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             if (Logger.Level >= BepInEx.Logging.LogLevel.Debug) {
-                Logger.LogDebug($"Ownership pass: considered {LastPassConsidered} ({LastPassUnownedOnEntry} unowned) over {ZonesToScan.Count} zones, rescued {LastPassRescued} ({LastPassHelmRescued} to a helmsman, {LastPassNearestRescued} to the nearest, {LastPassCreaturesRescued} creatures), released {LastPassReleased}, optimised {LastPassOptimised} ({LastPassCreaturesOptimised} creatures), deferred {LastPassDeferred}, creatures kept by a loading owner {LastPassCreaturesKept}, proximity {LastPassProximityPulled} pulled / {LastPassProximityKept} kept / {LastPassProximityRescued} rescued, interactive {LastPassInteractiveOptimised} ({LastPassInteractiveDeferred} deferred, {LastPassInteractiveHeld} held), static held {LastPassStaticHeld}, ghosts excluded {LastPassGhostsExcluded}, history {OwnerHistory.Count}, {LastPassMs:F1}ms.");
+                Logger.LogDebug($"Ownership pass: considered {LastPassConsidered} ({LastPassUnownedOnEntry} unowned) over {ZonesToScan.Count} zones, rescued {LastPassRescued} ({LastPassHelmRescued} to a helmsman, {LastPassNearestRescued} to the nearest, {LastPassCreaturesRescued} creatures), released {LastPassReleased}, optimised {LastPassOptimised} ({LastPassCreaturesOptimised} creatures), deferred {LastPassDeferred}, creatures kept by a loading owner {LastPassCreaturesKept}, proximity {LastPassProximityPulled} pulled / {LastPassProximityKept} kept / {LastPassProximityRescued} rescued / {LastPassProximityHeld} held, interactive {LastPassInteractiveOptimised} ({LastPassInteractiveDeferred} deferred, {LastPassInteractiveHeld} held), static held {LastPassStaticHeld}, ghosts excluded {LastPassGhostsExcluded}, history {OwnerHistory.Count}, {LastPassMs:F1}ms.");
             }
         }
 
@@ -1304,8 +1312,12 @@ namespace NetworkPerformanceSystem.Runtime {
                 // its owner is far enough away to lose it (OwnershipPolicy.ShouldPullToSoleNearby)
                 // and the ordinary hold has run out, and kept where it is until then - NOT handed
                 // to the sector's best in the meantime, which is the whole point. Two or more
-                // players near it is a shared fight, and nobody near it is nobody's fight; both
-                // fall through to the cost function exactly as before.
+                // players near it is a shared fight, and falls through to the cost function
+                // exactly as before. Nobody near it is nobody's fight: it falls through too, but
+                // an owner still within the keep distance (OwnershipPolicy.ShouldKeepWithOwner)
+                // keeps it, so a player stepping just outside the radius of the creature they were
+                // fighting does not lose it to a lower-latency player further away - only for the
+                // layer to pull it back once they step in again.
                 //
                 // Ahead of the "owner is already the sector's best" test on purpose: the commonest
                 // shape of the two-player case is the lower-latency player owning a creature the
@@ -1314,6 +1326,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 // The cost is SoleNearbyViewer: the same handful of multiplies tier 2 runs, per
                 // simulated object in a contested zone. Everything that does not move was retired
                 // by the tier split above without reaching this.
+                bool keepWithOwner = false;
                 if (_proximityEnabled) {
                     int sole = SoleNearbyViewer(verdict, zdo.GetPosition(), currentOwner,
                                                 out int ownerIndex, out float ownerSq);
@@ -1346,11 +1359,20 @@ namespace NetworkPerformanceSystem.Runtime {
                         }
                         continue;
                     }
+
+                    // Nobody near: the scan walked every candidate, so the owner's index and
+                    // distance are real. Decided here, applied just before a move would be
+                    // queued below, so it only ever stops a move the cost function was about to
+                    // make - and the hold history is still refreshed on the way.
+                    keepWithOwner = sole == NobodyNear
+                        && ownerIndex >= 0
+                        && Candidates[ownerIndex].CanOwn
+                        && OwnershipPolicy.ShouldKeepWithOwner(Candidates[ownerIndex].IsViewer, ownerSq, _proximityKeepSq);
                 }
 
-                // Tier 1's cost function from here down, unchanged. A single compare that retires
-                // nearly every remaining ZDO in the zone - in a settled world the owner already is
-                // the best choice.
+                // Tier 1's cost function from here down. A single compare that retires nearly
+                // every remaining ZDO in the zone - in a settled world the owner already is the
+                // best choice.
                 if (verdict.BestUid == currentOwner) { continue; }
 
                 // Directly-controlled objects follow their controller, never the cost function.
@@ -1377,6 +1399,14 @@ namespace NetworkPerformanceSystem.Runtime {
 
                 float improvement = currentTotal - verdict.BestTotalMs;
                 if (improvement < margin) { continue; }
+
+                // The proximity layer's keep band, decided above: nobody is near and the owner is
+                // still close enough to have been fighting it.
+                if (keepWithOwner) {
+                    LastPassProximityHeld++;
+                    TotalProximityHeld++;
+                    continue;
+                }
 
                 PendingSimulated.Add(new PendingMove {
                     Zdo = zdo, NewOwner = verdict.BestUid, Priority = improvement, Sector = verdict,
@@ -1670,9 +1700,18 @@ namespace NetworkPerformanceSystem.Runtime {
             return nearest;
         }
 
+        /// <summary>SoleNearbyViewer's answer when no viewer is within the radius. The scan has
+        /// walked every candidate, so the owner's index and distance it reports are real.</summary>
+        private const int NobodyNear = -1;
+
+        /// <summary>SoleNearbyViewer's answer when two or more viewers are within the radius. It
+        /// returns on the second, so the owner's index and distance may not have been reached.</summary>
+        private const int SharedFight = -2;
+
         /// <summary>
         /// The proximity layer's scan: the index into Candidates of the ONE player within the
-        /// proximity radius of this position, or -1 when nobody is or more than one is.
+        /// proximity radius of this position, NobodyNear when nobody is, or SharedFight when more
+        /// than one is.
         ///
         /// The same loop tier 2 runs, over the same two to four present candidates, asking a
         /// different question - not "who is nearest" but "is anybody here alone". Squares
@@ -1689,15 +1728,15 @@ namespace NetworkPerformanceSystem.Runtime {
         /// whether the one it got back may own.
         ///
         /// Also reports where the current owner is among the candidates and how far away, so the
-        /// caller can decide a pull without a second walk. Both are only meaningful when the
-        /// return value is not -1: an early return has not necessarily reached the owner yet. A
-        /// caller with no owner to find - a rescue - uses NearbyViewers instead.
+        /// caller can decide a pull or a keep without a second walk. Both are only meaningful when
+        /// the return value is not SharedFight: that early return has not necessarily reached the
+        /// owner yet. A caller with no owner to find - a rescue - uses NearbyViewers instead.
         /// </summary>
         private static int SoleNearbyViewer(SectorVerdict verdict, Vector3 pos, long currentOwner,
                                             out int ownerIndex, out float ownerSq) {
             ownerIndex = -1;
             ownerSq = float.MaxValue;
-            int sole = -1;
+            int sole = NobodyNear;
 
             List<int> presentIndex = verdict.PresentIndex;
             for (int i = 0; i < presentIndex.Count; i++) {
@@ -1713,7 +1752,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 }
 
                 if (!candidate.IsViewer || sq > _proximityRadiusSq) { continue; }
-                if (sole >= 0) { return -1; }                                 // a second player: a shared fight
+                if (sole >= 0) { return SharedFight; }                        // a second player
                 sole = presentIndex[i];
             }
             return sole;
@@ -2401,8 +2440,10 @@ namespace NetworkPerformanceSystem.Runtime {
             LastPassProximityKept = 0;
             LastPassProximityPulled = 0;
             LastPassProximityRescued = 0;
+            LastPassProximityHeld = 0;
             TotalProximityPulled = 0;
             TotalProximityRescued = 0;
+            TotalProximityHeld = 0;
             LastPassLeaderKept = 0;
             LastPassLeaderReturned = 0;
             LastPassLeaderRescued = 0;
@@ -2414,6 +2455,7 @@ namespace NetworkPerformanceSystem.Runtime {
             _proximityEnabled = false;
             _proximityRadiusSq = 0f;
             _proximityPullSq = 0f;
+            _proximityKeepSq = 0f;
 
             LastPassCreaturesRescued = 0;
             LastPassCreaturesOptimised = 0;

@@ -38,6 +38,7 @@ namespace NetworkPerformanceSystem.Runtime {
         CreaturePacing,    // M28 - ZDOMan.CreateSyncList: the host sends settled or distant creatures to each peer less often
         FightingCreaturesFirst, // M29 - ZDOMan.CreateSyncList (client): a player's alert or targeting creatures go out right after players and ships
         StatusEffectRepeats,    // M30 - SEMan.AddStatusEffect / ZRoutedRpc.RPC_RoutedRPC: a status effect asked for on somebody else's creature goes out a few times a second, and a flood of them is named in the log
+        QuietWildlife,          // M31 - ZSyncTransform.OwnerSync (owner) + M28's ZDOMan.CreateSyncList postfix (host): fish and birds are written and relayed a few times a second instead of every frame
     }
 
     /// <summary>

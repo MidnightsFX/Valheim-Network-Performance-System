@@ -1,5 +1,11 @@
 # Changelog
 
+**1.13.0**
+- A ship's chest no longer closes on a passenger while someone else is steering.
+- Fish, seagulls and crows send far fewer updates, freeing upload for players near water.
+- Creatures no longer bounce between players when the one fighting them steps back a little.
+- Network monitoring no longer reports creatures standing still as stalls.
+
 **1.12.0**
 - Fixes a flood of status effect messages that could fill a player's connection and stop the world loading for others.
 - Logs which status effect and player are responsible when such a flood happens.

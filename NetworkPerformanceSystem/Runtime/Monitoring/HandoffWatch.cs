@@ -21,9 +21,30 @@ namespace NetworkPerformanceSystem.Runtime {
 
         internal const double WindowMs = 10000d;
 
-        /// <summary>A gap this long between packets for a creature that is awake and busy is a
-        /// stall a player would have seen. Idle creatures write nothing and are not counted.</summary>
+        /// <summary>
+        /// A gap this long between packets for a creature that is awake, busy and moving is a stall
+        /// a player would have seen. Idle creatures are not counted at all.
+        ///
+        /// Busy alone is not enough: every owned creature is written at least every two seconds
+        /// whatever it is doing - BaseAI.UpdateRegeneration stores the world time (lastWorldTime)
+        /// every 2 s of AI ticks - so an alert creature standing still (a Dverger mage on its spot,
+        /// a leech waiting in the water) sends nothing but that heartbeat, and used to show up as a
+        /// steady stream of 1.95-2.2 s "stalls": about half of every stall record before 1.13.0.
+        /// So a gap of StallMs or more is judged once the packet that ended it has landed (see
+        /// PendingGap): a creature that was still and still is - IsStandingGap - had nothing to
+        /// say, and is counted as standing instead.
+        /// </summary>
         private const double StallMs = 1000d;
+
+        /// <summary>How far a creature may have moved across a gap and still count as standing.
+        /// Over a gap of a second or more that is under half a metre a second.</summary>
+        internal const float StandingMoveMetres = 0.5f;
+        private const float StandingMoveSq = StandingMoveMetres * StandingMoveMetres;
+
+        /// <summary>The velocity it last told everybody, under which it counts as still: the speed
+        /// at which CreaturePacing reads a creature as moving. What viewers extrapolated during
+        /// the gap, so under it they saw at most half a metre of drift either.</summary>
+        private const float StandingSpeedSq = CreaturePacing.MovingSpeed * CreaturePacing.MovingSpeed;
 
         private const double GapReportMs = 5000d;
         private const double LastSeenTtlMs = 60000d;
@@ -56,6 +77,10 @@ namespace NetworkPerformanceSystem.Runtime {
             internal int Gaps;
             internal double SumMs;
             internal double MaxMs;
+
+            /// <summary>Gaps of StallMs or more from creatures standing still - left out of
+            /// everything else here.</summary>
+            internal int Standing;
             internal readonly int[] Histogram = new int[GapEdgesMs.Length + 1];
             internal readonly HashSet<ZDOID> Creatures = new HashSet<ZDOID>();
 
@@ -64,6 +89,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 Gaps = 0;
                 SumMs = 0d;
                 MaxMs = 0d;
+                Standing = 0;
                 System.Array.Clear(Histogram, 0, Histogram.Length);
                 Creatures.Clear();
             }
@@ -76,6 +102,23 @@ namespace NetworkPerformanceSystem.Runtime {
         private static readonly Dictionary<ZDOID, double> LastSeenMs = new Dictionary<ZDOID, double>();
         private static readonly Dictionary<long, OwnerGaps> GapsByOwner = new Dictionary<long, OwnerGaps>();
         private static readonly List<ZDOID> Scratch = new List<ZDOID>();
+
+        /// <summary>
+        /// A long gap waiting to be judged. NotePacket runs before the packet that ended it is
+        /// applied, so it can only take what the ZDO held before: where the creature was and the
+        /// velocity it last told everybody. Tick, later in the same frame, reads where the packet
+        /// put it. Held by ZDOID, never ZDO: see the class summary.
+        /// </summary>
+        private struct PendingGap {
+            internal ZDOID Uid;
+            internal long Owner;
+            internal double GapMs;
+            internal double AtMs;
+            internal Vector3 PrevPos;
+            internal float PrevSpeedSq;
+        }
+
+        private static readonly List<PendingGap> PendingGaps = new List<PendingGap>();
 
         private static double _lastGapReportMs;
         private static double _lastPruneMs;
@@ -126,7 +169,19 @@ namespace NetworkPerformanceSystem.Runtime {
             if ((uid.ID & SampleMask) == 0) {
                 if (LastSeenMs.TryGetValue(uid, out double last)) {
                     bool busy = zdo.GetBool(ZDOVars.s_alert) || zdo.GetBool(ZDOVars.s_haveTargetHash);
-                    if (busy) { NoteGap(zdo, fromPeer, nowMs - last, nowMs); }
+                    if (busy) {
+                        double gapMs = nowMs - last;
+                        if (gapMs < StallMs) {
+                            NoteGap(zdo, fromPeer, gapMs, nowMs);
+                        } else {
+                            // Judged in Tick, once this packet's position has landed.
+                            PendingGaps.Add(new PendingGap {
+                                Uid = uid, Owner = fromPeer, GapMs = gapMs, AtMs = nowMs,
+                                PrevPos = zdo.GetPosition(),
+                                PrevSpeedSq = zdo.GetVec3(ZDOVars.s_velHash, Vector3.zero).sqrMagnitude,
+                            });
+                        }
+                    }
                 }
                 LastSeenMs[uid] = nowMs;
 
@@ -168,11 +223,57 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>OwnerRevisionGuard refused a packet that would have put an older owner back on
         /// this object.</summary>
         internal static void NoteBlocked(ZDOID uid) {
+            // A refused packet's position never lands, so a gap it ended cannot be judged by
+            // movement: it is counted the way every gap was before.
+            if (PendingGaps.Count > 0) { ResolveRefusedGap(uid); }
             if (Watched.Count == 0) { return; }
             if (Watched.TryGetValue(uid, out Entry entry)) { entry.Blocked++; }
         }
 
-        private static void NoteGap(ZDO zdo, long owner, double gapMs, double nowMs) {
+        /// <summary>Whether a gap of StallMs or more came from a creature standing still: the
+        /// velocity it last sent was under the moving speed, and the packet that ended the gap put
+        /// it less than StandingMoveMetres from where it was. Pure.</summary>
+        internal static bool IsStandingGap(float prevSpeedSq, float movedSq) {
+            return prevSpeedSq < StandingSpeedSq && movedSq < StandingMoveSq;
+        }
+
+        /// <summary>Judge the long gaps NotePacket queued this frame. Run before anything else in
+        /// Tick, so they land in the window they happened in.</summary>
+        private static void ResolvePendingGaps() {
+            if (PendingGaps.Count == 0) { return; }
+            ZDOMan zdoMan = ZDOMan.instance;
+            for (int i = 0; i < PendingGaps.Count; i++) {
+                PendingGap gap = PendingGaps[i];
+                // A peer forgotten in between: NoteGap would make it an entry nobody reports.
+                if (!GapsByOwner.TryGetValue(gap.Owner, out OwnerGaps gaps)) { continue; }
+                ZDO zdo = zdoMan != null ? zdoMan.GetZDO(gap.Uid) : null;
+                if (zdo == null) { continue; }
+
+                float movedSq = (zdo.GetPosition() - gap.PrevPos).sqrMagnitude;
+                if (IsStandingGap(gap.PrevSpeedSq, movedSq)) {
+                    gaps.Standing++;
+                    continue;
+                }
+                NoteGap(zdo, gap.Owner, gap.GapMs, gap.AtMs, Mathf.Sqrt(movedSq), Mathf.Sqrt(gap.PrevSpeedSq));
+            }
+            PendingGaps.Clear();
+        }
+
+        private static void ResolveRefusedGap(ZDOID uid) {
+            for (int i = PendingGaps.Count - 1; i >= 0; i--) {
+                PendingGap gap = PendingGaps[i];
+                if (gap.Uid != uid) { continue; }
+                PendingGaps.RemoveAt(i);
+
+                ZDO zdo = ZDOMan.instance != null ? ZDOMan.instance.GetZDO(uid) : null;
+                if (zdo != null && GapsByOwner.ContainsKey(gap.Owner)) {
+                    NoteGap(zdo, gap.Owner, gap.GapMs, gap.AtMs);
+                }
+            }
+        }
+
+        private static void NoteGap(ZDO zdo, long owner, double gapMs, double nowMs,
+                                    float movedMetres = -1f, float speed = -1f) {
             if (!GapsByOwner.TryGetValue(owner, out OwnerGaps gaps)) {
                 gaps = new OwnerGaps();
                 GapsByOwner[owner] = gaps;
@@ -191,18 +292,23 @@ namespace NetworkPerformanceSystem.Runtime {
             if (gapMs < StallMs) { return; }
 
             // Only a sampled object can be seen to stall, so a stall count is one in SampleDivisor
-            // of the real one, the same as the gap counts.
-            Monitoring.EmitServer(Monitoring.Line.Begin("stall")
+            // of the real one, the same as the gap counts. movedM and speed are left out for a
+            // gap whose packet was refused, which could not be measured.
+            JsonLine line = Monitoring.Line.Begin("stall")
                 .Num("t", nowMs, "0.#")
                 .Str("zdo", Monitoring.ZdoId(zdo.m_uid))
                 .Str("prefab", Monitoring.PrefabName(zdo))
                 .Id("owner", owner)
                 .Int("sample", SampleDivisor)
-                .Num("gapMs", gapMs, "0")
-                .End());
+                .Num("gapMs", gapMs, "0");
+            if (movedMetres >= 0f) { line.Num("movedM", movedMetres, "0.##"); }
+            if (speed >= 0f) { line.Num("speed", speed, "0.##"); }
+            Monitoring.EmitServer(line.End());
         }
 
         internal static void Tick(double nowMs) {
+            ResolvePendingGaps();
+
             if (Watched.Count > 0) {
                 Scratch.Clear();
                 foreach (KeyValuePair<ZDOID, Entry> pair in Watched) {
@@ -273,7 +379,8 @@ namespace NetworkPerformanceSystem.Runtime {
                     .Int("packets", gaps.Packets)
                     .Int("gaps", gaps.Gaps)
                     .Num("meanMs", gaps.Gaps > 0 ? gaps.SumMs / gaps.Gaps : 0d, "0")
-                    .Num("maxMs", gaps.MaxMs, "0");
+                    .Num("maxMs", gaps.MaxMs, "0")
+                    .Int("standing", gaps.Standing);
                 for (int i = 0; i < gaps.Histogram.Length; i++) {
                     line.Int(i < GapEdgesMs.Length ? "lt" + (int)GapEdgesMs[i] : "ge" + (int)GapEdgesMs[GapEdgesMs.Length - 1],
                              gaps.Histogram[i]);
@@ -293,6 +400,7 @@ namespace NetworkPerformanceSystem.Runtime {
             LastSeenMs.Clear();
             GapsByOwner.Clear();
             Scratch.Clear();
+            PendingGaps.Clear();
             _lastGapReportMs = 0d;
             _lastPruneMs = 0d;
         }

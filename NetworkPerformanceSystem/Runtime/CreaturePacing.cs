@@ -36,6 +36,10 @@ namespace NetworkPerformanceSystem.Runtime {
     /// Applied as a filter over the finished sync list (CreaturePacingPatches) rather than inside
     /// ShouldSend: AddForceSendZdos drops an id from the force-send set when ShouldSend says no,
     /// which would silently cancel those corrections.
+    ///
+    /// The same pass applies M31's host half to fish and birds (HoldWildlife; see QuietWildlife),
+    /// under that mechanism's own setting. Their counts are kept on QuietWildlife, so the creature
+    /// totals here and in the monitoring peer record stay creatures only.
     /// </summary>
     internal static class CreaturePacing {
 
@@ -89,10 +93,12 @@ namespace NetworkPerformanceSystem.Runtime {
             && ValConfig.PaceCreatureSends.Value;
 
         /// <summary>
-        /// Drops the creatures this peer is not due for from a finished sync list, in place and in
-        /// order, so whatever AddForceSendZdos put at the head stays there.
+        /// Drops the creatures (when <paramref name="creatures"/>) and the fish and birds (when
+        /// <paramref name="wildlife"/>) this peer is not due for from a finished sync list, in
+        /// place and in order, so whatever AddForceSendZdos put at the head stays there.
         /// </summary>
-        internal static void Filter(ZDOMan.ZDOPeer peer, List<ZDO> toSync, Vector3 refPos, float now) {
+        internal static void Filter(ZDOMan.ZDOPeer peer, List<ZDO> toSync, Vector3 refPos, float now,
+                                    bool creatures, bool wildlife) {
             if (peer == null || toSync == null || toSync.Count == 0) { return; }
 
             PruneIfDue(now);
@@ -102,17 +108,28 @@ namespace NetworkPerformanceSystem.Runtime {
             int deferred = 0;
             for (int i = 0; i < toSync.Count; i++) {
                 ZDO zdo = toSync[i];
-                if (zdo != null && OwnershipPolicy.IsCreature(zdo)) {
-                    listed++;
-                    Hold hold = Decide(peer, zdo, refPos, now, OwnershipPolicy.IsDirectlyControlled(zdo));
-                    if (hold != Hold.Send) {
-                        deferred++;
-                        switch (hold) {
-                            case Hold.IdleNear: DeferredIdleNear++; break;
-                            case Hold.IdleFar: DeferredIdleFar++; break;
-                            default: DeferredMovingFar++; break;
+                if (zdo != null) {
+                    if (creatures && OwnershipPolicy.IsCreature(zdo)) {
+                        listed++;
+                        Hold hold = Decide(peer, zdo, refPos, now, OwnershipPolicy.IsDirectlyControlled(zdo));
+                        if (hold != Hold.Send) {
+                            deferred++;
+                            switch (hold) {
+                                case Hold.IdleNear: DeferredIdleNear++; break;
+                                case Hold.IdleFar: DeferredIdleFar++; break;
+                                default: DeferredMovingFar++; break;
+                            }
+                            continue;
                         }
-                        continue;
+                    } else if (wildlife) {
+                        QuietWildlife.Kind kind = QuietWildlife.KindOf(zdo);
+                        if (kind != QuietWildlife.Kind.None) {
+                            QuietWildlife.RelayListed++;
+                            if (HoldWildlife(peer, zdo, refPos, now, kind, out bool near)) {
+                                if (near) { QuietWildlife.RelayHeldNear++; } else { QuietWildlife.RelayHeldFar++; }
+                                continue;
+                            }
+                        }
                     }
                 }
                 toSync[kept++] = zdo;
@@ -155,6 +172,31 @@ namespace NetworkPerformanceSystem.Runtime {
             if (interval <= 0f || now - info.m_syncTime >= interval) { return Hold.Send; }
             if (moving) { return Hold.MovingFar; }
             return distanceSq < NearSq ? Hold.IdleNear : Hold.IdleFar;
+        }
+
+        /// <summary>
+        /// M31 - whether this peer waits for this fish or bird: true holds it. The never-hold rules
+        /// are Decide's first four, plus a fish on a fishing line; then QuietWildlife's relay
+        /// interval for its kind and distance. <paramref name="near"/> says which interval held it.
+        /// </summary>
+        internal static bool HoldWildlife(ZDOMan.ZDOPeer peer, ZDO zdo, Vector3 refPos, float now,
+                                          QuietWildlife.Kind kind, out bool near) {
+            near = false;
+            if (!peer.m_zdos.TryGetValue(zdo.m_uid, out ZDOMan.ZDOPeer.PeerZDOInfo info)) { return false; }
+            if (zdo.OwnerRevision > info.m_ownerRevision) { return false; }
+            if (peer.m_forceSend.Contains(zdo.m_uid)) { return false; }
+            if (peer.m_peer != null && zdo.GetOwner() == peer.m_peer.m_uid) { return false; }
+            if (kind == QuietWildlife.Kind.Fish && QuietWildlife.IsHooked(zdo)) { return false; }
+
+            Vector3 position = zdo.GetPosition();
+            float dx = position.x - refPos.x;
+            float dy = position.y - refPos.y;
+            float dz = position.z - refPos.z;
+            float distanceSq = dx * dx + dy * dy + dz * dz;
+
+            if (now - info.m_syncTime >= QuietWildlife.RelayIntervalSeconds(kind, distanceSq)) { return false; }
+            near = distanceSq < QuietWildlife.RelayNearSq;
+            return true;
         }
 
         /// <summary>The shortest gap between two sends of one creature to one peer. Pure.</summary>

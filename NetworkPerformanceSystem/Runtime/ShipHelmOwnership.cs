@@ -53,6 +53,10 @@ namespace NetworkPerformanceSystem.Runtime {
             long helmsman = HelmsmanPeer(ship, controls.GetUser());
             if (helmsman == 0L || helmsman == ZDOMan.GetSessionID()) { return false; }
 
+            // A passenger looking in the ship's chest keeps the ship until they close it; see
+            // ChestOpenHere. The next UpdateOwner after that, two seconds at most, hands it over.
+            if (ChestOpenHere(nview)) { return false; }
+
             ZDO zdo = nview.GetZDO();
             if (Monitoring.Active) { Monitoring.NoteCause(zdo, HandoffCause.Helm); }
             zdo.SetOwner(helmsman);
@@ -67,6 +71,23 @@ namespace NetworkPerformanceSystem.Runtime {
                 Logger.LogDebug($"Ship helm: handed {ship.name} {zdo.m_uid} to its helmsman {helmsman}.");
             }
             return true;
+        }
+
+        /// <summary>
+        /// Whether the local player has one of this ship's containers open. A ship's chest keeps
+        /// its items in the ship's own ZDO (Container.m_rootObjectOverride), so vanilla's
+        /// Container.RPC_RequestOpen hands the whole ship to whoever opens it, and
+        /// InventoryGui.UpdateContainer hides a container the moment its viewer stops owning it.
+        /// Handing the ship straight back to the helmsman shut the chest on the passenger within
+        /// two seconds of every open, and each retry flipped a moving ship between the two
+        /// machines again. m_currentContainer is set when the open is granted and cleared when the
+        /// inventory closes, so it covers the whole time the chest is on screen.
+        /// </summary>
+        private static bool ChestOpenHere(ZNetView shipView) {
+            InventoryGui gui = InventoryGui.instance;
+            if (gui == null) { return false; }                      // dedicated server: no screen
+            Container open = gui.m_currentContainer;
+            return open != null && open.m_nview == shipView;
         }
 
         /// <summary>

@@ -65,6 +65,7 @@ namespace NetworkPerformanceSystem.Patches {
             OwnerRevisionGuard.Reset();
             QuietCreatures.Reset();
             CreaturePacing.Reset();
+            QuietWildlife.Reset();
             FightingCreaturesFirst.Reset();
             StatusEffectRepeats.Reset();
             // Diagnostics are session-scoped too: an nps_stats_collect left running must not

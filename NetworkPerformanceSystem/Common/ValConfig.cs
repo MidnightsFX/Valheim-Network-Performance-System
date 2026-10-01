@@ -114,6 +114,8 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<bool> PaceCreatureSends;
         // M29 - creatures that are fighting go out first on a full uplink
         public static ConfigEntry<bool> SendFightingCreaturesFirst;
+        // M31 - fish and birds send themselves a few times a second
+        public static ConfigEntry<bool> QuietWildlifeUpdates;
 
         // M8 - Steam transport configuration
         public static ConfigEntry<bool> EnableSteamTransportTuning;
@@ -344,6 +346,8 @@ namespace NetworkPerformanceSystem {
                 "Server side. Send a creature that has settled down to each player at most 10 times a second (5 beyond 32 m), and one moving more than 64 m away at most 15 times a second, instead of on every update. Creatures that are fighting, hunting, being ridden or changing owner still go out at once. Also covers players who do not have this mod.");
             SendFightingCreaturesFirst = BindServerConfig("Creature Updates", "Send Fighting Creatures First", true,
                 "When a player's upload is full, send the creatures they are simulating that are alert or chasing someone ahead of everything else they have changed, right after players and ships. Without this they wait their turn behind every fire, smelter and dropped item that player also simulates, and freeze for everyone else for a second or more. Changes only the order, never what is sent. Runs on each player's game that has this mod, using the server's setting.");
+            QuietWildlifeUpdates = BindServerConfig("Creature Updates", "Quiet Wildlife", true,
+                "Fish, seagulls and crows send themselves 5 times a second (fish) or 10 times a second (birds) instead of on every frame. They are always moving, so without this whoever simulates them re-sends each one up to 20 times a second, and on a lake or coast they can be a third of a player's upload. The server also passes them on to each player at most about 6 / 12 times a second (2 / 5 beyond 32 m), which covers players who do not have this mod. A fish on a fishing line is not affected. Runs on each player's game that has this mod and on the server, using the server's setting.");
 
             // Steam Socket
             EnableSteamTransportTuning = BindServerConfig("Steam Transport", "Enable Transport Tuning", true,

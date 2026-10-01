@@ -146,6 +146,8 @@ namespace NetworkPerformanceSystem.Runtime {
         private static long _quietAnimatorAtReport;
         private static long _quietSkippedAtReport;
         private static long _fightingMovedAtReport;
+        private static long _wildHeldAtReport;
+        private static long _wildPassedAtReport;
 
         internal static void OnStarted() {
             Monitoring.EmitClient(Monitoring.Line.Begin("c_session")
@@ -634,6 +636,12 @@ namespace NetworkPerformanceSystem.Runtime {
             // something else in its uploads this window: non-zero means the order was contested.
             line.Int("ffMoved", Window(FightingCreaturesFirst.CreaturesMoved, _fightingMovedAtReport));
 
+            // QuietWildlife's owner half this window: frames of fish and birds simulated here
+            // that were skipped, and that went through to the game's own write path.
+            line.Flag("wild", QuietWildlife.OwnerActive)
+                .Int("qwHeld", Window(QuietWildlife.FramesHeld, _wildHeldAtReport))
+                .Int("qwPass", Window(QuietWildlife.FramesPassed, _wildPassedAtReport));
+
             Monitoring.EmitClient(line.End());
 
             _frames = 0;
@@ -661,6 +669,8 @@ namespace NetworkPerformanceSystem.Runtime {
             _quietAnimatorAtReport = QuietCreatures.AnimatorWritten;
             _quietSkippedAtReport = QuietCreatures.TotalSkipped;
             _fightingMovedAtReport = FightingCreaturesFirst.CreaturesMoved;
+            _wildHeldAtReport = QuietWildlife.FramesHeld;
+            _wildPassedAtReport = QuietWildlife.FramesPassed;
         }
 
         internal static void Reset() {

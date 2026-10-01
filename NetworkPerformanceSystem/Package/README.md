@@ -27,12 +27,13 @@ NPS addresses these issues in a number of ways
 
 **Server-only works.** Vanilla clients get the send window, ownership, scheduler, station-request and creature-hit
 fixes with nothing installed on their end, and the server follows where they actually are rather than where they
-were two seconds ago. The server also sends settled or distant creatures to each player less often.
+were two seconds ago. The server also sends settled or distant creatures, and fish and birds, to each player less often.
 
 **Installing on clients too** adds latency compensation, live position reporting and the clean exit
 from a dead session for those clients, and lets a ship they own pass to whoever takes its helm.
 Creatures they simulate stop re-sending themselves while standing still, which matters most next
-to a pen of tamed animals.
+to a pen of tamed animals, and fish and birds they simulate are sent a few times a second instead of
+every frame, which matters most by water.
 Mixed groups are fine — benefits are per-player, and a client without the mod behaves
 exactly as vanilla. There is **no version lock**: nobody gets kicked for not having it.
 

@@ -233,17 +233,39 @@ namespace NetworkPerformanceSystem.Runtime {
         /// taken from it for the one player standing near. Same standing as
         /// InteractionStandOffMetres: a constant, because it is not a preference.
         ///
-        /// It is the whole of the proximity layer's distance hysteresis. "Exactly one player
-        /// within the radius, and it is not the owner" already puts the owner outside the radius;
-        /// without a margin a creature pacing along that line would change hands every time the
-        /// min-hold allowed. With it, the creature has to cross the margin plus whatever gap lies
-        /// between the two players' radii before it can go back. The distances are measured
-        /// against reference positions, which are up to 200ms old on the fast channel and up to
-        /// two seconds old for a client without this mod, so the band absorbs some of that error
-        /// too. The min-hold is the other half: whatever the geometry says, a new owner keeps the
-        /// object for Min Hold Seconds.
+        /// It is the proximity layer's distance hysteresis when somebody else is near. "Exactly one
+        /// player within the radius, and it is not the owner" already puts the owner outside the
+        /// radius; without a margin a creature pacing along that line would change hands every
+        /// time the min-hold allowed. With it, the creature has to cross the margin plus whatever
+        /// gap lies between the two players' radii before it can go back. The distances are
+        /// measured against reference positions, which are up to 200ms old on the fast channel and
+        /// up to two seconds old for a client without this mod, so the band absorbs some of that
+        /// error too. When nobody is near, ProximityKeepFactor is the band instead. The min-hold
+        /// is the last half: whatever the geometry says, a new owner keeps the object for Min Hold
+        /// Seconds.
         /// </summary>
         internal const float ProximityPullMarginMetres = 8f;
+
+        /// <summary>
+        /// How far, as a multiple of the proximity radius, an owner may be from an object NOBODY is
+        /// near and still keep it. Same standing as the pull margin: a constant, not a preference.
+        ///
+        /// The proximity layer gives an object to the one player near it; one step later that
+        /// player is just outside the radius, nobody is near, and the cost function used to hand
+        /// it to whoever had the lowest latency - a LAN player 60-80 m away - for the layer to
+        /// pull it straight back once its player stepped in again. The 2026-10-01 recording had
+        /// 32 of 45 such bounces with the owner 48-72 m away and nobody else within 48 m. With
+        /// nobody near there is no fight to make faster, so the player who was just fighting it
+        /// keeps it while they are still about that close.
+        /// </summary>
+        internal const float ProximityKeepFactor = 1.5f;
+
+        /// <summary>The keep distance for a radius: ProximityKeepFactor of it, and never short of
+        /// the pull distance, so an owner the pull rule would leave an object with is never one
+        /// this rule would let go of. Pure.</summary>
+        internal static float KeepDistanceMetres(float radiusMetres) {
+            return System.Math.Max(radiusMetres * ProximityKeepFactor, radiusMetres + ProximityPullMarginMetres);
+        }
 
         /// <summary>
         /// The proximity layer's pull rule, with the geometry factored out for the same reason
@@ -265,6 +287,19 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static bool ShouldPullToSoleNearby(bool ownerIsViewer, float ownerSq, float pullSq) {
             if (!ownerIsViewer) { return true; }
             return ownerSq > pullSq;
+        }
+
+        /// <summary>
+        /// The proximity layer's keep rule, asked only once the caller has established that NOBODY
+        /// is near the object. Pure, squared distances, for the same reason as the pull rule.
+        ///
+        ///   * owner is not a viewer   -> no. A dedicated host is not standing anywhere, so it has
+        ///                                no claim to keep; the cost function decides as before.
+        ///   * owner within keep range -> yes, and the caller holds the object where it is.
+        ///   * otherwise               -> no; the cost function decides as before.
+        /// </summary>
+        internal static bool ShouldKeepWithOwner(bool ownerIsViewer, float ownerSq, float keepSq) {
+            return ownerIsViewer && ownerSq <= keepSq;
         }
 
         private static PrefabClass Classify(ZDO zdo) {

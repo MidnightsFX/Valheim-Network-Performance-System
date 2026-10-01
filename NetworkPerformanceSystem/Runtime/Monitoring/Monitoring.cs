@@ -487,6 +487,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Int("proxKept", OwnershipArbiter.LastPassProximityKept)
                 .Int("proxPulled", OwnershipArbiter.LastPassProximityPulled)
                 .Int("proxRescued", OwnershipArbiter.LastPassProximityRescued)
+                .Int("proxHeld", OwnershipArbiter.LastPassProximityHeld)
                 .Int("firstInOrder", OwnershipArbiter.LastPassFirstSendsInOrder)
                 .Int("soleCreatures", solePrioritized)
                 .Int("contestedCreatures", contestedPrioritized)

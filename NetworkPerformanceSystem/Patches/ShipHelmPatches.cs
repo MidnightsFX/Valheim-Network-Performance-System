@@ -19,6 +19,8 @@ namespace NetworkPerformanceSystem.Patches {
     ///     vanilla's first-to-board pick), a ship owned by a dedicated server (where vanilla
     ///     returns before doing anything), and a grant made before this machine owned the ship.
     ///     When no handoff is due, vanilla runs unchanged.
+    /// Neither hands a ship over while this machine has the ship's chest open; it goes on the
+    /// first UpdateOwner after the chest closes.
     /// </summary>
     [HarmonyPatch]
     internal static class ShipHelmPatches {
@@ -35,10 +37,14 @@ namespace NetworkPerformanceSystem.Patches {
             FieldInfo controls = AccessTools.Field(typeof(Ship), "m_shipControlls");
             FieldInfo nview = AccessTools.Field(typeof(Ship), "m_nview");
             FieldInfo ship = AccessTools.Field(typeof(ShipControlls), "m_ship");
+            // Read to leave a ship with a passenger who has its chest open (ChestOpenHere).
+            FieldInfo openContainer = AccessTools.Field(typeof(InventoryGui), "m_currentContainer");
+            FieldInfo containerView = AccessTools.Field(typeof(Container), "m_nview");
 
-            if (requestControl == null || updateOwner == null || players == null || controls == null || nview == null || ship == null) {
+            if (requestControl == null || updateOwner == null || players == null || controls == null || nview == null || ship == null
+                || openContainer == null || containerView == null) {
                 PatchGuard.Disable(Mechanism.ShipHelmOwnership,
-                    "ShipControlls.RPC_RequestControl / Ship.UpdateOwner or the fields linking a ship to its helm do not have the expected shape. " +
+                    "ShipControlls.RPC_RequestControl / Ship.UpdateOwner or the fields linking a ship to its helm and chest do not have the expected shape. " +
                     "Either the game updated or another mod rewrote them first. Ships keep their owner as in vanilla.");
                 return false;
             }

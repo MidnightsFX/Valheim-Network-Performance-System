@@ -1,0 +1,101 @@
+[center][size=6][b]Network Performance System[/b][/size]
+[size=4]A general networking overhaul. [b]What if it felt like singleplayer for everyone?[/b][/size][/center]
+
+[line]
+
+Network Performance System is a general networking overhaul, designed to tackle the problem created by high ping.
+
+In Valheim, most objects are simulated by users. So a single high ping user in an area can make everything or all sorts of things feel terrible. This mod aims to address that in a number of ways.
+
+[line]
+
+[size=5][b]Why this is different from the other networking mods[/b][/size]
+
+Every other Valheim networking mod treats multiplayer performance as a [b]bandwidth[/b] problem — compression, bigger buffers, higher send rates, filtered broadcasts. That is the right diagnosis for ten people in one base saturating a shared cap. It does not handle a larger distributed server, or multiple players from vastly different geographic locations.
+
+NPS addresses these issues in a number of ways:
+
+[list]
+[*]Each peer gets their own round trip timing (RTT), healthcheck and bandwidth estimates
+[list]
+[*]This allows dynamic adjustments to route around a poor connection
+[*]Higher ping players with decent bandwidth allow the server to send more aggressively to these players in compensation
+[*]Object ownership can be dynamically adjusted around players with poor connections to provide the best experience for all players in the area
+[/list]
+[*]Objects which need network calls to interact with get ownership transferred ahead of time, making delay scenarios much less likely
+[*]Objects that change ownership during active requests get their requests properly re-targeted against the new owner, and an item that still cannot be delivered is dropped at the station instead of lost
+[*]Objects which are locally important (footsteps for example) are only network broadcast locally, instead of globally around the server
+[*]Server garbage collection churn is significantly reduced compared to vanilla
+[/list]
+
+[line]
+
+[size=5][b]Installing[/b][/size]
+
+[b]Server-only works.[/b] Vanilla clients get the send window, ownership, scheduler, station-request and creature-hit fixes with nothing installed on their end, and the server follows where they actually are rather than where they were two seconds ago. The server also sends settled or distant creatures to each player less often.
+
+[b]Installing on clients too[/b] adds latency compensation, live position reporting and the clean exit from a dead session for those clients, and lets a ship they own pass to whoever takes its helm. Creatures they simulate stop re-sending themselves while standing still, which matters most next to a pen of tamed animals.
+
+Mixed groups are fine — benefits are per-player, and a client without the mod behaves exactly as vanilla. There is [b]no version lock[/b]: nobody gets kicked for not having it.
+
+Works on dedicated servers and on player-hosted games.
+
+Requires [url=https://valheim.thunderstore.io/package/denikson/BepInExPack_Valheim/]BepInEx[/url] and [url=https://valheim.thunderstore.io/package/ValheimModding/Jotunn/]Jotunn[/url].
+
+[line]
+
+[size=5][b]Diagnosing and reporting a problem[/b][/size]
+
+An easy way to start is the [font=Courier New]nps_stats[/font] display. Run [font=Courier New]nps_stats_collect[/font] (needs [font=Courier New]devcommands[/font], since sampling costs a Steam call per peer per tick), play, then [font=Courier New]nps_stats[/font].
+
+A player the link-pressure table marks as [font=Courier New]LOSSY[/font] is already being dealt with: the server steps that one player's send rate down until their connection stops losing packets, and back up once it is clean, without changing anyone else's rate ([font=Courier New]Steam Transport / Enable Loss Backoff[/font]). A player whose loss does not improve - once their rate is below what their connection was already carrying, or at the lowest rate - has a connection problem the rate cannot fix: they go back to full speed and are left there until the server restarts. Loss measured during an outage at the server's end is ignored. The "Loss backoff" block shows who is backed off and by how much.
+
+[quote][b]Lag, rubber-banding, hits not landing? Send a report.[/b]
+
+[b]Server owners:[/b] in [font=Courier New]BepInEx/config/MidnightsFX.NetworkPerformanceSystem.cfg[/font], set [font=Courier New]Enable Network Monitoring = true[/font] in the [font=Courier New]Monitoring[/font] section. You do not need to restart, and an admin can also change it in game. Play through the problem, set it back to [font=Courier New]false[/font], and zip the newest folder in [font=Courier New]BepInEx/NpsMonitoring/[/font].
+
+[b]Players:[/b] your game sends nothing unless the server asks, and never sends names, platform ids, addresses or chat. To opt out anyway, set [font=Courier New]AllowMonitoringUpload = false[/font] in the [font=Courier New]Client config[/font] section of your own copy of that file. The server cannot override it. It only stops your game uploading: the server still logs its own side of the connection, such as your ping, under an anonymous session number.
+
+[b]Then[/b] post the zip as a [url=https://github.com/MidnightsFX/Valheim-Network-Performance-System/issues]GitHub issue[/url] or on the [url=https://discord.gg/Dmr9PQTy9m]Discord[/url], with a description of what you saw: what happened, how often, roughly when, and how many players were on. See "What is recorded" below.[/quote]
+
+If creatures rubber-band, hits do nothing, or things freeze when players come and go, the server can record what the network was doing so it can be diagnosed rather than guessed at.
+
+[list=1]
+[*]On the server, set [font=Courier New]Enable Network Monitoring[/font] to [font=Courier New]true[/font] in the [font=Courier New]Monitoring[/font] section. No restart is needed, and it can be changed in game by an admin.
+[*]Play through the problem. An evening with the usual players is ideal.
+[*]Set it back to [font=Courier New]false[/font].
+[*]Zip the newest folder under [font=Courier New]BepInEx/NpsMonitoring/[/font] on the server and send it, with a sentence about what players saw and roughly when, as a [url=https://github.com/MidnightsFX/Valheim-Network-Performance-System/issues]GitHub issue[/url] or on the [url=https://discord.gg/Dmr9PQTy9m]Discord[/url].
+[/list]
+
+[b]What is recorded:[/b] each time a creature changes owner and whether the change held, messages delivered to a player who no longer owned the target, how regularly each player's creatures report in, each player's ping, connection quality, and how much the server sends to and receives from them once a second, and what that traffic is made of: which of the game's messages, which mods' messages (by the name the mod gives them), and which kinds of objects. Clients that have the mod add what only they can see: what a creature was doing when it changed hands, who it was fighting, how far it jumped on screen, what killed each creature they were simulating, how often the creatures they simulate change, frame rate, and the names of the messages their game sends. That costs each client up to 2 KB per second of upload, sent in small batches that are held back whenever the connection is busy with the game's own traffic, so recording never delays it.
+
+[b]What is not:[/b] player names, Steam or platform ids, IP addresses, chat. Players appear only as the random session number the game gives them for that connection, and positions are rounded to the metre. Any player can refuse to send anything by setting [font=Courier New]AllowMonitoringUpload[/font] to [font=Courier New]false[/font] in their own config.
+
+While it is off it costs nothing: the hooks it uses are only installed while it is on. The folder is capped by [font=Courier New]Max Disk MB[/font] (4096 by default, across all sessions). When the cap is reached recording stops and the log says so; nothing already recorded is deleted, so clear out old sessions yourself. [font=Courier New]nps_stats[/font] shows whether it is running and whether anything is being dropped.
+
+[line]
+
+[size=5][b]Incompatible with[/b][/size]
+
+Other networking mods that rewrite the same code: FiresGhettoNetworking, VBNetTweaks, SkadiNet, BetterNetworking, Smoothbrain's Network, NetworkTweaks, WarheimNetwork, TimeoutLimit. BepInEx will refuse to load this mod alongside them rather than leave you half-patched. TimeoutLimit in particular is no longer something you give up: the [font=Courier New]Connection Timeout[/font] settings cover the same ground, and unlike a timeout raised at one layer only, they move both of the places vanilla times out at.
+
+[size=4][b]Verified compatible[/b][/size]
+
+Different layers, no overlap:
+
+[list]
+[*][b]LeanNet, Compress, Scenic[/b] — no overlap.
+[*][b]ReturnToSender[/b] — it already fixes the scheduler, so that one mechanism stands down and the rest keeps working.
+[*][b]EnRoute and BetterZeeRouter[/b] — both rework the routed-RPC relay, so relay filtering and relay send reuse stand down when either is present and everything else keeps working.
+[*][b]Valheim Plus[/b] — it has its own player limit, so this mod's [font=Courier New]Player Limit[/font] settings are ignored when it is installed and V+'s [font=Courier New]maxPlayers[/font] is the one in force.
+[*][b]ClientGhostWatchdog[/b] — it does the client-side half of the ghost handling itself and against its own timeout, so this mod's client watchdog stands down and leaves that mod's behaviour in charge. The host-side half — evicting a ghost from ownership, which that mod does not do — keeps running either way.
+[/list]
+
+[line]
+
+[size=5][b]Credits[/b][/size]
+
+[list]
+[*]Disconnect ghosting from [b][url=https://github.com/dreamwraith/Valheim-ClientGhostWatchdog]ClientGhostWatchdog[/url] by DreamWraith[/b].
+[*]ZDO redirect from BetterZeeRouter.
+[/list]

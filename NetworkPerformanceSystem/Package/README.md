@@ -27,7 +27,8 @@ NPS addresses these issues in a number of ways
 
 **Server-only works.** Vanilla clients get the send window, ownership, scheduler, station-request and creature-hit
 fixes with nothing installed on their end, and the server follows where they actually are rather than where they
-were two seconds ago. The server also sends settled or distant creatures, and fish and birds, to each player less often.
+were two seconds ago. The server also sends settled or distant creatures, and fish and birds, to each player less often,
+and sends the world's list of past players only when it has actually changed.
 
 **Installing on clients too** adds latency compensation, live position reporting and the clean exit
 from a dead session for those clients, and lets a ship they own pass to whoever takes its helm.

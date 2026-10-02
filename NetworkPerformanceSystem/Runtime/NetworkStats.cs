@@ -222,6 +222,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendCreaturePacing(sb);
             AppendQuietWildlife(sb);
             AppendStatusEffectRepeats(sb);
+            AppendPlayerHistoryRepeats(sb);
             AppendRoutedRpc(sb);
             AppendOwnerRpc(sb);
             AppendReferencePositions(sb);
@@ -285,6 +286,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.CreaturePacing: return ValConfig.PaceCreatureSends.Value;
                 case Mechanism.StatusEffectRepeats: return ValConfig.LimitRepeatedStatusEffects.Value;
                 case Mechanism.QuietWildlife: return ValConfig.QuietWildlifeUpdates.Value;
+                case Mechanism.PlayerHistoryRepeats: return ValConfig.SendPlayerHistoryOnlyWhenChanged.Value;
                 default: return true;
             }
         }
@@ -606,11 +608,11 @@ namespace NetworkPerformanceSystem.Runtime {
         private static void AppendTimeouts(StringBuilder sb) {
             sb.AppendLine();
             sb.AppendLine("Connection timeouts:");
-            sb.AppendLine($"  drop after       {ConnectionTimeout.EffectiveRpcTimeoutSeconds}s without a packet (ZRpc ping)");
+            sb.AppendLine($"  drop after       {ConnectionTimeout.InWorldTimeoutSeconds}s without a packet once in the world (ZRpc ping)");
+            sb.AppendLine($"  while joining    {ConnectionTimeout.JoiningTimeoutSeconds}s, until the player's character has spawned");
             sb.AppendLine(ConnectionTimeout.LastSteamReadback == null
                 ? "  steam layer      not applied (no Steam networking interface in this process)"
                 : $"  steam layer      {ConnectionTimeout.LastSteamReadback}");
-            sb.AppendLine($"  loading phase    {ConnectionTimeout.EffectiveLoadingTimeoutSeconds}s (crossplay joins and world transfer)");
             if (!ConnectionTimeout.Active) {
                 sb.AppendLine("  vanilla (timeout tuning is off)");
             } else if (NpsEnv.IsHost()
@@ -658,7 +660,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 } else if (!ValConfig.EnableGhostWatchdog.Value) {
                     sb.AppendLine("  watchdog         off (EnableGhostWatchdog)");
                 } else {
-                    float deadline = ConnectionTimeout.EffectiveRpcTimeoutSeconds;
+                    float deadline = ConnectionTimeout.DeadlineFor(server?.m_rpc);
                     sb.AppendLine($"  watchdog         warns at {deadline * 0.5f:F0}s, leaves at {deadline:F0}s{(GhostWatchdog.Warning ? "  [WARNING ACTIVE]" : "")}");
                     sb.AppendLine($"  session totals   {GhostWatchdog.TotalWarnings} warnings, {GhostWatchdog.TotalTrips} disconnects");
                 }
@@ -972,6 +974,30 @@ namespace NetworkPerformanceSystem.Runtime {
                 : $"  floods logged    0 (over {StatusEffectRepeats.FloodPerSecond} a second for one effect)");
         }
 
+        /// <summary>What M32 has held back, and how often the game marked the list changed when it
+        /// was not. Host only: it is the host that sends the list. Counted with the setting off too,
+        /// so the numbers say whether switching it on would do anything.</summary>
+        private static void AppendPlayerHistoryRepeats(StringBuilder sb) {
+            if (!NpsEnv.IsHost()) { return; }
+
+            sb.AppendLine();
+            sb.AppendLine("Player history list (since start):");
+            string reason = PatchGuard.GetDisableReason(Mechanism.PlayerHistoryRepeats);
+            if (reason != null) {
+                sb.AppendLine($"  stood down: {reason}");
+                return;
+            }
+
+            sb.AppendLine($"  built            {PlayerHistoryRepeats.Built} times, {PlayerHistoryRepeats.Changed} with a change ({PlayerHistoryRepeats.LastBytes / 1024f:F1} KB each)");
+            sb.AppendLine($"  to players       {PlayerHistoryRepeats.Sent} sent, {PlayerHistoryRepeats.Held} held back as already there ({PlayerHistoryRepeats.BytesHeld / (1024f * 1024f):F1} MB)");
+            if (!ValConfig.SendPlayerHistoryOnlyWhenChanged.Value) {
+                sb.AppendLine($"  setting off      {PlayerHistoryRepeats.SentAnyway} sent although the player already had it");
+            }
+            sb.AppendLine(PlayerHistoryRepeats.Roundtrips > 0
+                ? $"  marked changed   {PlayerHistoryRepeats.Roundtrips} times when it was not - last: {PlayerHistoryRepeats.LastFinding}"
+                : "  marked changed   0 times when it was not");
+        }
+
         /// <summary>The send scheduler's effective output. On a small server this simply confirms
         /// the configured rate; on a large one it is the number that says whether the host is
         /// CPU-bound on the send path - the frame budget trades per-peer rate for frame time, and
@@ -1273,7 +1299,7 @@ namespace NetworkPerformanceSystem.Runtime {
             for (int i = 0; i < peers.Count; i++) {
                 if (!TrafficLedger.TryGetSummary(peers[i].m_uid, out string received, out string sent)) { continue; }
                 if (!any) {
-                    sb.AppendLine($"  {Pad("traffic", 15)} last window, KB/s of game messages (before Steam's framing):");
+                    sb.AppendLine($"  {Pad("traffic", 15)} last window, KB/s of game messages (before Steam's framing; xN = each object sent N times):");
                     any = true;
                 }
                 string name = string.IsNullOrEmpty(peers[i].m_playerName) ? peers[i].m_uid.ToString() : peers[i].m_playerName;

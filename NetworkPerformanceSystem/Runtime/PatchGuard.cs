@@ -39,6 +39,7 @@ namespace NetworkPerformanceSystem.Runtime {
         FightingCreaturesFirst, // M29 - ZDOMan.CreateSyncList (client): a player's alert or targeting creatures go out right after players and ships
         StatusEffectRepeats,    // M30 - SEMan.AddStatusEffect / ZRoutedRpc.RPC_RoutedRPC: a status effect asked for on somebody else's creature goes out a few times a second, and a flood of them is named in the log
         QuietWildlife,          // M31 - ZSyncTransform.OwnerSync (owner) + M28's ZDOMan.CreateSyncList postfix (host): fish and birds are written and relayed a few times a second instead of every frame
+        PlayerHistoryRepeats,   // M32 - ZNet.SendHistoricalPlayerList: the world's player history goes to a player only when it differs from the copy they have, and what keeps marking it changed is named in the log
     }
 
     /// <summary>

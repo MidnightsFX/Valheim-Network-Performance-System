@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using Steamworks;
 
 namespace NetworkPerformanceSystem.Runtime {
@@ -29,6 +30,23 @@ namespace NetworkPerformanceSystem.Runtime {
     /// holds its slot, and keeps ownership of everything it was simulating, for the configured
     /// time instead of 30 seconds. Objects an absent owner holds do not move. So this is sized to
     /// the worst connection you actually want to keep, not set high as a matter of course.
+    ///
+    /// <para>TWO DEADLINES, PER PEER. A joining player and a player already in the world go quiet
+    /// for different reasons and need different answers. Loading a large modded world freezes
+    /// the joining client's main thread, and with it its ZRpc pings: on a 30-45 player server,
+    /// 837 join-time silences over eight days reached 34s at the 99th percentile and 110s at the
+    /// worst, every one of them recovering. Once the player is in, a recovered silence was under
+    /// 2 minutes in 179 of 180 cases, while one that never recovered is a crashed game or a dead
+    /// link - and every second of deadline beyond that is a player left in a frozen world and a
+    /// slot held for nobody. ZRpc's deadline is a single static, so the static is rewritten
+    /// before each peer's ZRpc.Update to that peer's deadline: Loading Timeout Seconds until the
+    /// peer's character exists, Connection Timeout Seconds from then on.</para>
+    ///
+    /// <para>Steam's TimeoutConnected stays process-global and takes the longer of the two. It
+    /// is the lower layer that wins, so the joining allowance has to hold there too; and ZRpc
+    /// still hangs up on an in-world peer at the shorter deadline, so nothing is kept longer for
+    /// it. (In the same data Steam went on acknowledging through every join-time freeze, at about
+    /// 100 B/s - the transport lives on its own thread - so this is belt and braces.)</para>
     ///
     /// Everything is written after vanilla has written its own - a postfix on each seam - and read
     /// back, so a refused write is visible in the log rather than assumed to have worked.
@@ -62,8 +80,28 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>Set once RegisterGlobalCallbacks has run, for the same reason.</summary>
         private static bool _steamUp;
 
-        /// <summary>What ZRpc is enforcing now, for nps_stats.</summary>
-        internal static float EffectiveRpcTimeoutSeconds { get; private set; } = VanillaRpcTimeoutSeconds;
+        /// <summary>The ZRpc deadline for a peer whose character is in the world, for nps_stats and
+        /// for the readers that size themselves off the hang-up deadline. Cached by ApplyRpc
+        /// rather than computed per read: ZRpc.Update reads it for every peer on every frame.</summary>
+        internal static float InWorldTimeoutSeconds { get; private set; } = VanillaRpcTimeoutSeconds;
+
+        /// <summary>The ZRpc deadline for a peer that is still joining - from the connection
+        /// until its character exists. Never below InWorldTimeoutSeconds.</summary>
+        internal static float JoiningTimeoutSeconds { get; private set; } = VanillaRpcTimeoutSeconds;
+
+        /// <summary>Whether ZRpc.Update rewrites the static per peer. Off while tuning is off, so
+        /// the game's own value - or another mod's - is left alone.</summary>
+        private static bool _perPeer;
+
+        /// <summary>
+        /// The ZRpcs whose player has reached the world: on a host, each peer whose client has
+        /// sent its character id; on a client, the server's, once our own character has spawned.
+        /// Sticky - a respawn clears the character id for a moment and is not a new join. Weak
+        /// keys, so a disconnected peer's ZRpc is not kept alive by being listed here.
+        /// </summary>
+        private static ConditionalWeakTable<ZRpc, object> _inWorld = new ConditionalWeakTable<ZRpc, object>();
+
+        private static readonly object Present = new object();
 
         /// <summary>The Steam readback from the last apply, for nps_stats. Null until we have run
         /// against a Steam interface.</summary>
@@ -72,7 +110,7 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>Suppresses repeats of the RPC log line: ZPlayFabSocket.Accept calls
         /// SetLongTimeout once per accepted socket, and re-logging an unchanged value per join
         /// would be noise.</summary>
-        private static float _lastLoggedRpcSeconds = -1f;
+        private static string _lastLoggedRpc;
 
         /// <summary>
         /// True when the admin has left the mechanism switched on and its patches survived.
@@ -91,17 +129,28 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
-        /// The loading-phase timeout in force. Floored at the ordinary one: a "long" timeout below
-        /// the normal one would mean a crossplay peer gets LESS slack during the world transfer
-        /// than it gets while idle, which is the opposite of what that value is for and is the one
-        /// pairing an operator can produce here by accident.
+        /// The deadline ZRpc enforces for this connection: the joining allowance until its player
+        /// has reached the world, the in-world one after.
         /// </summary>
-        internal static float EffectiveLoadingTimeoutSeconds {
-            get {
-                return Active
-                    ? Math.Max(ValConfig.LoadingTimeoutSeconds.Value, ValConfig.ConnectionTimeoutSeconds.Value)
-                    : VanillaRpcLongTimeoutSeconds;
-            }
+        internal static float DeadlineFor(ZRpc rpc) {
+            return rpc != null && _inWorld.TryGetValue(rpc, out _) ? InWorldTimeoutSeconds : JoiningTimeoutSeconds;
+        }
+
+        /// <summary>Called from the ZRpc.Update prefix, before vanilla compares the silence against
+        /// the static. Every ZRpc.Update is on the main thread, so the write cannot leak into
+        /// another peer's comparison.</summary>
+        internal static void BeforeRpcUpdate(ZRpc rpc) {
+            if (!_perPeer) { return; }
+            ZRpc.m_timeout = DeadlineFor(rpc);
+        }
+
+        /// <summary>
+        /// This connection's player is in the world from here on. Host: from the RPC_CharacterID
+        /// postfix. Client: from the SetCharacterID postfix, for the server's ZRpc.
+        /// </summary>
+        internal static void NoteInWorld(ZRpc rpc) {
+            if (rpc == null || _inWorld.TryGetValue(rpc, out _)) { return; }
+            _inWorld.Add(rpc, Present);
         }
 
         /// <summary>Called from the ZRpc.SetLongTimeout postfix - the one place vanilla writes
@@ -131,34 +180,53 @@ namespace NetworkPerformanceSystem.Runtime {
 
         internal static void Reset() {
             _longMode = false;
-            _lastLoggedRpcSeconds = -1f;
+            _lastLoggedRpc = null;
+            _inWorld = new ConditionalWeakTable<ZRpc, object>();
         }
 
         /// <summary>
-        /// Overwrites the value vanilla just wrote into ZRpc's static timeout. Read back out of
-        /// the field rather than assumed: this is the half with no Steam call to refuse it, but it
-        /// is also the half that would silently do nothing if the field were ever renamed.
+        /// Recomputes both deadlines and overwrites the value vanilla just wrote into ZRpc's
+        /// static. Read back out of the field rather than assumed: this is the half with no Steam
+        /// call to refuse it, but it is also the half that would silently do nothing if the field
+        /// were ever renamed.
+        ///
+        /// Vanilla's "long" mode is ZPlayFabSocket raising the static to 90s for the whole process
+        /// the first time a crossplay socket appears, and never lowering it again. That is kept as
+        /// a floor under the in-world deadline, so a crossplay server never drops anyone sooner
+        /// than the game itself would.
+        ///
+        /// Between per-peer writes the static holds the joining deadline, the longer one, so a
+        /// ZRpc updated by some path our prefix does not see is never cut short mid-join.
         /// </summary>
         private static void ApplyRpc(string reason) {
-            float want = Active
-                ? (_longMode ? EffectiveLoadingTimeoutSeconds : ValConfig.ConnectionTimeoutSeconds.Value)
-                : (_longMode ? VanillaRpcLongTimeoutSeconds : VanillaRpcTimeoutSeconds);
+            float vanilla = _longMode ? VanillaRpcLongTimeoutSeconds : VanillaRpcTimeoutSeconds;
+            _perPeer = Active;
+            if (_perPeer) {
+                InWorldTimeoutSeconds = Math.Max(ValConfig.ConnectionTimeoutSeconds.Value, _longMode ? vanilla : 0f);
+                JoiningTimeoutSeconds = Math.Max(ValConfig.LoadingTimeoutSeconds.Value, InWorldTimeoutSeconds);
+            } else {
+                InWorldTimeoutSeconds = vanilla;
+                JoiningTimeoutSeconds = vanilla;
+            }
 
             float before = ZRpc.m_timeout;
-            ZRpc.m_timeout = want;
-            EffectiveRpcTimeoutSeconds = ZRpc.m_timeout;
+            ZRpc.m_timeout = JoiningTimeoutSeconds;
 
-            if (EffectiveRpcTimeoutSeconds == _lastLoggedRpcSeconds) { return; }
-            _lastLoggedRpcSeconds = EffectiveRpcTimeoutSeconds;
+            string line = _perPeer
+                ? $"ZRpc ping timeout {before}s -> {JoiningTimeoutSeconds}s while joining, {InWorldTimeoutSeconds}s once in the world"
+                : $"ZRpc ping timeout {before}s -> {ZRpc.m_timeout}s (vanilla)";
+            if (_longMode) { line += " [crossplay]"; }
+            if (line == _lastLoggedRpc) { return; }
+            _lastLoggedRpc = line;
 
-            Logger.LogInfo($"Connection timeout ({reason}): ZRpc ping timeout {before}s -> {EffectiveRpcTimeoutSeconds}s" +
-                           (_longMode ? " [loading phase]" : ""));
+            Logger.LogInfo($"Connection timeout ({reason}): {line}");
         }
 
         /// <summary>
         /// Writes the two Steam-level timeouts at Global scope. Both keys are int32 milliseconds;
         /// vanilla writes TimeoutConnected as a float, which Steam converts, so a read back as
-        /// int32 returns the same number either way.
+        /// int32 returns the same number either way. TimeoutConnected takes the joining
+        /// allowance - see the class summary for why the longer of the two is the right one here.
         /// </summary>
         private static void ApplySteam(string reason) {
             if (!SteamNetConfig.Available) { return; }   // reports itself once, then goes quiet
@@ -167,7 +235,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 ? ValConfig.ConnectTimeoutSeconds.Value * MillisPerSecond
                 : VanillaSteamInitialMillis;
             int wantConnected = Active
-                ? ValConfig.ConnectionTimeoutSeconds.Value * MillisPerSecond
+                ? Math.Max(ValConfig.LoadingTimeoutSeconds.Value, ValConfig.ConnectionTimeoutSeconds.Value) * MillisPerSecond
                 : VanillaSteamConnectedMillis;
 
             int beforeInitial = ReadOr(ESteamNetworkingConfigValue.k_ESteamNetworkingConfig_TimeoutInitial, VanillaSteamInitialMillis);

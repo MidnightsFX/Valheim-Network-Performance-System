@@ -133,6 +133,9 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<bool> EnablePlayerLimitOverride;
         public static ConfigEntry<int> MaxPlayers;
 
+        // M32 - the world's player history goes to a player only when it changed
+        public static ConfigEntry<bool> SendPlayerHistoryOnlyWhenChanged;
+
         // M11 - connection timeouts
         public static ConfigEntry<bool> EnableConnectionTimeoutTuning;
         public static ConfigEntry<int> ConnectTimeoutSeconds;
@@ -382,6 +385,10 @@ namespace NetworkPerformanceSystem {
                 "How many players the server accepts. 10 is vanilla. Crossplay servers cant go above 128, steam can. Setting above 128 for Crossplay caps it at 128.",
                 false, 1, 255);
 
+            // Player history resends
+            SendPlayerHistoryOnlyWhenChanged = BindServerConfig("Player List", "Send Player History Only When Changed", true,
+                "Server side. Send the list of everyone who has ever joined this world to a player only when it differs from the copy they already have. The game sends the whole list - about 60 bytes for every player the world has seen - to every player whenever it marks it changed, and on some servers it marks it changed on every 2-second update without anything changing: 20 KB to every player every 2 seconds on a world that has seen 340 players, over a third of the server's upload. Players who join still get it, and a real change still goes to everyone. Also covers players who do not have this mod. The log says what keeps marking it changed either way.");
+
             // Timeout Limits
             EnableConnectionTimeoutTuning = BindServerConfig("Connection Timeout", "Enable Timeout Tuning", true,
                 "Let this mod set how long a connection may go quiet before either end hangs up, instead of the game's fixed 30 seconds.");
@@ -389,10 +396,10 @@ namespace NetworkPerformanceSystem {
                 "How long a connection attempt may take before Steam abandons it, in seconds. 10 is Steam's own default, which the game never changes. This covers only the handshake, before the connection exists.",
                 false, 5, 600);
             ConnectionTimeoutSeconds = BindServerConfig("Connection Timeout", "Connection Timeout Seconds", 30,
-                "How long an established connection may go without a packet before it is dropped, in seconds. 30 is vanilla. This is the setting for players who get disconnected mid-join or during a hitch on a weak link.",
+                "How long a player who is already in the world may go without a packet before they are dropped, in seconds. 30 is vanilla. Keep it short: a player whose game or connection has died is sent back to the menu and their slot freed this much sooner, instead of being left in a frozen world. Players still joining get 'Loading Timeout Seconds' instead. On a crossplay server the game never drops anyone in under 90.",
                 false, 10, 600);
             LoadingTimeoutSeconds = BindServerConfig("Connection Timeout", "Loading Timeout Seconds", 90,
-                "The longer allowance the game already gives itself while a crossplay peer is joining and the world is being transferred, in seconds. 90 is vanilla. A slow client can spend minutes here loading on a large world.",
+                "How long a player who is still joining - connecting, downloading and loading the world, until their character appears - may go without a packet before they are dropped, in seconds. Loading a large modded world can freeze a player's game for a minute or more, so this is kept apart from 'Connection Timeout Seconds'. Never shorter than that setting.",
                 true, 30, 900);
             EvictGhostOwners = BindServerConfig("Connection Timeout", "Evict Ghost Owners", true,
                 "Stop giving objects to a player who has stopped answering. A peer that goes quiet keeps its slot for the full 'Connection Timeout Seconds' so it can come back, but the things it was simulating - creatures especially - are handed to players who are actually there.");

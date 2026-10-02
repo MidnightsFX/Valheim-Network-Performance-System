@@ -109,7 +109,7 @@ namespace NetworkPerformanceSystem.Runtime {
             Player local = Player.m_localPlayer;
             if (local != null && local.IsTeleporting()) { Recover(silent: true); return; }
 
-            float deadline = ConnectionTimeout.EffectiveRpcTimeoutSeconds;
+            float deadline = ConnectionTimeout.DeadlineFor(server.m_rpc);
             if (deadline <= 0f) { return; }
 
             float silence = PeerLiveness.SilenceSeconds(server.m_uid);

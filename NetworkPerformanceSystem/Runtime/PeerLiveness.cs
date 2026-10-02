@@ -253,7 +253,7 @@ namespace NetworkPerformanceSystem.Runtime {
             float configured = ValConfig.GhostOwnerEvictSeconds != null
                 ? ValConfig.GhostOwnerEvictSeconds.Value
                 : 10f;
-            float hangUp = ConnectionTimeout.EffectiveRpcTimeoutSeconds;
+            float hangUp = ConnectionTimeout.InWorldTimeoutSeconds;
             return hangUp > 0f && configured > hangUp * 0.75f ? hangUp * 0.75f : configured;
         }
 

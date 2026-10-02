@@ -26,6 +26,10 @@ namespace NetworkPerformanceSystem.Runtime {
     ///   * the ZDOs in a ZDOData package by prefab, as the host applies each one it receives
     ///     (ZDO.Deserialize) and writes each one it sends (ZDO.Serialize).
     ///
+    /// Each prefab also counts the distinct objects behind its sends. A count alone cannot tell a
+    /// player walking into a fortress (1,250 walls, each sent once) from the 2026-10-01 support
+    /// loop (the same 1,250 walls re-sent every second); the number of objects can.
+    ///
     /// Sizes are the ZRpc package as the game hands it over, before Steam's framing, resends and
     /// acks; the peer record's inBps/outBps are Steam's own count of the wire, for comparison.
     ///
@@ -55,6 +59,9 @@ namespace NetworkPerformanceSystem.Runtime {
         internal sealed class Tally {
             internal long Count;
             internal long Bytes;
+
+            /// <summary>The distinct ZDOs this window, for prefab tallies only; null for methods.</summary>
+            internal HashSet<ZDOID> Objects;
         }
 
         internal sealed class Direction {
@@ -62,7 +69,7 @@ namespace NetworkPerformanceSystem.Runtime {
             internal long Packages;
             internal long Bytes;
 
-            internal void Add(Kind kind, int hash, int bytes) {
+            internal Tally Add(Kind kind, int hash, int bytes) {
                 long key = Key(kind, hash);
                 if (!Entries.TryGetValue(key, out Tally tally)) {
                     tally = new Tally();
@@ -70,15 +77,24 @@ namespace NetworkPerformanceSystem.Runtime {
                 }
                 tally.Count++;
                 tally.Bytes += bytes;
+                return tally;
+            }
+
+            internal void AddZdo(int prefab, ZDOID uid, int bytes) {
+                Tally tally = Add(Kind.Zdo, prefab, bytes);
+                if (tally.Objects == null) { tally.Objects = new HashSet<ZDOID>(); }
+                tally.Objects.Add(uid);
             }
 
             /// <summary>Counts back to zero, entries kept: the same methods and prefabs come
             /// round every window, and the set of them is bounded by what the game and its mods
-            /// contain.</summary>
+            /// contain. The object sets keep their capacity, which is the most of that prefab one
+            /// player has had in range at once.</summary>
             internal void Clear() {
                 foreach (Tally tally in Entries.Values) {
                     tally.Count = 0;
                     tally.Bytes = 0;
+                    tally.Objects?.Clear();
                 }
                 Packages = 0;
                 Bytes = 0;
@@ -125,12 +141,12 @@ namespace NetworkPerformanceSystem.Runtime {
 
         internal static void OnZdoReceived(long peerUid, ZDO zdo, int dataBytes) {
             if (peerUid == 0L || zdo == null) { return; }
-            ForUid(peerUid).In.Add(Kind.Zdo, zdo.GetPrefab(), dataBytes + ZdoHeaderBytes);
+            ForUid(peerUid).In.AddZdo(zdo.GetPrefab(), zdo.m_uid, dataBytes + ZdoHeaderBytes);
         }
 
         internal static void OnZdoSent(ZDO zdo, int dataBytes) {
             if (SendingTo == 0L || zdo == null) { return; }
-            ForUid(SendingTo).Out.Add(Kind.Zdo, zdo.GetPrefab(), dataBytes + ZdoHeaderBytes);
+            ForUid(SendingTo).Out.AddZdo(zdo.GetPrefab(), zdo.m_uid, dataBytes + ZdoHeaderBytes);
         }
 
         /// <summary>
@@ -240,10 +256,13 @@ namespace NetworkPerformanceSystem.Runtime {
 
         /// <summary>
         /// [["name", count, bytes], ...] for one kind, heaviest first: the first <paramref name="top"/>
-        /// by name, the rest as "(other)". For ZDOs, <paramref name="containerBytes"/> is the
-        /// ZDOData total, and what the per-prefab tallies do not account for - the packages' own
-        /// framing, and received ZDOs the host did not apply (no newer than its own copy, or a
-        /// creature update M25 refused from a stale owner) - is listed as "(not attributed)".
+        /// by name, the rest as "(other)". ZDO entries carry a fourth member, the distinct objects
+        /// those sends were - count over objects is how many times each went out in the window.
+        /// A ZDO has one prefab, so the objects of "(other)" are a plain sum. For ZDOs,
+        /// <paramref name="containerBytes"/> is the ZDOData total, and what the per-prefab tallies
+        /// do not account for - the packages' own framing, and received ZDOs the host did not apply
+        /// (no newer than its own copy, or a creature update M25 refused from a stale owner) - is
+        /// listed as "(not attributed)", with no objects.
         /// </summary>
         private static string ListJson(Direction direction, Kind kind, int top, long containerBytes) {
             Sorted.Clear();
@@ -255,31 +274,50 @@ namespace NetworkPerformanceSystem.Runtime {
             }
             Sorted.Sort((a, b) => b.Value.Bytes.CompareTo(a.Value.Bytes));
 
+            bool zdo = kind == Kind.Zdo;
             Scratch.Length = 0;
             Scratch.Append('[');
             long otherCount = 0L;
             long otherBytes = 0L;
+            long otherObjects = 0L;
             for (int i = 0; i < Sorted.Count; i++) {
+                Tally tally = Sorted[i].Value;
+                long objects = zdo ? ObjectsOf(tally) : -1L;
                 if (i >= top) {
-                    otherCount += Sorted[i].Value.Count;
-                    otherBytes += Sorted[i].Value.Bytes;
+                    otherCount += tally.Count;
+                    otherBytes += tally.Bytes;
+                    otherObjects += objects;
                     continue;
                 }
-                Entry(NameOf(Sorted[i].Key), Sorted[i].Value.Count, Sorted[i].Value.Bytes);
+                Entry(NameOf(Sorted[i].Key), tally.Count, tally.Bytes, objects);
             }
-            if (otherCount > 0L) { Entry("(other)", otherCount, otherBytes); }
-            if (kind == Kind.Zdo && containerBytes > attributed) { Entry("(not attributed)", 0L, containerBytes - attributed); }
+            if (otherCount > 0L) { Entry("(other)", otherCount, otherBytes, zdo ? otherObjects : -1L); }
+            if (zdo && containerBytes > attributed) { Entry("(not attributed)", 0L, containerBytes - attributed, 0L); }
             Scratch.Append(']');
             Sorted.Clear();
             return Scratch.ToString();
         }
 
-        private static void Entry(string name, long count, long bytes) {
+        private static long ObjectsOf(Tally tally) => tally.Objects != null ? tally.Objects.Count : 0L;
+
+        /// <summary>One list member; <paramref name="objects"/> is written only when it is not
+        /// negative, which is ZDO entries only.</summary>
+        private static void Entry(string name, long count, long bytes, long objects) {
             if (Scratch.Length > 1) { Scratch.Append(','); }
             Scratch.Append('[');
             JsonLine.AppendString(Scratch, name);
             Scratch.Append(',').Append(count.ToString(CultureInfo.InvariantCulture))
-                   .Append(',').Append(bytes.ToString(CultureInfo.InvariantCulture)).Append(']');
+                   .Append(',').Append(bytes.ToString(CultureInfo.InvariantCulture));
+            if (objects >= 0L) { Scratch.Append(',').Append(objects.ToString(CultureInfo.InvariantCulture)); }
+            Scratch.Append(']');
+        }
+
+        /// <summary>"x12" - how many times each object went out on average, for a prefab entry in
+        /// the nps_stats summary; empty below 1.5, where repeats are not the story. Pure.</summary>
+        internal static string RepeatsLabel(long count, long objects) {
+            if (objects <= 0L) { return string.Empty; }
+            double each = (double)count / objects;
+            return each < 1.5d ? string.Empty : " x" + each.ToString("0", CultureInfo.InvariantCulture);
         }
 
         internal static string NameOf(long key) {
@@ -296,9 +334,10 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
-        /// "12.3 KB/s: ZDOData 9.1 (Wolf 3.2, Hen 1.1), RoutedRPC 2.0 (Mod!NAME 1.5), ..." - the
-        /// connection methods, with the heaviest routed methods and prefabs inside the two
-        /// containers. KB/s over the window.
+        /// "12.3 KB/s: ZDOData 9.1 (Ashlands_Wall_2x2 6.0 x10, Wolf 3.2 x150), RoutedRPC 2.0
+        /// (Mod!NAME 1.5), ..." - the connection methods, with the heaviest routed methods and
+        /// prefabs inside the two containers. KB/s over the window; "xN" after a prefab is how
+        /// many times each of its objects was sent (see RepeatsLabel).
         /// </summary>
         private static string Summarise(Direction direction, double windowMs, long zdoDataBytes, long routedBytes) {
             double seconds = System.Math.Max(0.001d, windowMs / 1000d);
@@ -334,6 +373,7 @@ namespace NetworkPerformanceSystem.Runtime {
             for (int i = 0; i < Sorted.Count && i < 3; i++) {
                 if (i > 0) { sb.Append(", "); }
                 sb.Append(NameOf(Sorted[i].Key)).Append(' ').Append(Rate(Sorted[i].Value.Bytes, seconds));
+                if (kind == Kind.Zdo) { sb.Append(RepeatsLabel(Sorted[i].Value.Count, ObjectsOf(Sorted[i].Value))); }
             }
             sb.Append(')');
             Sorted.Clear();

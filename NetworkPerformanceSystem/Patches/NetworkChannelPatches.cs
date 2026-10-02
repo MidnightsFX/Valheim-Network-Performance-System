@@ -157,6 +157,7 @@ namespace NetworkPerformanceSystem.Patches {
             SteamTransport.ForgetPeer(netPeer.m_uid);
             LossBackoff.ForgetPeer(netPeer.m_uid);
             CreaturePacing.ForgetPeer(netPeer.m_uid);
+            StructureUpdates.ForgetPeer(netPeer.m_uid);
             StatusEffectRepeats.ForgetPeer(netPeer.m_uid);
             // Keyed by connection, not uid: a peer dropped mid-handshake may never have had one.
             ZdoDataGuard.Forget(netPeer.m_rpc);

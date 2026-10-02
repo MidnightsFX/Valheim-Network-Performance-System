@@ -93,12 +93,13 @@ namespace NetworkPerformanceSystem.Runtime {
             && ValConfig.PaceCreatureSends.Value;
 
         /// <summary>
-        /// Drops the creatures (when <paramref name="creatures"/>) and the fish and birds (when
-        /// <paramref name="wildlife"/>) this peer is not due for from a finished sync list, in
-        /// place and in order, so whatever AddForceSendZdos put at the head stays there.
+        /// Drops the creatures (when <paramref name="creatures"/>), the fish and birds (when
+        /// <paramref name="wildlife"/>) and the buildings, trees and rocks (when
+        /// <paramref name="structures"/>, M33) this peer is not due for from a finished sync list,
+        /// in place and in order, so whatever AddForceSendZdos put at the head stays there.
         /// </summary>
         internal static void Filter(ZDOMan.ZDOPeer peer, List<ZDO> toSync, Vector3 refPos, float now,
-                                    bool creatures, bool wildlife) {
+                                    bool creatures, bool wildlife, bool structures, bool ownerMayWait) {
             if (peer == null || toSync == null || toSync.Count == 0) { return; }
 
             PruneIfDue(now);
@@ -121,14 +122,17 @@ namespace NetworkPerformanceSystem.Runtime {
                             }
                             continue;
                         }
-                    } else if (wildlife) {
-                        QuietWildlife.Kind kind = QuietWildlife.KindOf(zdo);
+                    } else {
+                        QuietWildlife.Kind kind = wildlife ? QuietWildlife.KindOf(zdo) : QuietWildlife.Kind.None;
                         if (kind != QuietWildlife.Kind.None) {
                             QuietWildlife.RelayListed++;
                             if (HoldWildlife(peer, zdo, refPos, now, kind, out bool near)) {
                                 if (near) { QuietWildlife.RelayHeldNear++; } else { QuietWildlife.RelayHeldFar++; }
                                 continue;
                             }
+                        } else if (structures && StructureUpdates.IsHeldStructure(zdo)
+                                   && !StructureUpdates.ShouldSendNow(peer, zdo, refPos, now, ownerMayWait)) {
+                            continue;
                         }
                     }
                 }

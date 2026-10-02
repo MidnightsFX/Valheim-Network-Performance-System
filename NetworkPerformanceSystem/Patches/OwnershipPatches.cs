@@ -66,6 +66,7 @@ namespace NetworkPerformanceSystem.Patches {
             QuietCreatures.Reset();
             CreaturePacing.Reset();
             QuietWildlife.Reset();
+            StructureUpdates.Reset();
             FightingCreaturesFirst.Reset();
             StatusEffectRepeats.Reset();
             PlayerHistoryRepeats.Reset();

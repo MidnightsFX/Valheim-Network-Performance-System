@@ -336,7 +336,8 @@ namespace NetworkPerformanceSystem.Runtime {
         /// placement, type, flags, prefab, connection and every stored value, read straight out of
         /// ZDOExtraData's tables with no allocation. Snow buildup (s_snow, s_preSnow) is left out;
         /// it changes every visit while it snows, and is cosmetic. Each table mixes its own marker
-        /// and count, so a value moving from one type to another changes it too.
+        /// and the count of what it contributed, after its entries - so a value moving from one
+        /// type to another changes it, and a table holding nothing but snow is as if absent.
         /// </summary>
         internal static ulong Fingerprint(ZDO zdo) {
             ZDOID id = zdo.m_uid;
@@ -354,59 +355,73 @@ namespace NetworkPerformanceSystem.Runtime {
                 hash = Mix(hash, (int)connection.m_target.ID);
             }
 
+            int n = 0;
             if (ZDOExtraData.s_floats.TryGetValue(id, out BinarySearchDictionary<int, float> floats)) {
-                hash = Mix(hash, 0x10000 | floats.m_length);
                 for (int i = 0; i < floats.m_length; i++) {
                     if (floats.m_keys[i] == ZDOVars.s_snow) { continue; }
                     hash = Mix(Mix(hash, floats.m_keys[i]), floats.m_values[i]);
+                    n++;
                 }
             }
+            hash = EndTable(hash, 1, ref n);
             if (ZDOExtraData.s_vec3.TryGetValue(id, out BinarySearchDictionary<int, Vector3> vectors)) {
-                hash = Mix(hash, 0x20000 | vectors.m_length);
                 for (int i = 0; i < vectors.m_length; i++) {
                     hash = Mix(Mix(hash, vectors.m_keys[i]), vectors.m_values[i]);
+                    n++;
                 }
             }
+            hash = EndTable(hash, 2, ref n);
             if (ZDOExtraData.s_quats.TryGetValue(id, out BinarySearchDictionary<int, Quaternion> quats)) {
-                hash = Mix(hash, 0x30000 | quats.m_length);
                 for (int i = 0; i < quats.m_length; i++) {
                     Quaternion q = quats.m_values[i];
                     hash = Mix(Mix(Mix(Mix(Mix(hash, quats.m_keys[i]), q.x), q.y), q.z), q.w);
+                    n++;
                 }
             }
+            hash = EndTable(hash, 3, ref n);
             if (ZDOExtraData.s_ints.TryGetValue(id, out BinarySearchDictionary<int, int> ints)) {
-                hash = Mix(hash, 0x40000 | ints.m_length);
                 for (int i = 0; i < ints.m_length; i++) {
                     if (ints.m_keys[i] == ZDOVars.s_preSnow) { continue; }
                     hash = Mix(Mix(hash, ints.m_keys[i]), ints.m_values[i]);
+                    n++;
                 }
             }
+            hash = EndTable(hash, 4, ref n);
             if (ZDOExtraData.s_longs.TryGetValue(id, out BinarySearchDictionary<int, long> longs)) {
-                hash = Mix(hash, 0x50000 | longs.m_length);
                 for (int i = 0; i < longs.m_length; i++) {
                     hash = Mix(Mix(hash, longs.m_keys[i]), longs.m_values[i]);
+                    n++;
                 }
             }
+            hash = EndTable(hash, 5, ref n);
             if (ZDOExtraData.s_strings.TryGetValue(id, out BinarySearchDictionary<int, string> strings)) {
-                hash = Mix(hash, 0x60000 | strings.m_length);
                 for (int i = 0; i < strings.m_length; i++) {
                     hash = Mix(hash, strings.m_keys[i]);
                     string value = strings.m_values[i];
+                    n++;
                     if (value == null) { hash = Mix(hash, -1); continue; }
                     hash = Mix(hash, value.Length);
                     for (int c = 0; c < value.Length; c++) { hash = Mix(hash, (int)value[c]); }
                 }
             }
+            hash = EndTable(hash, 6, ref n);
             if (ZDOExtraData.s_byteArrays.TryGetValue(id, out BinarySearchDictionary<int, byte[]> arrays)) {
-                hash = Mix(hash, 0x70000 | arrays.m_length);
                 for (int i = 0; i < arrays.m_length; i++) {
                     hash = Mix(hash, arrays.m_keys[i]);
                     byte[] value = arrays.m_values[i];
+                    n++;
                     if (value == null) { hash = Mix(hash, -1); continue; }
                     hash = Mix(hash, value.Length);
                     for (int b = 0; b < value.Length; b++) { hash = Mix(hash, (int)value[b]); }
                 }
             }
+            return EndTable(hash, 7, ref n);
+        }
+
+        /// <summary>Close one table: its marker and how many entries it gave, nothing if none.</summary>
+        private static ulong EndTable(ulong hash, int table, ref int count) {
+            if (count > 0) { hash = Mix(hash, (table << 24) | count); }
+            count = 0;
             return hash;
         }
 
@@ -616,6 +631,8 @@ namespace NetworkPerformanceSystem.Runtime {
                 released++;
                 if (ceiling) { ReleasedAtCeiling++; } else { Released++; }
             }
+            // The room one send left is spent on one batch; the next send says whether there is more.
+            if (released > 0) { state.LastSendComplete = false; }
         }
 
         /// <summary>Put the real record back, only if the fake is still what is there.</summary>

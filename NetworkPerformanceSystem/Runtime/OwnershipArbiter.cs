@@ -434,6 +434,11 @@ namespace NetworkPerformanceSystem.Runtime {
         /// in a zone nobody is present in, as vanilla does.</summary>
         private static bool _keepWhileLoaded;
 
+        /// <summary>M33 is holding back owner changes on buildings, trees and rocks, read once per
+        /// pass. While it is, a tier-2 move of one of those is pushed only to its new and old
+        /// owner - see Drain.</summary>
+        private static bool _structureOwnersWait;
+
         /// <summary>Entries no pass has seen for this long are dropped so the history table
         /// cannot grow without bound on a long-running server. Pruning keys off LastSeenAt, not
         /// ChangedAt: a stable owner's entry must survive, or expiry would read as a fresh claim
@@ -497,6 +502,7 @@ namespace NetworkPerformanceSystem.Runtime {
             _creaturesEnabled = ValConfig.OwnershipArbitrateCreatures.Value;
             _followersEnabled = _creaturesEnabled && ValConfig.OwnershipFollowersStayWithLeader.Value;
             _keepWhileLoaded = ValConfig.OwnershipKeepWhileLoaded.Value;
+            _structureOwnersWait = StructureUpdates.Active && StructureUpdates.OwnerChangesMayWait;
 
             LastPassGhostsExcluded = 0;
             BuildCandidates(zdoMan);
@@ -2239,8 +2245,27 @@ namespace NetworkPerformanceSystem.Runtime {
                     LastPassCreaturesOptimised++;
                     TotalCreaturesOptimised++;
                 }
-                if (forceSend || move.Proximity || move.Creature) { ForceSendTo(move.Sector, move.Zdo.m_uid, move.OldOwner); }
+                if (forceSend || move.Proximity || move.Creature) {
+                    // A rock or tree M33 holds updates for only needs telling its new owner, who
+                    // is about to hit it, and its old one, who must stop simulating it. Everyone
+                    // else's hits reach the new owner through the router's structure family, and
+                    // their copies catch up when the change is due.
+                    if (_structureOwnersWait && !move.Creature && StructureUpdates.IsHeldStructure(move.Zdo)) {
+                        ForceSendToOwners(move.NewOwner, move.OldOwner, move.Zdo.m_uid);
+                    } else {
+                        ForceSendTo(move.Sector, move.Zdo.m_uid, move.OldOwner);
+                    }
+                }
             }
+        }
+
+        /// <summary>ForceSendTo narrowed to the two machines an owner change is about.</summary>
+        private static void ForceSendToOwners(long newOwner, long oldOwner, ZDOID id) {
+            ZDOMan zdoMan = ZDOMan.instance;
+            if (zdoMan == null) { return; }
+            long self = zdoMan.m_sessionID;
+            if (newOwner != 0L && newOwner != self) { ForceSendIfHeld(zdoMan, newOwner, id); }
+            if (oldOwner != 0L && oldOwner != self && oldOwner != newOwner) { ForceSendIfHeld(zdoMan, oldOwner, id); }
         }
 
         /// <summary>

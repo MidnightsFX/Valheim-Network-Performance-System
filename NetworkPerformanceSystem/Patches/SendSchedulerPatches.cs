@@ -36,6 +36,16 @@ namespace NetworkPerformanceSystem.Patches {
     /// under load - min(1/interval, budget/cost) - instead of the frame time exploding, and no
     /// peer can be starved because the order never resets. nps_stats reports the effective rate.
     ///
+    /// The budget alone fails on exactly the servers it is for. Once one send costs more than the
+    /// budget - a big base around a player is thousands of objects to scan and sort - every frame
+    /// stops after a single peer, which is vanilla's one peer per frame again: forty players on a
+    /// 30 fps server each wait 40 frames, 1.3 s, between updates. So the budget may not stop a
+    /// frame until a minimum share of the peer list has been serviced (Min Players Per Frame
+    /// Percent). Every peer then gets a send at least once every 100/share frames however many
+    /// have joined, the frame pays for it, and the budget is the ceiling above that floor.
+    /// NetworkTweaks' answer, a fixed count of peers per 50 ms tick in its own loop, caps the
+    /// rate instead - 10 per tick is 5 Hz each at 40 players - which is why it is not used here.
+    ///
     /// This is the one mechanism here that is not novel - ReturnToSender, VBNetTweaks and SkadiNet
     /// all fix it and agree on the shape. We carry it because we are standalone.
     /// </summary>
@@ -55,9 +65,21 @@ namespace NetworkPerformanceSystem.Patches {
         internal static int LastFrameServiced;
         internal static int ServicedLastSecond;
         internal static int BudgetBreaksLastSecond;
+        internal static int PastBudgetLastSecond;        // sends the minimum share made after the budget ran out
+        internal static float SendCostMsLastSecond;      // mean wall time of one SendZDOs
         private static int _servicedAccum;
         private static int _budgetBreaksAccum;
+        private static int _pastBudgetAccum;
+        private static int _sendsAccum;
+        private static double _sendMsAccum;
         private static float _windowStart;
+
+        // Since start, for the monitoring record, which takes its own deltas.
+        internal static long TotalServiced;
+        internal static long TotalSends;
+        internal static long TotalPastBudget;
+        internal static long TotalBudgetBreaks;
+        internal static double TotalSendMs;
 
         [HarmonyPatch(typeof(ZDOMan), "SendZDOToPeers2")]
         [HarmonyPrefix]
@@ -76,12 +98,24 @@ namespace NetworkPerformanceSystem.Patches {
             if (toService <= 0) { return false; }
             _strideAccumulator -= toService;
 
+            int floor = MinPeersPerFrame(count);
             double budgetMs = ValConfig.SendSchedulerFrameBudgetMs.Value;
             FrameWatch.Restart();
 
             int serviced = 0;
+            int sends = 0;
+            int pastBudget = 0;
             bool brokeBudget = false;
             for (int i = 0; i < toService; i++) {
+                // The first `floor` slots are taken whatever the budget says - at least one, so
+                // progress is guaranteed even when a single send exceeds the budget. After that
+                // the budget decides whether to go on.
+                bool overBudget = i > 0 && FrameWatch.Elapsed.TotalMilliseconds > budgetMs;
+                if (overBudget && i >= floor) {
+                    brokeBudget = true;
+                    break;
+                }
+
                 if (_strideIndex >= count) { _strideIndex = 0; }
                 ZDOMan.ZDOPeer peer = peers[_strideIndex];
                 _strideIndex++;
@@ -89,13 +123,8 @@ namespace NetworkPerformanceSystem.Patches {
 
                 if (peer?.m_peer?.m_socket == null || !peer.m_peer.m_socket.IsConnected()) { continue; }
                 __instance.SendZDOs(peer, false);
-
-                // At least one peer is always serviced, so progress is guaranteed even when a
-                // single send exceeds the budget; the check only decides whether to go on.
-                if (i + 1 < toService && FrameWatch.Elapsed.TotalMilliseconds > budgetMs) {
-                    brokeBudget = true;
-                    break;
-                }
+                sends++;
+                if (overBudget) { pastBudget++; }
             }
 
             // Whatever the budget cut off is still owed. Adding it back keeps the long-run
@@ -103,21 +132,42 @@ namespace NetworkPerformanceSystem.Patches {
             // overload is paid down at "everyone once per frame" at most, never compounding.
             _strideAccumulator = Mathf.Min(_strideAccumulator + (toService - serviced), count);
 
-            RecordFrame(serviced, brokeBudget);
+            RecordFrame(serviced, sends, pastBudget, FrameWatch.Elapsed.TotalMilliseconds, brokeBudget);
             return false;
         }
 
-        private static void RecordFrame(int serviced, bool brokeBudget) {
+        /// <summary>The fewest peers a frame services before the budget may stop it: the configured
+        /// share of the peer list, rounded up, and never less than one.</summary>
+        internal static int MinPeersPerFrame(int peerCount) {
+            int percent = Mathf.Clamp(ValConfig.SendSchedulerMinPeersPercent.Value, 0, 100);
+            return Mathf.Max(1, (peerCount * percent + 99) / 100);
+        }
+
+        private static void RecordFrame(int serviced, int sends, int pastBudget, double sendMs, bool brokeBudget) {
             LastFrameServiced = serviced;
             _servicedAccum += serviced;
+            _sendsAccum += sends;
+            _pastBudgetAccum += pastBudget;
+            _sendMsAccum += sendMs;
             if (brokeBudget) { _budgetBreaksAccum++; }
+
+            TotalServiced += serviced;
+            TotalSends += sends;
+            TotalPastBudget += pastBudget;
+            TotalSendMs += sendMs;
+            if (brokeBudget) { TotalBudgetBreaks++; }
 
             float now = Time.realtimeSinceStartup;
             if (now - _windowStart < 1f) { return; }
             ServicedLastSecond = _servicedAccum;
             BudgetBreaksLastSecond = _budgetBreaksAccum;
+            PastBudgetLastSecond = _pastBudgetAccum;
+            SendCostMsLastSecond = _sendsAccum > 0 ? (float)(_sendMsAccum / _sendsAccum) : 0f;
             _servicedAccum = 0;
             _budgetBreaksAccum = 0;
+            _pastBudgetAccum = 0;
+            _sendsAccum = 0;
+            _sendMsAccum = 0d;
             _windowStart = now;
         }
 
@@ -127,9 +177,19 @@ namespace NetworkPerformanceSystem.Patches {
             LastFrameServiced = 0;
             ServicedLastSecond = 0;
             BudgetBreaksLastSecond = 0;
+            PastBudgetLastSecond = 0;
+            SendCostMsLastSecond = 0f;
             _servicedAccum = 0;
             _budgetBreaksAccum = 0;
+            _pastBudgetAccum = 0;
+            _sendsAccum = 0;
+            _sendMsAccum = 0d;
             _windowStart = 0f;
+            TotalServiced = 0;
+            TotalSends = 0;
+            TotalPastBudget = 0;
+            TotalBudgetBreaks = 0;
+            TotalSendMs = 0d;
         }
 
         /// <summary>

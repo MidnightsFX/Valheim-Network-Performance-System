@@ -89,6 +89,7 @@ namespace NetworkPerformanceSystem.Runtime {
         private static bool _reportedStop;
         private static long _nextHandoffId;
         private static double _lastPeerSampleMs;
+        private static double _lastSchedulerSampleMs;
 
         private static HandoffCause _pendingCause;
         private static bool _hasPendingCause;
@@ -164,6 +165,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     _lastPeerSampleMs = now;
                     SamplePeers(now);
                 }
+                SampleScheduler(now);
                 TrafficLedger.Tick(now, ZNet.instance != null ? ZNet.instance.GetPeers().Count : 0);
                 ReportWriterState();
             }
@@ -183,6 +185,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             _nextHandoffId = 0L;
             _lastPeerSampleMs = 0d;
+            _lastSchedulerSampleMs = 0d;
             _reportedStop = false;
             HandoffsRecorded = 0L;
             DragBacksRecorded = 0L;
@@ -295,6 +298,61 @@ namespace NetworkPerformanceSystem.Runtime {
             name = prefab != null ? prefab.name : hash.ToString(System.Globalization.CultureInfo.InvariantCulture);
             PrefabNames[hash] = name;
             return name;
+        }
+
+        // -- send scheduler ----------------------------------------------------------------
+
+        private const double SchedulerSampleMs = 10000d;
+        private static long _schedServiced, _schedSends, _schedPastBudget, _schedBreaks;
+        private static double _schedSendMs;
+
+        /// <summary>
+        /// What M2b delivered over the last ten seconds: the per-peer rate it reached, what one
+        /// send cost, how often the frame budget cut a frame short and how many sends the minimum
+        /// share made past it. Together they say whether the budget or the minimum is setting the
+        /// rate on a big server, and what the minimum costs in server frame time - which is what
+        /// Min Players Per Frame Percent's default has to be judged on. The first call of a
+        /// session only takes the baseline.
+        /// </summary>
+        private static void SampleScheduler(double now) {
+            if (_lastSchedulerSampleMs > 0d && now - _lastSchedulerSampleMs < SchedulerSampleMs) { return; }
+
+            long serviced = Patches.SendSchedulerPatches.TotalServiced;
+            long sends = Patches.SendSchedulerPatches.TotalSends;
+            long pastBudget = Patches.SendSchedulerPatches.TotalPastBudget;
+            long breaks = Patches.SendSchedulerPatches.TotalBudgetBreaks;
+            double sendMs = Patches.SendSchedulerPatches.TotalSendMs;
+            double windowMs = now - _lastSchedulerSampleMs;
+            // A session reset zeroes the totals; that window is a baseline, not a sample.
+            bool baseline = _lastSchedulerSampleMs <= 0d || serviced < _schedServiced;
+
+            long dServiced = serviced - _schedServiced;
+            long dSends = sends - _schedSends;
+            long dPastBudget = pastBudget - _schedPastBudget;
+            long dBreaks = breaks - _schedBreaks;
+            double dSendMs = sendMs - _schedSendMs;
+            _schedServiced = serviced;
+            _schedSends = sends;
+            _schedPastBudget = pastBudget;
+            _schedBreaks = breaks;
+            _schedSendMs = sendMs;
+            _lastSchedulerSampleMs = now;
+
+            if (baseline || !PatchGuard.IsActive(Mechanism.SendScheduler) || !ValConfig.EnableSchedulerFix.Value) { return; }
+
+            int peers = ZDOMan.s_instance != null ? ZDOMan.s_instance.m_peers.Count : 0;
+            EmitServer(Line.Begin("sched")
+                .Num("t", now, "0.#")
+                .Num("ms", windowMs, "0")
+                .Int("peers", peers)
+                .Int("min", Patches.SendSchedulerPatches.MinPeersPerFrame(peers))
+                .Int("serviced", dServiced)
+                .Int("sends", dSends)
+                .Int("pastBudget", dPastBudget)
+                .Int("breaks", dBreaks)
+                .Num("hz", peers > 0 ? dServiced * 1000d / windowMs / peers : 0d, "0.#")
+                .Num("sendMs", dSends > 0 ? dSendMs / dSends : 0d, "0.###")
+                .End());
         }
 
         // -- session and config ------------------------------------------------------------
@@ -636,6 +694,13 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (CreaturePacing.TryGetPeerCounts(peer.m_uid, out long paceDeferred, out long paceListed)) {
                     line.Int("paceDef", paceDeferred)
                         .Int("paceList", paceListed);
+                }
+                // M33: buildings, trees and rocks parked for this player (running totals) and
+                // parked right now.
+                if (StructureUpdates.TryGetPeerCounts(peer.m_uid, out long structParked, out long structListed, out int structNow)) {
+                    line.Int("stPark", structParked)
+                        .Int("stList", structListed)
+                        .Int("stNow", structNow);
                 }
 
                 EmitServer(line.End());

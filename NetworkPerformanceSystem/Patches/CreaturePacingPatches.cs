@@ -15,8 +15,9 @@ namespace NetworkPerformanceSystem.Patches {
     /// the head, still marked in the peer's force-send set, which is how they are recognised and
     /// kept. The host branch only: the same IsServer() test vanilla branches on.
     ///
-    /// It also carries M31's host half (QuietWildlife): fish and birds are filtered by the same
-    /// pass, so the postfix runs when either setting is on and each half obeys its own.
+    /// It also carries M31's host half (QuietWildlife) and M33 (StructureUpdates): fish and birds,
+    /// and buildings, trees and rocks, are filtered by the same pass, so the postfix runs when any
+    /// of the three settings is on and each obeys its own.
     /// </summary>
     [HarmonyPatch]
     internal static class CreaturePacingPatches {
@@ -47,10 +48,12 @@ namespace NetworkPerformanceSystem.Patches {
             if (toSync == null || toSync.Count == 0 || peer?.m_peer == null) { return; }
             bool creatures = CreaturePacing.Active;
             bool wildlife = QuietWildlife.RelayActive;
-            if (!creatures && !wildlife) { return; }
+            bool structures = StructureUpdates.Active;
+            if (!creatures && !wildlife && !structures) { return; }
             if (ZNet.instance == null || !ZNet.instance.IsServer()) { return; }
 
-            CreaturePacing.Filter(peer, toSync, peer.m_peer.GetRefPos(), Time.time, creatures, wildlife);
+            CreaturePacing.Filter(peer, toSync, peer.m_peer.GetRefPos(), Time.time, creatures, wildlife,
+                                  structures, structures && StructureUpdates.OwnerChangesMayWait);
         }
     }
 }

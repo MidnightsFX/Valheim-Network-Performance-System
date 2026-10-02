@@ -44,9 +44,6 @@ namespace NetworkPerformanceSystem {
 
         // Add Server synced config entries under here
 
-        // number of peers to send data to per update
-        public static ConfigEntry<int> PeersPerUpdate; 
-
         // M2/M2c - bandwidth-delay-product send window
         public static ConfigEntry<bool> EnableSendWindowSizing;
         public static ConfigEntry<float> SendWindowBdpFactor;
@@ -56,6 +53,7 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<bool> EnableSchedulerFix;
         public static ConfigEntry<float> SendIntervalSeconds;
         public static ConfigEntry<float> SendSchedulerFrameBudgetMs;
+        public static ConfigEntry<int> SendSchedulerMinPeersPercent;
 
         // M3 - latency-aware ownership arbitration
         public static ConfigEntry<bool> EnableOwnershipArbitration;
@@ -265,20 +263,6 @@ namespace NetworkPerformanceSystem {
                 new AcceptableValueRange<float>(1f, 300f),
                 new ConfigurationManagerAttributes { IsAdvanced = true }));
 
-            // --- ReturnToSender Number of Peers Per Update (synced with server) -------------
-            PeersPerUpdate = BindServerConfig(
-                "ZDO Peers", "Peers Per Update", 10, 
-                "Number of peers to sync data to each update tick. Vanilla default is 1. The higher this is the more data needs to be transferred each update tick.",
-                valMin: 1, valMax: 50
-            );
-
-            // --- M2/M2c: bandwidth-delay-product send window -------------------------------
-            // Vanilla allows a fixed 10240 bytes of in-flight reliable ZDO data per peer.
-            // Throughput through a fixed window is window/RTT, so vanilla is correctly sized
-            // up to ~67ms RTT and starves every peer beyond it (~41 KB/s at 250ms) regardless
-            // of their actual connection. Sizing by RTT is a no-op for local players by
-            // construction, which is the point - a big static window instead adds standing
-            // queue delay to the peers that were already fine.
             // Bandwidth sizing
             EnableSendWindowSizing = BindServerConfig("Send Window", "Enable BDP Window Sizing", true,
                 "Size each peer's in-flight ZDO window from their measured round-trip time and the rate Steam sends to them at. Low-latency peers are unaffected; high-latency peers stop being throttled by their distance.");
@@ -293,7 +277,9 @@ namespace NetworkPerformanceSystem {
             SendIntervalSeconds = BindServerConfig("Send Scheduler", "Send Interval Seconds", 0.033f,
                 "Seconds between ZDO send rounds. Vanilla is 0.05, lower = more updates, higher = slower updates.", true, 0.02f, 0.2f);
             SendSchedulerFrameBudgetMs = BindServerConfig("Send Scheduler", "Frame Budget Ms", 4f,
-                "Maximum milliseconds per frame the host spends sending ZDOs to peers. Peers are serviced in round-robin order until the budget runs out and the remainder is owed to the next frame, so nobody is starved. On a busy server this is what keeps the frame time bounded: the effective per-peer send rate becomes min(1/interval, budget/cost) - raise it to trade server frame time for send rate, lower it on a CPU-constrained host. nps_stats shows the effective rate and how often the budget is hit.", true, 0.5f, 16f);
+                "Maximum milliseconds per frame the host spends sending ZDOs to peers, once Min Players Per Frame Percent of them have been sent to. Peers are serviced in round-robin order until the budget runs out and the remainder is owed to the next frame, so nobody is starved. On a busy server this is what keeps the frame time bounded: the effective per-peer send rate becomes min(1/interval, budget/cost) - raise it to trade server frame time for send rate, lower it on a CPU-constrained host. nps_stats shows the effective rate and how often the budget is hit.", true, 0.5f, 16f);
+            SendSchedulerMinPeersPercent = BindServerConfig("Send Scheduler", "Min Players Per Frame Percent", 25,
+                "The frame budget never stops a frame's sends before this share of the connected players has been sent to (rounded up, at least one). On a big server each send costs more, and the budget alone can cut a frame down to one or two players, leaving each player waiting dozens of server frames for an update. With this, every player is sent to at least once every few server frames however many have joined: 25 is at least once every 4 frames. It only adds sends while the budget is what is limiting, and those sends cost server frame time. 0 leaves the budget alone in charge. nps_stats shows how many sends it adds and what each one costs.", true, 0, 100);
 
             // Arbiter
             EnableOwnershipArbitration = BindServerConfig("Ownership", "Enable Latency-Aware Ownership", true,

@@ -221,6 +221,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendFightingCreaturesFirst(sb);
             AppendCreaturePacing(sb);
             AppendQuietWildlife(sb);
+            AppendStructureUpdates(sb);
             AppendStatusEffectRepeats(sb);
             AppendPlayerHistoryRepeats(sb);
             AppendRoutedRpc(sb);
@@ -265,7 +266,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.SteamTransport: return ValConfig.EnableSteamTransportTuning.Value;
                 case Mechanism.SyncListCache: return ValConfig.EnableSyncListCache.Value;
                 case Mechanism.ConnectionTimeout: return ValConfig.EnableConnectionTimeoutTuning.Value;
-                case Mechanism.RpcOwnerRouting: return ValConfig.EnableStationRpcRouting.Value || ValConfig.EnableCreatureHitRouting.Value;
+                case Mechanism.RpcOwnerRouting: return ValConfig.EnableStationRpcRouting.Value || ValConfig.EnableCreatureHitRouting.Value || ValConfig.EnableStructureHitRouting.Value;
                 case Mechanism.JotunnQueueLimit: return ValConfig.EnableSendWindowSizing.Value;
                 case Mechanism.QueueSizeView: return ValConfig.EnableSendWindowSizing.Value && ValConfig.ReportVanillaQueueSize.Value;
                 case Mechanism.DeserializeAlloc: return AllocationRelief.DeserializeWanted;
@@ -287,6 +288,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.StatusEffectRepeats: return ValConfig.LimitRepeatedStatusEffects.Value;
                 case Mechanism.QuietWildlife: return ValConfig.QuietWildlifeUpdates.Value;
                 case Mechanism.PlayerHistoryRepeats: return ValConfig.SendPlayerHistoryOnlyWhenChanged.Value;
+                case Mechanism.StructureUpdates: return ValConfig.HoldUnchangedStructures.Value;
                 default: return true;
             }
         }
@@ -949,6 +951,51 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"    >{QuietWildlife.RelayNearMetres:F0}m           {QuietWildlife.RelayHeldFar} (at most {1f / QuietWildlife.FishRelayFarInterval:F0}/s fish, {1f / QuietWildlife.BirdRelayFarInterval:F0}/s birds)");
         }
 
+        /// <summary>What M33 is holding back: building, tree and rock updates players already
+        /// have, by why the rest went out. Host only: it is the host's send list that is filtered.</summary>
+        private static void AppendStructureUpdates(StringBuilder sb) {
+            if (!NpsEnv.IsHost()) { return; }
+
+            sb.AppendLine();
+            sb.AppendLine("Building, tree and rock updates (since start):");
+            string reason = PatchGuard.GetDisableReason(Mechanism.StructureUpdates)
+                         ?? PatchGuard.GetDisableReason(Mechanism.CreaturePacing);
+            if (reason != null) {
+                sb.AppendLine($"  stood down: {reason}");
+                return;
+            }
+            if (!ValConfig.HoldUnchangedStructures.Value) {
+                sb.AppendLine("  off (every change goes to every player who has the object, ahead of every creature)");
+                return;
+            }
+
+            long[] by = StructureUpdates.SentBy;
+            long sent = 0;
+            for (int i = 1; i < by.Length; i++) { sent += by[i]; }
+            long listed = StructureUpdates.Listed;
+            string share = listed > 0 ? $" ({100f * StructureUpdates.Parked / listed:F0}%)" : "";
+            bool ownersWait = StructureUpdates.OwnerChangesMayWait;
+            sb.AppendLine($"  parked           {StructureUpdates.Parked} of {listed} listed{share}; {StructureUpdates.Reparked} more changes while parked; {StructureUpdates.ParkedNow} parked now");
+            sb.AppendLine($"  owner changes    {(ownersWait ? "may wait" : "always sent (needs Route Structure Hits To Owner and Reject Stale Owner Updates)")}");
+            sb.AppendLine($"  sent at once     {sent}: changed {by[(int)StructureUpdates.Reason.Changed]}, within {StructureUpdates.NearMetres:F0}m {by[(int)StructureUpdates.Reason.Near]}, " +
+                          $"no record {by[(int)StructureUpdates.Reason.NoRecord]}, host wrote {by[(int)StructureUpdates.Reason.HostWrote]}, " +
+                          $"owner change {by[(int)StructureUpdates.Reason.OwnerChange]}, former owner {by[(int)StructureUpdates.Reason.FormerOwner]}, " +
+                          $"their own {by[(int)StructureUpdates.Reason.OwnsIt]}, force-sent {by[(int)StructureUpdates.Reason.ForceSend]}");
+            sb.AppendLine($"  hold ended       {StructureUpdates.Released} into spare room, {StructureUpdates.ReleasedAtCeiling} at twice {StructureUpdates.MaxHoldSeconds:F0}s, " +
+                          $"{StructureUpdates.ForceRestored} for a force-send, {StructureUpdates.Dropped} overwritten elsewhere");
+            sb.AppendLine($"  changes seen     {StructureUpdates.Stamped} applied updates changed something; {StructureUpdates.RecordCount} objects tracked");
+
+            string refused = "";
+            if (StructureUpdates.RefusedBy.Count > 0) {
+                List<KeyValuePair<string, int>> top = new List<KeyValuePair<string, int>>(StructureUpdates.RefusedBy);
+                top.Sort((a, b) => b.Value.CompareTo(a.Value));
+                List<string> names = new List<string>();
+                for (int i = 0; i < top.Count && i < 6; i++) { names.Add($"{top[i].Key} {top[i].Value}"); }
+                refused = $" (kept out by {string.Join(", ", names.ToArray())})";
+            }
+            sb.AppendLine($"  prefabs          {StructureUpdates.PrefabsHeld} held, {StructureUpdates.PrefabsRefused} never held{refused}");
+        }
+
         /// <summary>What M30 has seen and held. Every role: the requests are counted where they
         /// are made, and again on the host for the ones players send it. The counting runs with
         /// the limit off too, so the numbers say whether switching it on would do anything.</summary>
@@ -1019,10 +1066,12 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  sends/s          {SendSchedulerPatches.ServicedLastSecond} across {peers} peers");
             sb.AppendLine($"  per-peer rate    {effectiveHz:F1} Hz (target {targetHz:F0} Hz)");
             sb.AppendLine($"  last frame       {SendSchedulerPatches.LastFrameServiced} peers");
+            sb.AppendLine($"  send cost        {SendSchedulerPatches.SendCostMsLastSecond:F2}ms per peer");
             sb.AppendLine($"  budget breaks/s  {SendSchedulerPatches.BudgetBreaksLastSecond} (frame budget {ValConfig.SendSchedulerFrameBudgetMs.Value:F1}ms)");
+            sb.AppendLine($"  past budget/s    {SendSchedulerPatches.PastBudgetLastSecond} sends (min {SendSchedulerPatches.MinPeersPerFrame(peers)} peers per frame, {ValConfig.SendSchedulerMinPeersPercent.Value}%)");
             if (peers > 0 && SendSchedulerPatches.BudgetBreaksLastSecond > 0 && effectiveHz < targetHz * 0.75f) {
-                sb.AppendLine("  NOTE: send rate is CPU-bound - the frame budget is cutting rounds short. Raise Frame Budget Ms");
-                sb.AppendLine("  to trade server frame time for send rate, or accept the lower rate.");
+                sb.AppendLine("  NOTE: send rate is CPU-bound - the frame budget is cutting rounds short. Raise Frame Budget Ms or");
+                sb.AppendLine("  Min Players Per Frame Percent to trade server frame time for send rate, or accept the lower rate.");
             }
         }
 
@@ -1103,8 +1152,20 @@ namespace NetworkPerformanceSystem.Runtime {
                 AppendHoldLines(sb, c, items: false);
             }
 
+            sb.AppendLine();
+            sb.AppendLine("Structure hits (since start):");
+            if (!hooks || !ValConfig.EnableStructureHitRouting.Value) {
+                sb.AppendLine("  vanilla (hits, repairs and removals on buildings, trees and rocks go to whoever the sender's copy names as owner)");
+            } else {
+                RpcOwnerRouter.Counters t = RpcOwnerRouter.Structures;
+                sb.AppendLine($"  {Pad("seen", 13)} {t.Seen} hits, repairs, removals and snow changes on buildings, trees and rocks");
+                sb.AppendLine($"  {Pad("re-targeted", 13)} {t.Retargeted} (sender's copy named a stale owner, or nobody - delivered to the current one)");
+                sb.AppendLine($"  {Pad("claimed", 13)} {t.Claimed} (no present owner - handed to the sender first)");
+                AppendHoldLines(sb, t, items: false);
+            }
+
             if (RpcOwnerRouter.Waiting > 0) {
-                sb.AppendLine($"  {Pad("waiting", 13)} {RpcOwnerRouter.Waiting} (both kinds)");
+                sb.AppendLine($"  {Pad("waiting", 13)} {RpcOwnerRouter.Waiting} (all kinds)");
             }
         }
 

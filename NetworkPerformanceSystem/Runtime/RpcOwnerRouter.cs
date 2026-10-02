@@ -117,6 +117,17 @@ namespace NetworkPerformanceSystem.Runtime {
     /// back to it as the new owner, counts twice in that player's stats. The damage lands once.
     /// RPC_Stagger is deliberately NOT routed: it has no IsOwner check at all and runs on every
     /// receiver, so re-addressing it would take the stagger away from the others.
+    ///
+    /// STRUCTURE HITS are the third family: hits, repairs, removals and snow changes on the
+    /// buildings, trees and rocks M33 holds updates for (StructureUpdates.IsHeldStructure).
+    /// WearNTear's RPC_Damage, RPC_Remove, RPC_Repair and RPC_SetSnow, TreeBase's, MineRock5's and
+    /// Destructible's RPC_Damage, and MineRock's "Hit" are all addressed through the sender's copy
+    /// of the owner and dropped by a non-owner's IsOwner check; RPC_ClearCachedSupport names the
+    /// owner from the sender's copy too. M33 lets a player's copy name an old owner for longer,
+    /// so this family is what makes that safe, and it catches vanilla's own stale window besides.
+    /// Presence is judged by the station test - the 3x3 square the ownership pass uses for "owner
+    /// present" on anything that is not a creature - so a claim made here is one the pass keeps.
+    /// No item rides on any of these, so nothing is refunded.
     /// </summary>
     internal static class RpcOwnerRouter {
 
@@ -125,6 +136,7 @@ namespace NetworkPerformanceSystem.Runtime {
         internal enum Family : byte {
             Station,
             Creature,
+            Structure,
         }
 
         /// <summary>What one family of requests needed correcting. "Re-targeted" and "claimed" are
@@ -155,11 +167,24 @@ namespace NetworkPerformanceSystem.Runtime {
 
         internal static readonly Counters Stations = new Counters();
         internal static readonly Counters Creatures = new Counters();
+        internal static readonly Counters Structures = new Counters();
 
         /// <summary>The owner-addressed creature requests that must land. Only RPC_Damage - see the
         /// class comment for why RPC_Stagger is not one of them.</summary>
         private static readonly HashSet<int> CreatureRequestHashes = new HashSet<int> {
             "RPC_Damage".GetStableHashCode(),
+        };
+
+        /// <summary>The owner-addressed requests on buildings, trees and rocks. RPC_HealthChanged,
+        /// RPC_CreateFragments, MineRock's "Hide" and MineRock5's RPC_SetAreaHealth go to everybody
+        /// and are left alone.</summary>
+        private static readonly HashSet<int> StructureRequestHashes = new HashSet<int> {
+            "RPC_Damage".GetStableHashCode(),              // WearNTear, TreeBase, MineRock5, Destructible
+            "Hit".GetStableHashCode(),                     // MineRock
+            "RPC_Remove".GetStableHashCode(),              // WearNTear
+            "RPC_Repair".GetStableHashCode(),              // WearNTear
+            "RPC_SetSnow".GetStableHashCode(),             // WearNTear
+            "RPC_ClearCachedSupport".GetStableHashCode(),  // WearNTear, addressed by the sender's copy of a neighbour's owner
         };
 
         /// <summary>
@@ -239,7 +264,13 @@ namespace NetworkPerformanceSystem.Runtime {
 
         internal static int Waiting => Held.Count;
 
-        private static Counters For(Family family) => family == Family.Station ? Stations : Creatures;
+        private static Counters For(Family family) {
+            switch (family) {
+                case Family.Station: return Stations;
+                case Family.Creature: return Creatures;
+                default: return Structures;
+            }
+        }
 
         // -- entry points ----------------------------------------------------------------------
 
@@ -315,7 +346,9 @@ namespace NetworkPerformanceSystem.Runtime {
         /// Is this a request one of the enabled families takes, and on what object? The method
         /// hash is checked first because it retires nearly every message for the price of two set
         /// probes; only a matching hash pays for the ZDO lookup and the prefab check. A hit on a
-        /// player or a building matches the hash and fails the prefab check, and is left alone.
+        /// player matches the hash and fails every prefab check, and is left alone. The families
+        /// are tried in order - station, creature, structure - so an RPC_Damage on a creature is
+        /// always a creature hit, and one on a wall or a tree is a structure hit.
         /// </summary>
         private static bool TryClassify(ZDOID target, int methodHash, out ZDO zdo, out Family family) {
             zdo = null;
@@ -324,7 +357,9 @@ namespace NetworkPerformanceSystem.Runtime {
 
             bool station = RequestHashes.Contains(methodHash) && ValConfig.EnableStationRpcRouting.Value;
             bool creature = !station && CreatureRequestHashes.Contains(methodHash) && ValConfig.EnableCreatureHitRouting.Value;
-            if (!station && !creature) { return false; }
+            bool structure = !station && StructureRequestHashes.Contains(methodHash)
+                && ValConfig.EnableStructureHitRouting != null && ValConfig.EnableStructureHitRouting.Value;
+            if (!station && !creature && !structure) { return false; }
 
             zdo = ZDOMan.instance?.GetZDO(target);
             if (zdo == null) { return false; }
@@ -333,8 +368,12 @@ namespace NetworkPerformanceSystem.Runtime {
                 family = Family.Station;
                 return Station(zdo) != null;
             }
-            family = Family.Creature;
-            return OwnershipPolicy.IsCreature(zdo);
+            if (creature && OwnershipPolicy.IsCreature(zdo)) {
+                family = Family.Creature;
+                return true;
+            }
+            family = Family.Structure;
+            return structure && StructureUpdates.IsHeldStructure(zdo);
         }
 
         /// <summary>
@@ -553,7 +592,9 @@ namespace NetworkPerformanceSystem.Runtime {
 
             Vector2s zone = ZoneSystem.GetZone(zdo.GetPosition());
             Vector2s peerZone = ZoneSystem.GetZone(refPos);
-            if (family == Family.Station) {
+            if (family != Family.Creature) {
+                // Stations and structures: the pass's "owner present" test for anything that is
+                // not a creature, so it rescues nothing the router has just given away.
                 return ZoneCompat.InActiveArea(zone, peerZone, ZoneCompat.ActiveZoneRadius);
             }
 
@@ -770,6 +811,7 @@ namespace NetworkPerformanceSystem.Runtime {
             StationPrefabs.Clear();
             Stations.Clear();
             Creatures.Clear();
+            Structures.Clear();
         }
     }
 }

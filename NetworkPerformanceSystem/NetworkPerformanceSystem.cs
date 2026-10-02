@@ -21,7 +21,6 @@ namespace NetworkPerformanceSystem
     [BepInIncompatibility("CW_Jesse.BetterNetworking")]
     [BepInIncompatibility("org.bepinex.plugins.network")]     // Smoothbrain - Network
     [BepInIncompatibility("Searica.Valheim.NetworkTweaks")]
-    [BepInIncompatibility("redseiko.valheim.returntosender")]  // applies same transpiler patch
     [BepInIncompatibility("dzk.warheimnetwork")]
     [BepInIncompatibility("com.maxsch.valheim.TimeoutLimit")]
     // Deliberately NOT blocked - verified to have no patch-site overlap:
@@ -36,7 +35,7 @@ namespace NetworkPerformanceSystem
     {
         public const string PluginGUID = "MidnightsFX.NetworkPerformanceSystem";
         public const string PluginName = "NetworkPerformanceSystem";
-        public const string PluginVersion = "1.13.1";
+        public const string PluginVersion = "1.14.0";
 
         internal static ManualLogSource Log;
         internal static Harmony HarmonyInstance;

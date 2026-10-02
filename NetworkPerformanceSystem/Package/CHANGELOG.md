@@ -1,11 +1,13 @@
 # Changelog
 
-**1.13.1**
+**1.14.0**
 - Players who are still joining and loading the world now get a separate, longer allowance before they are dropped, so the in-world timeout can be kept short.
 - A player whose game or connection dies is now sent back to the menu and freed from the server sooner, instead of sitting in a frozen world.
 - Network monitoring now shows when the same objects are being sent over and over.
 - The server no longer resends the world's list of past players to everyone every few seconds when nothing in it has changed, freeing a large share of its upload.
-- Logs what keeps marking that list as changed, so the mod responsible can be found.
+- Buildings, trees and rocks are no longer re-sent to nearby players when nothing they could see about them changed, leaving room for creatures.
+	- Hits, repairs and removals on buildings, trees and rocks now reach whoever owns them.
+- Busy servers with many players now send world updates to each player more often.
 
 **1.13.0**
 - A ship's chest no longer closes on a passenger while someone else is steering.

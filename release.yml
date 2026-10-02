@@ -20,12 +20,9 @@ publish:
   thunderstore:
     enabled: true
   nexus:
-    # Both ids come from the mod page, which has to exist first: this
-    # uploads a new file version, it cannot create a page. Fill them in
-    # and set enabled: true.
-    enabled: false
-    # mod_id: 0000     # the number in the mod page URL
-    # file_id: 000000  # the EXISTING file this replaces
+    enabled: true
+    mod_id: 4132
+    file_id: 8059587
   github:
     enabled: true
   discord:

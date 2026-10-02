@@ -62,11 +62,80 @@ namespace NetworkPerformanceSystem.Runtime {
             if (!Resolve()) { return false; }
 
             try {
-                return WriteVia(_resolved, key, value);
+                return WriteVia(_resolved, key, ESteamNetworkingConfigScope.k_ESteamNetworkingConfig_Global, IntPtr.Zero, value);
             } catch (Exception e) {
                 Logger.LogWarning($"Steam transport: writing {key} failed ({e.GetType().Name}: {e.Message}). " +
                                   "That value keeps its vanilla setting.");
                 return false;
+            }
+        }
+
+        // -- one connection ----------------------------------------------------------------
+        // The same keys exist at Connection scope, where the scope object is the connection
+        // handle itself (an intptr_t carrying the value, not a pointer to it). A value set there
+        // overrides Global for that connection alone, stops following later Global writes, and
+        // dies with the connection. Writing a null value at a non-global scope removes it, so the
+        // connection inherits again. Every write is read back: Steam returns OK for a value set on
+        // the connection itself, OKInherited when none is, and BadScopeObj for a handle it does
+        // not know - which is how an interface that cannot do this at all announces itself.
+
+        /// <summary>Outcome of a connection-scope rate write or clear, verified by reading the
+        /// connection back. BadHandle is Steam not recognising the connection - closed under us,
+        /// or an interface that does not resolve handles the other half created. Failed is
+        /// anything else, including a readback that did not show the value written.</summary>
+        internal enum ConnectionResult { Ok, BadHandle, Failed }
+
+        /// <summary>Pins one connection's send rate: SendRateMax then SendRateMin at Connection
+        /// scope, the order SteamTransport.WriteRate uses for the global pair, then reads Min
+        /// back.</summary>
+        internal static ConnectionResult TrySetConnectionRate(uint hConn, int bytesPerSec) {
+            if (!Resolve()) { return ConnectionResult.Failed; }
+
+            try {
+                IntPtr scopeObj = new IntPtr((long)hConn);
+                const ESteamNetworkingConfigScope scope = ESteamNetworkingConfigScope.k_ESteamNetworkingConfig_Connection;
+                if (!WriteVia(_resolved, ESteamNetworkingConfigValue.k_ESteamNetworkingConfig_SendRateMax, scope, scopeObj, bytesPerSec)) { return ConnectionResult.Failed; }
+                if (!WriteVia(_resolved, ESteamNetworkingConfigValue.k_ESteamNetworkingConfig_SendRateMin, scope, scopeObj, bytesPerSec)) { return ConnectionResult.Failed; }
+                return VerifyConnection(scopeObj, bytesPerSec);
+            } catch (Exception e) {
+                Logger.LogWarning($"Steam transport: per-connection send-rate write failed ({e.GetType().Name}: {e.Message}).");
+                return ConnectionResult.Failed;
+            }
+        }
+
+        /// <summary>Removes one connection's send-rate override so it inherits the global rate
+        /// again, then reads back that nothing is set on it any more.</summary>
+        internal static ConnectionResult TryClearConnectionRate(uint hConn) {
+            if (!Resolve()) { return ConnectionResult.Failed; }
+
+            try {
+                IntPtr scopeObj = new IntPtr((long)hConn);
+                const ESteamNetworkingConfigScope scope = ESteamNetworkingConfigScope.k_ESteamNetworkingConfig_Connection;
+                if (!ClearVia(_resolved, ESteamNetworkingConfigValue.k_ESteamNetworkingConfig_SendRateMax, scope, scopeObj)) { return ConnectionResult.Failed; }
+                if (!ClearVia(_resolved, ESteamNetworkingConfigValue.k_ESteamNetworkingConfig_SendRateMin, scope, scopeObj)) { return ConnectionResult.Failed; }
+                return VerifyConnection(scopeObj, 0);
+            } catch (Exception e) {
+                Logger.LogWarning($"Steam transport: per-connection send-rate clear failed ({e.GetType().Name}: {e.Message}).");
+                return ConnectionResult.Failed;
+            }
+        }
+
+        /// <summary>Reads SendRateMin back at Connection scope. expected == 0 means a clear: the
+        /// value must now be inherited. Anything else must be set on the connection, at that
+        /// value.</summary>
+        private static ConnectionResult VerifyConnection(IntPtr scopeObj, int expected) {
+            ESteamNetworkingGetConfigValueResult result = ReadRaw(_resolved,
+                ESteamNetworkingConfigValue.k_ESteamNetworkingConfig_SendRateMin,
+                ESteamNetworkingConfigScope.k_ESteamNetworkingConfig_Connection, scopeObj, out int value);
+            switch (result) {
+                case ESteamNetworkingGetConfigValueResult.k_ESteamNetworkingGetConfigValue_OK:
+                    return expected != 0 && value == expected ? ConnectionResult.Ok : ConnectionResult.Failed;
+                case ESteamNetworkingGetConfigValueResult.k_ESteamNetworkingGetConfigValue_OKInherited:
+                    return expected == 0 ? ConnectionResult.Ok : ConnectionResult.Failed;
+                case ESteamNetworkingGetConfigValueResult.k_ESteamNetworkingGetConfigValue_BadScopeObj:
+                    return ConnectionResult.BadHandle;
+                default:
+                    return ConnectionResult.Failed;
             }
         }
 
@@ -99,9 +168,10 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             _resolved = UtilsApi.Absent;
-            PatchGuard.Disable(Mechanism.SteamTransport,
-                "neither Steamworks networking-utils interface is initialised in this process " +
-                "(crossplay-only, or Steamworks failed to start). Send-rate bounds and Nagle stay at vanilla.");
+            const string reason = "neither Steamworks networking-utils interface is initialised in this process " +
+                                  "(crossplay-only, or Steamworks failed to start). Send-rate bounds and Nagle stay at vanilla.";
+            PatchGuard.Disable(Mechanism.SteamTransport, reason);
+            PatchGuard.Disable(Mechanism.LossBackoff, reason);
             return false;
         }
 
@@ -118,22 +188,30 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         private static bool TryReadVia(UtilsApi api, ESteamNetworkingConfigValue key, out int value) {
+            ESteamNetworkingGetConfigValueResult result = ReadRaw(api, key,
+                ESteamNetworkingConfigScope.k_ESteamNetworkingConfig_Global, IntPtr.Zero, out value);
+            return result == ESteamNetworkingGetConfigValueResult.k_ESteamNetworkingGetConfigValue_OK
+                || result == ESteamNetworkingGetConfigValueResult.k_ESteamNetworkingGetConfigValue_OKInherited;
+        }
+
+        /// <summary>One int32 read at any scope, with Steam's own verdict returned as-is. The value
+        /// is only meaningful on OK or OKInherited.</summary>
+        private static ESteamNetworkingGetConfigValueResult ReadRaw(UtilsApi api, ESteamNetworkingConfigValue key,
+                                                                  ESteamNetworkingConfigScope scope, IntPtr scopeObj, out int value) {
             value = 0;
             IntPtr buffer = Marshal.AllocHGlobal(sizeof(int));
             try {
                 Marshal.WriteInt32(buffer, 0);
                 ulong size = sizeof(int);
                 ESteamNetworkingGetConfigValueResult result = api == UtilsApi.GameServer
-                    ? ReadGameServer(key, buffer, ref size)
-                    : ReadClient(key, buffer, ref size);
+                    ? ReadGameServer(key, scope, scopeObj, buffer, ref size)
+                    : ReadClient(key, scope, scopeObj, buffer, ref size);
 
-                if (result != ESteamNetworkingGetConfigValueResult.k_ESteamNetworkingGetConfigValue_OK &&
-                    result != ESteamNetworkingGetConfigValueResult.k_ESteamNetworkingGetConfigValue_OKInherited) {
-                    return false;
+                if (result == ESteamNetworkingGetConfigValueResult.k_ESteamNetworkingGetConfigValue_OK ||
+                    result == ESteamNetworkingGetConfigValueResult.k_ESteamNetworkingGetConfigValue_OKInherited) {
+                    value = Marshal.ReadInt32(buffer);
                 }
-
-                value = Marshal.ReadInt32(buffer);
-                return true;
+                return result;
             } finally {
                 Marshal.FreeHGlobal(buffer);
             }
@@ -142,45 +220,52 @@ namespace NetworkPerformanceSystem.Runtime {
         // The four interop calls live in their own non-inlined methods so the Steamworks types are
         // only resolved when one is actually invoked, and anything they throw - including a
         // type-load failure - lands in the caller's catch rather than escaping into the patch.
+        // Scope and scope object are arguments: Global with a zero object for the process-wide
+        // keys, Connection with the handle for one connection's.
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         private static ESteamNetworkingGetConfigValueResult ReadGameServer(
-            ESteamNetworkingConfigValue key, IntPtr buffer, ref ulong size) {
-            return SteamGameServerNetworkingUtils.GetConfigValue(key,
-                ESteamNetworkingConfigScope.k_ESteamNetworkingConfig_Global, IntPtr.Zero,
+            ESteamNetworkingConfigValue key, ESteamNetworkingConfigScope scope, IntPtr scopeObj, IntPtr buffer, ref ulong size) {
+            return SteamGameServerNetworkingUtils.GetConfigValue(key, scope, scopeObj,
                 out ESteamNetworkingConfigDataType _, buffer, ref size);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         private static ESteamNetworkingGetConfigValueResult ReadClient(
-            ESteamNetworkingConfigValue key, IntPtr buffer, ref ulong size) {
-            return SteamNetworkingUtils.GetConfigValue(key,
-                ESteamNetworkingConfigScope.k_ESteamNetworkingConfig_Global, IntPtr.Zero,
+            ESteamNetworkingConfigValue key, ESteamNetworkingConfigScope scope, IntPtr scopeObj, IntPtr buffer, ref ulong size) {
+            return SteamNetworkingUtils.GetConfigValue(key, scope, scopeObj,
                 out ESteamNetworkingConfigDataType _, buffer, ref size);
         }
 
-        private static bool WriteVia(UtilsApi api, ESteamNetworkingConfigValue key, int value) {
+        private static bool WriteVia(UtilsApi api, ESteamNetworkingConfigValue key,
+                                     ESteamNetworkingConfigScope scope, IntPtr scopeObj, int value) {
             GCHandle pinned = GCHandle.Alloc(value, GCHandleType.Pinned);
             try {
                 return api == UtilsApi.GameServer
-                    ? WriteGameServer(key, pinned.AddrOfPinnedObject())
-                    : WriteClient(key, pinned.AddrOfPinnedObject());
+                    ? WriteGameServer(key, scope, scopeObj, pinned.AddrOfPinnedObject())
+                    : WriteClient(key, scope, scopeObj, pinned.AddrOfPinnedObject());
             } finally {
                 pinned.Free();
             }
         }
 
+        /// <summary>A null value at a non-global scope removes the entry, so the object inherits.</summary>
+        private static bool ClearVia(UtilsApi api, ESteamNetworkingConfigValue key,
+                                     ESteamNetworkingConfigScope scope, IntPtr scopeObj) {
+            return api == UtilsApi.GameServer
+                ? WriteGameServer(key, scope, scopeObj, IntPtr.Zero)
+                : WriteClient(key, scope, scopeObj, IntPtr.Zero);
+        }
+
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static bool WriteGameServer(ESteamNetworkingConfigValue key, IntPtr value) {
-            return SteamGameServerNetworkingUtils.SetConfigValue(key,
-                ESteamNetworkingConfigScope.k_ESteamNetworkingConfig_Global, IntPtr.Zero,
+        private static bool WriteGameServer(ESteamNetworkingConfigValue key, ESteamNetworkingConfigScope scope, IntPtr scopeObj, IntPtr value) {
+            return SteamGameServerNetworkingUtils.SetConfigValue(key, scope, scopeObj,
                 ESteamNetworkingConfigDataType.k_ESteamNetworkingConfig_Int32, value);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private static bool WriteClient(ESteamNetworkingConfigValue key, IntPtr value) {
-            return SteamNetworkingUtils.SetConfigValue(key,
-                ESteamNetworkingConfigScope.k_ESteamNetworkingConfig_Global, IntPtr.Zero,
+        private static bool WriteClient(ESteamNetworkingConfigValue key, ESteamNetworkingConfigScope scope, IntPtr scopeObj, IntPtr value) {
+            return SteamNetworkingUtils.SetConfigValue(key, scope, scopeObj,
                 ESteamNetworkingConfigDataType.k_ESteamNetworkingConfig_Int32, value);
         }
     }

@@ -30,6 +30,11 @@ namespace NetworkPerformanceSystem.Runtime {
     /// reflection write rather than a Harmony patch. Jotunn is a hard dependency, so the type is
     /// always present; the field name is what could change between Jotunn versions, and a miss
     /// stands the mechanism down loudly rather than throwing out of Awake.
+    ///
+    /// M14 (SendQueueView) now also covers Jotunn: its wait loop reads the queue through the
+    /// socket like everyone else's and is shown the vanilla-sized figure. This stays as the
+    /// backstop for when that view is switched off or has stood down, and costs nothing when it
+    /// is not needed - a limit that is never approached is never waited on.
     /// </summary>
     internal static class JotunnSendQueue {
 

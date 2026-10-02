@@ -42,8 +42,6 @@ namespace NetworkPerformanceSystem.Patches {
     [HarmonyPatch]
     internal static class SendSchedulerPatches {
 
-        private static bool _checkedForReturnToSender;
-
         /// <summary>Fractional peers owed a send, accumulated per frame. Clamped to one full
         /// round so a hitch is repaid as at most one burst, not several.</summary>
         private static float _strideAccumulator;
@@ -64,8 +62,6 @@ namespace NetworkPerformanceSystem.Patches {
         [HarmonyPatch(typeof(ZDOMan), "SendZDOToPeers2")]
         [HarmonyPrefix]
         private static bool ReplaceRoundRobin(ZDOMan __instance, float dt) {
-            EnsureReturnToSenderCheck();
-
             if (!PatchGuard.IsActive(Mechanism.SendScheduler)) { return true; }
             if (!ValConfig.EnableSchedulerFix.Value) { return true; }
 
@@ -141,14 +137,12 @@ namespace NetworkPerformanceSystem.Patches {
         /// all-peers loop, so our prefix would never fire. It already does this job correctly -
         /// stand down rather than leave dead code that looks active in the log.
         ///
-        /// Checked lazily on first tick rather than at Awake because BepInEx populates
-        /// Chainloader.PluginInfos incrementally as plugins load, so a plugin ordered after us is
-        /// not visible from our own Awake.
+        /// Called once from the plugin's Start, not from the prefix: with ReturnToSender installed
+        /// the prefix never runs, so a check inside it could never find the mod it is looking for.
+        /// Not from Awake either, because BepInEx populates Chainloader.PluginInfos incrementally
+        /// as plugins load, so a plugin ordered after us is not visible from our own Awake.
         /// </summary>
-        private static void EnsureReturnToSenderCheck() {
-            if (_checkedForReturnToSender) { return; }
-            _checkedForReturnToSender = true;
-
+        internal static void CheckForReturnToSender() {
             if (PatchGuard.IsPluginLoaded(PatchGuard.ReturnToSenderGUID)) {
                 PatchGuard.Disable(Mechanism.SendScheduler,
                     "ReturnToSender is installed and already services every peer per tick. " +

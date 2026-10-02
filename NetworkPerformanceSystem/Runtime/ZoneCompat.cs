@@ -112,6 +112,31 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
+        /// Whether a peer centred on peerZone has a zone in its near ring - the ring ZNetScene
+        /// instantiates every object in, simulated or not. Exact rather than an upper bound, which
+        /// is the difference from ZdoInstancePossible: this answers "may this peer be left owning a
+        /// creature it is not standing next to", and an answer that is ever too generous leaves a
+        /// creature with an owner that has no instance of it, frozen.
+        ///
+        /// ZDOMan.FindSectorObjects walks Chebyshev rings 1..near around the peer's zone and keeps
+        /// a ring zone only when ZoneSystem.ZonesWithinRadius passes it - centre distance under
+        /// near zones plus half a zone - unless the distance is classic, which keeps the whole
+        /// square. At the stock near distance of 2 that drops the four corners of the 5x5.
+        ///
+        /// Pure, so the offline harness can table it against that loop.
+        /// </summary>
+        internal static bool NearRingLoaded(Vector2s peerZone, Vector2s zone, int near, bool classic) {
+            int dx = zone.x - peerZone.x;
+            int dy = zone.y - peerZone.y;
+            if (Mathf.Abs(dx) > near || Mathf.Abs(dy) > near) { return false; }
+            if (classic) { return true; }
+
+            float radius = near * ZoneSystem.c_ZoneSize + ZoneSystem.c_ZoneSizeHalf;
+            float distanceSq = (dx * dx + dy * dy) * ZoneSystem.c_ZoneSize * ZoneSystem.c_ZoneSize;
+            return distanceSq < radius * radius;
+        }
+
+        /// <summary>
         /// A zone's live sector list, or null when the zone holds nothing.
         ///
         /// Mirrors ZDOMan.FindObjects: the index is clamped rather than bounds-checked, with
@@ -131,6 +156,33 @@ namespace NetworkPerformanceSystem.Runtime {
             return man.m_portalObjects.TryGetValue(ZoneSystem.SectorToIndex(zone), out List<ZDO> portals)
                 ? portals
                 : null;
+        }
+
+        /// <summary>
+        /// Whether this zone's objects live in bucket 0 - which every zone outside the 512x512
+        /// sector grid shares (roughly beyond 16km from the world centre on either axis), along
+        /// with the grid's own corner zone (-256, -256).
+        ///
+        /// Mods do build playable space out there, and a dedicated server's reference position can
+        /// be put there too. For such a zone SectorObjects answers with every object in every
+        /// such zone, so anything that visits zones one at a time and trusts the zone it asked
+        /// about - rather than each object's position - sees the same objects once per zone and
+        /// judges them by the wrong one. ZDOMan.FindSectorObjects avoids it by remembering the
+        /// sector indices it has visited; callers of SectorObjects must do the same, or skip
+        /// these zones and walk SharedBucketObjects once instead.
+        /// </summary>
+        internal static bool InSharedBucket(Vector2s zone) {
+            return ZoneSystem.SectorToIndex(zone).Sector == ZoneSystem.SectorZero.Sector;
+        }
+
+        /// <summary>Every object in bucket 0, whatever zone it is really in. See InSharedBucket.</summary>
+        internal static List<ZDO> SharedBucketObjects(ZDOMan man) {
+            return man.m_objectsBySector[ZoneSystem.SectorZero.Sector];
+        }
+
+        /// <summary>Every portal in bucket 0, whatever zone it is really in. See InSharedBucket.</summary>
+        internal static List<ZDO> SharedBucketPortals(ZDOMan man) {
+            return man.m_portalObjects.TryGetValue(ZoneSystem.SectorZero, out List<ZDO> portals) ? portals : null;
         }
     }
 }

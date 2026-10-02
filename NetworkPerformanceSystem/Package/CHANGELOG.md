@@ -1,5 +1,110 @@
 # Changelog
 
+**1.13.0**
+- A ship's chest no longer closes on a passenger while someone else is steering.
+- Fish, seagulls and crows send far fewer updates, freeing upload for players near water.
+- Creatures no longer bounce between players when the one fighting them steps back a little.
+- Network monitoring no longer reports creatures standing still as stalls.
+
+**1.12.0**
+- Fixes a flood of status effect messages that could fill a player's connection and stop the world loading for others.
+- Logs which status effect and player are responsible when such a flood happens.
+- Ping is now measured for players whose connection is wrapped by another mod.
+- Network monitoring records how each player's connection is read.
+
+**1.11.1**
+- Compatibility improvements for ZenMods
+- Fixes tamed animals falling out of raised pens
+	- Server-side, and works for players without the mod. `nps_stats` gains an "in order" line in the Ownership block.
+
+**1.11.0**
+- Improved send/recieve rate management
+- When a player's upload is full, the creatures they are fighting now go out ahead of everything else they are simulating, right after players and ships.
+- Quiet Idle Creatures now also skips a standing creature's turns of under a degree.
+- Network monitoring now records what each player's connection carries, message by message, in both directions: the game's own messages, each mod's messages by name, and the kinds of objects in world updates. While monitoring is on, `nps_stats` shows the latest totals for each player.
+	- This allows diagnosing noisy mods, or mods that flood the connection stream
+- Ore, fuel, food and ammo put into a station are no longer lost when the server cannot deliver them to the station's owner. The item is dropped at the station instead, for the player to pick up and put in again.
+	- A request made the moment a player reaches a station, before the server has seen them arrive, now waits up to 3 seconds for them and goes in as normal.
+	- Covers smelters and everything built like them (kiln, blast furnace, windmill, spinning wheel, eitr refinery), fermenters, cooking stations and ovens, fires and torches, and ballistas. A shield generator's fuel is covered when it takes only one kind.
+	- Server-side, and works for players without the mod. `nps_stats` gains "parked" and "handed back" lines in the "Station requests" block.
+- A cooking station item added by another mod without taking the station first is no longer put in twice.
+
+**1.10.0**
+- Pets following a player, and creatures summoned with a staff, now stay on that player's machine instead of being moved to whoever has the lowest ping. New `Ownership` setting **Followers Stay With Their Player** (default on).
+- Players on the same local network as the server now have their ping measured. Steam reports them at 0 ms, which was read as "no measurement", so they were treated as 150 ms and kept losing creatures to players further away.
+- Network monitoring now records how each creature died: what killed it, the damage types, where it was, and whether it had just changed owner.
+- A player standing on the edge between two areas no longer makes the server hand every object in the next area over back and forth each time they step - over a thousand at a time in a built-up base, each one re-sent to everyone nearby. Objects now stay with a player while that player still has them loaded. New `Ownership` setting **Keep Objects While Loaded** (default on).
+- Loss backoff stops sooner for a player whose packet loss is not caused by the send rate. Once their rate is below what their connection was already carrying, and their loss has not improved, they go straight back to full speed. Before, they were slowed all the way to the floor first, and their updates queued for up to a fifth of a second on the way.
+- A network outage at the server no longer makes loss backoff slow down players whose connections were fine.
+- Idle creatures, tamed animals in pens especially, no longer re-send themselves many times a second for movements too small to see. A player looking after a few dozen of them could spend their whole upload on it, and everyone nearby had to download all of it. New `Creature Updates` setting **Quiet Idle Creatures** (default on). It works on each player's game that has the mod, using the server's setting.
+- The server now sends a creature that has settled down to each player at most 10 times a second (5 beyond 32 m), and one moving more than 64 m away at most 15 times a second, instead of on every update. This also reduces what players without the mod cost everyone else. New `Creature Updates` setting **Pace Creature Sends** (default on).
+- Network monitoring now records additional details
+
+**1.9.0**
+- Creatures no longer get stuck with a player who walked away and came back.
+- Fixed objects outside the normal world area changing owner several times every two seconds.
+- A player whose packet loss does not improve when the server slows down for them goes back to full speed, and is not slowed down again until the server restarts.
+- Peer simulation distance is now included in ownership calculation decisions
+
+**1.8.0**
+- Improves how tightly a players position is tracked to better arbitrate ownership
+	- The server follows each player's character directly, as it arrives with the game's own object updates. New `Reference Position` setting **Use Character Position** (default on). Works for players without the mod and costs nothing on the wire.
+- `Steam Transport`: **Send Rate Max KBps** and **Send Rate Min KBps** are replaced by a single **Send Rate KBps** (default 0, the game's 150).
+	- The new setting is the exact rate the server sends to each player, and it is applied on the server only. Steam never slows down for a connection that cannot keep up, so budget the server's upload for players × rate. A player whose connection cannot take it loses packets instead of getting a slower stream.
+	- `Send Window` **Target Rate KBps** is also no longer read: each player's window is now sized from the rate Steam actually uses for their connection.
+- The server now slows down for a player whose connection is losing packets, one player at a time. New `Steam Transport` setting **Enable Loss Backoff** (default on), with **Loss Backoff Threshold** (default 0.95) and **Loss Backoff Floor KBps** (default 32).
+	- Steam sends to every player at one fixed pace and never slows down for a player who cannot keep up; that player got packet loss.
+	- When a player has received under 95% of what was sent for 10 seconds, their own connection's rate is stepped down by a quarter, again every 10 seconds while it stays lossy, never below the floor. Once clean for 60 seconds it is stepped back up one step at a time, until it follows Send Rate KBps again. Change rate is isolated to the impacted user.
+	- Server-side, and needs Enable Transport Tuning. `nps_stats` gains a "Loss backoff" block, and the LOSSY verdict in the link-pressure table now says what has been done about it.
+- `nps_stats_collect` also measures how often a send runs out of room before the end of its list, and whether creatures or players were among what was left for later. See the new "Send truncation" block.
+- Creatures are now arbitrated, and before anything else. New `Ownership` setting **Arbitrate Creatures** (default on).
+	- The game marks ships and players as moving objects but not creatures, so earlier prioritization of this caused them to be deprioritized instead.
+	- `nps_stats` gains a "creatures" line in the Ownership block.
+- Hits on creatures are delivered to whoever is simulating the creature. New `Routed RPC` setting **Route Creature Hits To Owner** (default on).
+	- A hit sent to a player who no longer owned the creature, or to nobody because the attacker's game thought it had no owner, did nothing.
+	- A creature nobody is simulating is handed to the player who hit it, and the hit follows.
+	- Server-side, and works for players without the mod. `nps_stats` gains a "Creature hits" block.
+- Ownership changes made by the server now stick. New `Ownership` setting **Reject Stale Owner Updates** (default on).
+	- Server-side. `nps_stats` gains a "stale owner" line in the Ownership block.
+- Network monitoring now records creatures.
+
+**1.7.0**
+- Players on a high-ping connection no longer see the world pause every 8 seconds while there is a lot going on.
+	- `Queue Drain Interval Seconds` and `Queue Drain Floor Bytes` are no longer read and can be deleted from the config.
+	- `nps_stats` "Third-party send queue thresholds" shows how many outside reads were adjusted and how much is kept out of them for each player.
+- A creature with exactly one player near it now belongs to that player, whatever anyone else's latency is. New `Ownership` setting **Creature Proximity Ownership** (default on), with **Creature Proximity Radius** (default 48 m).
+	- `nps_stats` gains a "proximity" line: kept, pulled, and rescues it redirected.
+- Network monitoring: a recorder a server owner can switch on when something is wrong, to send with a bug report. New `Monitoring` section, **Enable Network Monitoring** (default off). See "Reporting a network problem" in the README.
+	- Records each change of a creature's owner and whether it held, messages delivered to a player who no longer owned the target, how regularly each player's creatures report in, and each player's ping and connection quality. Clients with the mod add what only they can see, at up to 2 KB per second in small batches that always wait for the game's own traffic, and a player can refuse with `AllowMonitoringUpload`.
+	- No player names, platform ids, addresses or chat. Players appear only as the session number the game gives them.
+	- Costs nothing while off: its hooks are installed when it is switched on and removed when it is switched off, with no restart either way.
+	- Written to `BepInEx/NpsMonitoring`, compressed, and capped by **Max Disk MB** (default 4096). Recording stops at the cap; nothing already recorded is deleted.
+	- `nps_stats` gains a "Network monitoring" block.
+
+**1.6.0**
+- A player who has stopped answering no longer freezes everything they were simulating. New `Connection Timeout` setting **Evict Ghost Owners** (default on), with **Ghost Owner Evict Seconds** (default 10).
+	- "Stop trusting this peer to simulate" is a different question and is now asked separately. A peer that goes quiet loses its objects to the players who are actually there, while keeping its slot for the full timeout so it can come back. Nothing is disconnected any sooner, and if it returns it competes for ownership again on the next pass.
+	- Detection asks Steam directly - `SteamNetConnectionRealTimeStatus_t.m_eState`, which reports a dead link before anything closes the socket - and falls back to a silence timer for crossplay peers, which report no state. The timer discounts main-thread stalls rather than counting a frozen frame as the peers going quiet.
+	- If every peer goes quiet at once, that is treated as a fault at the host's end and nobody is evicted until one answers.
+	- This is what makes raising `Connection Timeout Seconds` safe: the wait now costs only the slot.
+- Clients are no longer left playing a world the server has dropped them from. New `Client config` setting **EnableGhostWatchdog** (default on).
+	- A warning with a countdown appears halfway to the timeout actually in force and clears itself if the connection comes back; at the deadline, or as soon as the transport calls the link dead, the character is saved and the game returns to the menu with an explanation rather than the generic "disconnected".
+	- No timeout of its own - it follows the same deadline the game is using, so it cannot disagree with the server's setting.
+	- Stands down automatically when ClientGhostWatchdog is installed.
+- `nps_stats` gains a "Peer liveness" block: who is quiet, for how long, what the transport says, and the eviction and watchdog counters.
+- Credit: the ghost handling started from [ClientGhostWatchdog](https://github.com/dreamwraith/Valheim-ClientGhostWatchdog) by DreamWraith. No code is shared; the observation that the game needs a second opinion on whether a peer is still there is theirs.
+- Picking berries, mining ore and chopping trees no longer lag when another player owns the object. Ownership arbitration is now tiered: moving objects are placed by latency as before, and interactable-but-stationary ones by distance. New `Ownership` setting **Interactive Object Ownership** (default on).
+	- Pickables, ore deposits, rocks, trees, logs and destructibles go to whoever is standing nearest them. These ask their owner to do the work and every handler checks it is the owner, so an object owned by another player costs four network legs per keypress - and placing by ping rather than by distance would not have helped, because nothing about a berry bush changes between interactions.
+	- Building pieces, containers, crafting stations and portals are still never moved off a player who is present, which is what keeps the fermenter and smelter fix above intact.
+	- An object is never taken from an owner still within reach of it, never taken for a player further away than `Interactive Claim Radius`, and each move is pushed to nearby players immediately.
+	- An unowned patch - one nobody has visited - now goes to the nearest player rather than the lowest-ping one, on the first pass and with no delay.
+	- Tuning: `Interactive Claim Radius`, `Interactive Challenge Margin`, `Interactive Min Hold Seconds`, `Interactive Max Reassigns Per Pass`. The tier has its own budget so a zone full of creatures cannot starve it, or be starved by it.
+	- `nps_stats` gains per-tier ownership counters.
+- Ships are now simulated by the player at the helm, so steering is no longer choppy when someone else on board owned the ship. New `Ownership` setting **Ship Ownership Follows Helmsman** (default on).
+	- The ship's current owner hands it over when the helm is taken, the same way the game already hands over saddles and carts. This needs the mod on whichever machine owns the ship; a ship owned by a player without it behaves as in vanilla.
+	- The host gives an abandoned ship (its owner left or disconnected) to the player at its helm first.
+	- `nps_stats` gains a "Ship helm" block with the handoff and helm rescue counts.
+
 **1.5.0**
 - Updates default send timing to prevent alternating delays from the dedicated server
 - New `Allocation` section: four opt-in changes that remove short-lived objects from the ZDO network path, reducing how often the garbage collector runs. None of them alters a byte on the wire or a value in a ZDO.

@@ -35,7 +35,7 @@ namespace NetworkPerformanceSystem.Runtime {
     /// THE ONE BEHAVIOURAL DIFFERENCE is that the relay no longer passes through ZRpc.Invoke, so a
     /// mod that hooks ZRpc.Invoke to observe traffic will not see relayed RoutedRPCs. Nothing known
     /// depends on that - Compress hooks the ZDO send's own call site, not Invoke - but it is why
-    /// this has its own switch. ZRpc's sent-packet and sent-byte counters are kept exactly as
+    /// this has its own switch. This mod's own traffic monitoring is told directly (SendFrame). ZRpc's sent-packet and sent-byte counters are kept exactly as
     /// Invoke keeps them, and ZRpc's debug mode (which writes the method name into the frame) is
     /// left to vanilla.
     /// </summary>
@@ -132,6 +132,9 @@ namespace NetworkPerformanceSystem.Runtime {
 
             rpc.m_sentPackages++;
             rpc.m_sentData += _frameLength;
+            // This send never passes ZRpc.SendPackage, where monitoring counts the rest. Before
+            // the socket, for the same reason as the cut above.
+            if (Monitoring.Active && Monitoring.ServerRole) { TrafficLedger.OnSent(rpc, Frame); }
             rpc.m_socket.Send(Frame);
             AllocationRelief.RelaySendsReused++;
         }

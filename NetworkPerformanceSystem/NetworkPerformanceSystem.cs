@@ -36,7 +36,7 @@ namespace NetworkPerformanceSystem
     {
         public const string PluginGUID = "MidnightsFX.NetworkPerformanceSystem";
         public const string PluginName = "NetworkPerformanceSystem";
-        public const string PluginVersion = "1.5.0";
+        public const string PluginVersion = "1.13.0";
 
         internal static ManualLogSource Log;
         internal static Harmony HarmonyInstance;
@@ -55,13 +55,29 @@ namespace NetworkPerformanceSystem
             Patches.PlayerLimitPatches.ApplyPlayFabCapacityPatch(HarmonyInstance);
             // M13 is a reflection write into Jotunn rather than a patch, but the value it writes
             // depends on whether M2 survived PatchAll - so it goes after Harmony and before the
-            // summary, where a stand-down is listed with the rest.
+            // summary in Start, where a stand-down is listed with the rest.
             JotunnSendQueue.OnStartup();
-            PatchGuard.VerifyAfterPatching();
 
             // Configs are not written until after they are all wired up, they exist in memory before this.
             // Flushing all of the configs at once is a significant speedup in mod load time
             ValConfig.SaveOnSet(true);
+            // Hand edits to the file on disk apply without a restart - the only way to change a
+            // setting on a dedicated server with no admin in game.
+            ValConfig.WatchConfigFile();
+        }
+
+        public void Start() {
+            // Stand-downs for mods that already do a mechanism's job. BepInEx adds each plugin to
+            // Chainloader.PluginInfos as it loads it, so a mod ordered after us is invisible from
+            // Awake. Unity does not call Start until the chainloader has finished loading every
+            // plugin, and it is still before any session exists. Checking from inside the patched
+            // methods instead fails when the other mod keeps them from running at all.
+            Patches.SendSchedulerPatches.CheckForReturnToSender();
+            Patches.RoutedRpcPatches.CheckForOverlappingMods();
+            Patches.RpcOwnerRouterPatches.CheckForOverlappingMods();
+            GhostWatchdog.CheckForRival();
+            // After the stand-downs, so the summary lists what is actually running.
+            PatchGuard.VerifyAfterPatching();
         }
 
         public void OnGUI() {
@@ -72,6 +88,8 @@ namespace NetworkPerformanceSystem
         }
 
         public void OnDestroy() {
+            // Closes its files and removes its own hooks; a no-op when monitoring was never on.
+            Monitoring.Shutdown();
             JotunnSendQueue.Restore();
             HarmonyInstance?.UnpatchSelf();
         }

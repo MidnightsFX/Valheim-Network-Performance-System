@@ -101,7 +101,7 @@ namespace NetworkPerformanceSystem.Patches {
 
             IlMatch.ReplaceInPlace(codes, site, new CodeInstruction(OpCodes.Call, current));
 
-            Logger.LogInfo("Player limit is configurable (ZNet.RPC_PeerInfo rewritten).");
+            IlMatch.LogOnce("Player limit is configurable (ZNet.RPC_PeerInfo rewritten).");
             return codes;
         }
 
@@ -138,7 +138,7 @@ namespace NetworkPerformanceSystem.Patches {
             // A miss here costs the browser display and nothing else, so it warns rather than
             // disabling the mechanism - the limit itself is still enforced at the value set.
             if (matches != 1) {
-                Logger.LogWarning($"ZSteamMatchmaking.RegisterServer does not have the expected IL shape (found {matches} " +
+                IlMatch.WarnOnce($"ZSteamMatchmaking.RegisterServer does not have the expected IL shape (found {matches} " +
                     $"CreateLobby(.., {PlayerLimit.VanillaLimit}) or SetMaxPlayerCount({PlayerLimit.VanillaLimit}) calls, " +
                     $"expected 1; IL there: {IlMatch.DescribeNeighbours(codes, SteamCapacityCalls)}). The server browser " +
                     "will keep advertising a limit of 10. Joining is unaffected - the limit the server enforces is the " +
@@ -149,7 +149,7 @@ namespace NetworkPerformanceSystem.Patches {
             string call = ((MemberInfo)codes[site + 1].operand).Name;
             IlMatch.ReplaceInPlace(codes, site, new CodeInstruction(OpCodes.Call, capacity));
 
-            Logger.LogInfo($"Steam advertised capacity is configurable (ZSteamMatchmaking.RegisterServer rewritten at {call}).");
+            IlMatch.LogOnce($"Steam advertised capacity is configurable (ZSteamMatchmaking.RegisterServer rewritten at {call}).");
             return codes;
         }
 
@@ -234,7 +234,7 @@ namespace NetworkPerformanceSystem.Patches {
 
             if (matches != 1) {
                 PlayerLimit.CrossplayCapacityPinned = true;
-                Logger.LogWarning($"ZPlayFabMatchmaking.CreateLobby does not have the expected IL shape (found {matches} " +
+                IlMatch.WarnOnce($"ZPlayFabMatchmaking.CreateLobby does not have the expected IL shape (found {matches} " +
                     $"MaxPlayers = {PlayerLimit.VanillaLimit} or {PlayerLimit.VanillaDedicatedPlayFabMembers} assignments, " +
                     $"expected 1; IL there: {IlMatch.DescribeNeighbours(codes, PlayFabLobbyMembers)}). The crossplay lobby " +
                     "stays at 10 members, so crossplay clients will be refused past 10. Steam clients are unaffected.");
@@ -243,7 +243,7 @@ namespace NetworkPerformanceSystem.Patches {
 
             IlMatch.ReplaceInPlace(codes, site, new CodeInstruction(OpCodes.Call, capacity));
 
-            Logger.LogInfo($"Crossplay lobby capacity is configurable (ZPlayFabMatchmaking.CreateLobby rewritten; vanilla asked for {vanilla}).");
+            IlMatch.LogOnce($"Crossplay lobby capacity is configurable (ZPlayFabMatchmaking.CreateLobby rewritten; vanilla asked for {vanilla}).");
             return codes;
         }
 
@@ -317,7 +317,7 @@ namespace NetworkPerformanceSystem.Patches {
 
             if (matches != 1) {
                 PlayerLimit.CrossplayNetworkPinned = true;
-                Logger.LogWarning($"ZPlayFabMatchmaking.CreateAndJoinNetwork does not have the expected IL shape (found " +
+                IlMatch.WarnOnce($"ZPlayFabMatchmaking.CreateAndJoinNetwork does not have the expected IL shape (found " +
                     $"{matches} MaxPlayerCount = {PlayerLimit.VanillaLimit} or {PlayerLimit.VanillaDedicatedPlayFabMembers} " +
                     $"assignments, expected 1; IL there: {IlMatch.DescribeNeighbours(codes, PartyNetworkMembers)}). The " +
                     "crossplay Party network stays at 10 devices, so crossplay players will be admitted by the lobby and " +
@@ -327,7 +327,7 @@ namespace NetworkPerformanceSystem.Patches {
 
             IlMatch.ReplaceInPlace(codes, site, new CodeInstruction(OpCodes.Call, capacity));
 
-            Logger.LogInfo($"Crossplay Party network capacity is configurable (ZPlayFabMatchmaking.CreateAndJoinNetwork rewritten; vanilla asked for {vanilla}).");
+            IlMatch.LogOnce($"Crossplay Party network capacity is configurable (ZPlayFabMatchmaking.CreateAndJoinNetwork rewritten; vanilla asked for {vanilla}).");
             return codes;
         }
 

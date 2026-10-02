@@ -102,6 +102,9 @@ namespace NetworkPerformanceSystem {
         // M12 creatures - hits on a creature delivered to whoever simulates it now
         public static ConfigEntry<bool> EnableCreatureHitRouting;
 
+        // M12 structures - hits, repairs and removals on buildings, trees and rocks delivered to their owner
+        public static ConfigEntry<bool> EnableStructureHitRouting;
+
         // M30 - a status effect asked for on somebody else's creature is not sent on every ask
         public static ConfigEntry<bool> LimitRepeatedStatusEffects;
 
@@ -116,6 +119,10 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<bool> SendFightingCreaturesFirst;
         // M31 - fish and birds send themselves a few times a second
         public static ConfigEntry<bool> QuietWildlifeUpdates;
+
+        // M33 - buildings, trees and rocks a player already has are not re-sent for a change nobody can see
+        public static ConfigEntry<bool> HoldUnchangedStructures;
+        public static ConfigEntry<float> StructureMaxHoldSeconds;
 
         // M8 - Steam transport configuration
         public static ConfigEntry<bool> EnableSteamTransportTuning;
@@ -332,6 +339,8 @@ namespace NetworkPerformanceSystem {
                 "Deliver fermenter, smelter, cooking station, fireplace, shield generator and ballista item requests (add item / ore / fuel / ammo, tap, empty) to whoever owns the object right now. Prevents RPCs being dropped and items being eaten. An ore, fuel, food or ammo item that still cannot be delivered is dropped at the station instead of being lost.");
             EnableCreatureHitRouting = BindServerConfig("Routed RPC", "Route Creature Hits To Owner", true,
                 "Deliver hits on creatures to whoever is simulating the creature right now, prevents silently dropping hits.");
+            EnableStructureHitRouting = BindServerConfig("Routed RPC", "Route Structure Hits To Owner", true,
+                "Deliver hits, repairs, removals and snow changes on buildings, trees and rocks to whoever owns them right now. A player whose copy still names an earlier owner sends them to that player, who drops them without a word. Structure Updates only holds back owner changes while this is on.");
             LimitRepeatedStatusEffects = BindServerConfig("Routed RPC", "Limit Repeated Status Effects", true,
                 "Send a status effect to a creature another player is simulating at most 4 times a second, instead of every time something asks for it. An area that gives a status effect keeps applying it, 50 times a second, to creatures that were yours when they walked in. Once one of them is handed to another player every one of those becomes a message, and a few animals in a base can fill a player's whole upload and stop the world loading for the player they were handed to. Runs on each player's game that has this mod, using the server's setting; the server also stops passing the repeats on from players who do not have it. The log names the effect either way.");
 
@@ -351,6 +360,13 @@ namespace NetworkPerformanceSystem {
                 "When a player's upload is full, send the creatures they are simulating that are alert or chasing someone ahead of everything else they have changed, right after players and ships. Without this they wait their turn behind every fire, smelter and dropped item that player also simulates, and freeze for everyone else for a second or more. Changes only the order, never what is sent. Runs on each player's game that has this mod, using the server's setting.");
             QuietWildlifeUpdates = BindServerConfig("Creature Updates", "Quiet Wildlife", true,
                 "Fish, seagulls and crows send themselves 5 times a second (fish) or 10 times a second (birds) instead of on every frame. They are always moving, so without this whoever simulates them re-sends each one up to 20 times a second, and on a lake or coast they can be a third of a player's upload. The server also passes them on to each player at most about 6 / 12 times a second (2 / 5 beyond 32 m), which covers players who do not have this mod. A fish on a fishing line is not affected. Runs on each player's game that has this mod and on the server, using the server's setting.");
+
+            // Structure updates
+            HoldUnchangedStructures = BindServerConfig("Structure Updates", "Hold Unchanged Structures", true,
+                "Server side. Do not re-send a building piece, tree or rock to a player who already has it when all that changed is who owns it, the snow on it, or a value rewritten to what it already was. It goes out at once when its health or support changes, and to a player within 16 m of it; anything else waits until that player's connection has room, up to Max Hold Seconds. The game sends every building update ahead of every creature update, so while players walk through a ruin or a big base the creatures around them otherwise wait behind thousands of walls. Doors, chests, stations, fires, portals, ships and carts are never held. Also covers players who do not have this mod.");
+            StructureMaxHoldSeconds = BindServerConfig("Structure Updates", "Max Hold Seconds", 30f,
+                "How long a held building, tree or rock update waits before it goes out as soon as there is room, in seconds. It never waits more than twice this.",
+                false, 1f, 120f);
 
             // Steam Socket
             EnableSteamTransportTuning = BindServerConfig("Steam Transport", "Enable Transport Tuning", true,

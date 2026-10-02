@@ -21,6 +21,7 @@ namespace NetworkPerformanceSystem
     [BepInIncompatibility("CW_Jesse.BetterNetworking")]
     [BepInIncompatibility("org.bepinex.plugins.network")]     // Smoothbrain - Network
     [BepInIncompatibility("Searica.Valheim.NetworkTweaks")]
+    [BepInIncompatibility("redseiko.valheim.returntosender")]  // applies same transpiler patch
     [BepInIncompatibility("dzk.warheimnetwork")]
     [BepInIncompatibility("com.maxsch.valheim.TimeoutLimit")]
     // Deliberately NOT blocked - verified to have no patch-site overlap:

@@ -44,6 +44,9 @@ namespace NetworkPerformanceSystem {
 
         // Add Server synced config entries under here
 
+        // number of peers to send data to per update
+        public static ConfigEntry<int> PeersPerUpdate; 
+
         // M2/M2c - bandwidth-delay-product send window
         public static ConfigEntry<bool> EnableSendWindowSizing;
         public static ConfigEntry<float> SendWindowBdpFactor;
@@ -262,6 +265,20 @@ namespace NetworkPerformanceSystem {
                 new AcceptableValueRange<float>(1f, 300f),
                 new ConfigurationManagerAttributes { IsAdvanced = true }));
 
+            // --- ReturnToSender Number of Peers Per Update (synced with server) -------------
+            PeersPerUpdate = BindServerConfig(
+                "ZDO Peers", "Peers Per Update", 10, 
+                "Number of peers to sync data to each update tick. Vanilla default is 1. The higher this is the more data needs to be transferred each update tick.",
+                valMin: 1, valMax: 50
+            );
+
+            // --- M2/M2c: bandwidth-delay-product send window -------------------------------
+            // Vanilla allows a fixed 10240 bytes of in-flight reliable ZDO data per peer.
+            // Throughput through a fixed window is window/RTT, so vanilla is correctly sized
+            // up to ~67ms RTT and starves every peer beyond it (~41 KB/s at 250ms) regardless
+            // of their actual connection. Sizing by RTT is a no-op for local players by
+            // construction, which is the point - a big static window instead adds standing
+            // queue delay to the peers that were already fine.
             // Bandwidth sizing
             EnableSendWindowSizing = BindServerConfig("Send Window", "Enable BDP Window Sizing", true,
                 "Size each peer's in-flight ZDO window from their measured round-trip time and the rate Steam sends to them at. Low-latency peers are unaffected; high-latency peers stop being throttled by their distance.");

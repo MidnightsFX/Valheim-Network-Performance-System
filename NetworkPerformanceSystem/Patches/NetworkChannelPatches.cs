@@ -40,6 +40,9 @@ namespace NetworkPerformanceSystem.Patches {
             // does anything until the host has monitoring running.
             peer.m_rpc.Register<ZPackage>(MonitoringUpload.RpcHello, MonitoringUpload.RPC_Hello);
             peer.m_rpc.Register<ZPackage>(MonitoringUpload.RpcBatch, MonitoringUpload.RPC_Batch);
+
+            // M35: a player's frame report. Only the host acts on one.
+            peer.m_rpc.Register<ZPackage>(PeerCapacity.RpcClientLoad, PeerCapacity.RPC_ClientLoad);
         }
 
         // -- RTT sampling ------------------------------------------------------------------
@@ -107,6 +110,11 @@ namespace NetworkPerformanceSystem.Patches {
             if (PatchGuard.IsActive(Mechanism.PeerLiveness)) { PeerLiveness.Evaluate(); }
 
             float dt = Time.unscaledDeltaTime;
+
+            // M34, both roles: a client reports its frame rate to the host, a listen host files
+            // its own. Gates itself, and does nothing on a dedicated server.
+            FrameSampler.Tick(dt);
+
             if (NpsEnv.IsHost()) {
                 TickLatencyTable(dt);
             } else {
@@ -156,6 +164,7 @@ namespace NetworkPerformanceSystem.Patches {
             LiveRefPos.ForgetPeer(netPeer.m_uid);
             SteamTransport.ForgetPeer(netPeer.m_uid);
             LossBackoff.ForgetPeer(netPeer.m_uid);
+            PeerCapacity.ForgetPeer(netPeer.m_uid);
             CreaturePacing.ForgetPeer(netPeer.m_uid);
             StructureUpdates.ForgetPeer(netPeer.m_uid);
             StatusEffectRepeats.ForgetPeer(netPeer.m_uid);
@@ -176,6 +185,9 @@ namespace NetworkPerformanceSystem.Patches {
             LiveRefPos.Reset();
             SteamTransport.Reset();
             LossBackoff.Reset();
+            PeerCapacity.Reset();
+            FrameSampler.Reset();
+            DamageNumbers.Reset();
             ZdoDataGuard.Reset();
             _latencyTableTimer = 0f;
         }

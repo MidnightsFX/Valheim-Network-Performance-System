@@ -84,6 +84,11 @@ namespace NetworkPerformanceSystem {
         // M3 ring keep - an object nobody is standing near stays with an owner who still has it loaded
         public static ConfigEntry<bool> OwnershipKeepWhileLoaded;
 
+        // M35 - a player whose game slows down under a fight simulates fewer creatures
+        public static ConfigEntry<bool> BalanceCreaturesByFrameRate;
+        public static ConfigEntry<float> CreatureLoadMinOwnerFps;
+        public static ConfigEntry<int> CreatureLoadMinAllowance;
+
         // M25 - the host's ownership changes are not undone by a peer's older update
         public static ConfigEntry<bool> RejectStaleOwnerUpdates;
 
@@ -108,6 +113,9 @@ namespace NetworkPerformanceSystem {
 
         // M30 - a status effect asked for on somebody else's creature is not sent on every ask
         public static ConfigEntry<bool> LimitRepeatedStatusEffects;
+
+        // M36 - who is sent the floating damage numbers
+        public static ConfigEntry<string> DamageNumbers;
 
         // M9 - per-peer sector scan cache
         public static ConfigEntry<bool> EnableSyncListCache;
@@ -323,6 +331,16 @@ namespace NetworkPerformanceSystem {
             OwnershipKeepWhileLoaded = BindServerConfig("Ownership", "Keep Objects While Loaded", true,
                 "Leave an object with its owner while that player still has it loaded, instead of releasing it the moment they step one zone away and claiming it again when they step back. A player standing on a zone edge otherwise flips every object in the next zone over each time they move - over a thousand at a time in a built-up base. Creatures already work this way.");
 
+            // Creature load
+            BalanceCreaturesByFrameRate = BindServerConfig("Creature Load", "Balance Creatures By Frame Rate", true,
+                "Players with this mod tell the server how smoothly their game is running. When a player's frame rate stays under Min Owner FPS while they simulate a lot of creatures in a fight, the server gives them fewer creatures to run and moves the rest, a few at a time, to players whose games have room. Creatures only that player is near stay with them. If moving creatures does not make their game faster, they get them back and are left alone for ten minutes. Players without the mod are treated as before. Needs Arbitrate Creatures.");
+            CreatureLoadMinOwnerFps = BindServerConfig("Creature Load", "Min Owner FPS", 25f,
+                "Frame rate below which a player counts as struggling, held for 10 seconds. A player at or above this plus 5 counts as having room to take creatures from someone else.",
+                false, 10f, 60f);
+            CreatureLoadMinAllowance = BindServerConfig("Creature Load", "Min Creature Allowance", 4,
+                "The fewest creatures a struggling player is ever held to, and the number they must own before their frame rate is looked at.",
+                true, 0, 64);
+
             // Arbitration persistance
             RejectStaleOwnerUpdates = BindServerConfig("Ownership", "Reject Stale Owner Updates", true,
                 "Prevents previous owners network updates immediately taking an owned object back, and tells that player straight away who owns it now. A creature's movement from its previous owner is dropped rather than shown to everyone else. Disabling this effectively neuters the arbiter.");
@@ -345,7 +363,15 @@ namespace NetworkPerformanceSystem {
             EnableStructureHitRouting = BindServerConfig("Routed RPC", "Route Structure Hits To Owner", true,
                 "Deliver hits, repairs, removals and snow changes on buildings, trees and rocks to whoever owns them right now. A player whose copy still names an earlier owner sends them to that player, who drops them without a word. Structure Updates only holds back owner changes while this is on.");
             LimitRepeatedStatusEffects = BindServerConfig("Routed RPC", "Limit Repeated Status Effects", true,
-                "Send a status effect to a creature another player is simulating at most 4 times a second, instead of every time something asks for it. An area that gives a status effect keeps applying it, 50 times a second, to creatures that were yours when they walked in. Once one of them is handed to another player every one of those becomes a message, and a few animals in a base can fill a player's whole upload and stop the world loading for the player they were handed to. Runs on each player's game that has this mod, using the server's setting; the server also stops passing the repeats on from players who do not have it. The log names the effect either way.");
+                "Send a status effect to a creature another player is simulating at most 4 times a second, instead of every time something asks for it - and an effect that lasts only once in a third of its duration, at least every 2 seconds, since asking again only restarts its timer. An area that gives a status effect keeps applying it, 50 times a second, to creatures that were yours when they walked in. Once one of them is handed to another player every one of those becomes a message, and a few animals in a base can fill a player's whole upload and stop the world loading for the player they were handed to. Runs on each player's game that has this mod, using the server's setting; the server also stops passing the repeats on from players who do not have it. The log names the effect either way.");
+
+            DamageNumbers = BindServerConfig("Routed RPC", "Damage Numbers", Runtime.DamageNumbers.EveryoneNearbyName,
+                "Who is sent the floating damage numbers. The game makes a number on whichever player's game simulates what was hit and sends it to everyone, and each player then ignores it unless it is within 30 m. " +
+                "'Everyone Nearby' does what the game does, but only to players close enough to see it. " +
+                "'Attacker Only' sends a hit's number only to the player who landed it; damage a player or their tame takes, blocks, heals and bonuses stay on the game that made them, and burning or poison ticks are only seen by whoever simulates the creature. " +
+                "'Off' never sends them: each player sees only the numbers their own game makes. " +
+                "Applied by every player's game that has this mod, using the server's setting. The server also stops passing on numbers from players without the mod when this is 'Off'.",
+                new AcceptableValueList<string>(Runtime.DamageNumbers.EveryoneNearbyName, Runtime.DamageNumbers.AttackerOnlyName, Runtime.DamageNumbers.OffName));
 
             // Cache list optimization
             EnableSyncListCache = BindServerConfig("Sync List Cache", "Enable Sector Scan Cache", true,
@@ -472,6 +498,14 @@ namespace NetworkPerformanceSystem {
             LossBackoffHoldSeconds.SettingChanged += OnLossBackoffSettingChanged;
             LossBackoffRecoverSeconds.SettingChanged += OnLossBackoffSettingChanged;
 
+            // M35 drops every allowance at once when switched off, so creatures go back to the
+            // ordinary rules without waiting out a recover time.
+            DamageNumbers.SettingChanged += OnDamageNumbersSettingChanged;
+
+            BalanceCreaturesByFrameRate.SettingChanged += OnCreatureLoadSettingChanged;
+            CreatureLoadMinOwnerFps.SettingChanged += OnCreatureLoadSettingChanged;
+            CreatureLoadMinAllowance.SettingChanged += OnCreatureLoadSettingChanged;
+
             // Both timeout layers are process-global and re-writable at any time as well, so these
             // apply on edit too - including the edit Jotunn performs on a client when the server
             // pushes its own values down at join time.
@@ -492,6 +526,14 @@ namespace NetworkPerformanceSystem {
 
         private static void OnLossBackoffSettingChanged(object sender, EventArgs e) {
             Runtime.LossBackoff.OnConfigChanged();
+        }
+
+        private static void OnDamageNumbersSettingChanged(object sender, EventArgs e) {
+            Runtime.DamageNumbers.OnConfigChanged();
+        }
+
+        private static void OnCreatureLoadSettingChanged(object sender, EventArgs e) {
+            Runtime.PeerCapacity.OnConfigChanged();
         }
 
         private static void OnJotunnQueueSettingChanged(object sender, EventArgs e) {

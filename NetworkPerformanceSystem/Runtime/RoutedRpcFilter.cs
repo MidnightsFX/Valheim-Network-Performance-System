@@ -98,6 +98,11 @@ namespace NetworkPerformanceSystem.Runtime {
         /// Never throws: anything unexpected about a message means "vanilla broadcast".
         /// </summary>
         internal static bool TryRelay(ZRoutedRpc router, ZRoutedRpc.RoutedRPCData data) {
+            // M36 first, and whatever the relay filter's own switch says: with Damage Numbers set
+            // to Off the server passes on no damage number at all - which only ever comes from a
+            // player without the mod, or an older copy of it.
+            if (router != null && router.m_server && DamageNumbers.DropAtRelay(data)) { return true; }
+
             if (!PatchGuard.IsActive(Mechanism.RoutedRpcFilter)) { return false; }
             if (!ValConfig.EnableRoutedRpcFilter.Value) { return false; }
             if (router == null || data == null || !router.m_server) { return false; }
@@ -273,11 +278,14 @@ namespace NetworkPerformanceSystem.Runtime {
             if (ZoneSystem.instance == null) { return false; }
             if (!TryReadPosition(data, out Vector3 pos)) { return false; }
 
-            // Generous on purpose: the receiver's own test is tighter (damage text has a camera
-            // distance cap; an effect is only visible within the active area), and a peer's
-            // reference position on the host can be a couple of seconds old. A zone beyond the
-            // active area covers both.
+            // Generous on purpose for an effect: it is only visible within the active area, and a
+            // peer's reference position on the host can be a couple of seconds old, so a zone
+            // beyond the active area covers both. A damage number has a much tighter test of its
+            // own - the receiver drops it beyond 30 m of their camera - so it goes only to players
+            // within that plus some slack (M36; see DamageNumbers.RelayDistanceSq).
             Vector2s zone = ZoneSystem.GetZone(pos);
+            bool damageNumber = data.m_methodHash == DamageTextHash && DamageNumbers.Active;
+            float numberSq = damageNumber ? DamageNumbers.RelayDistanceSq() : 0f;
 
             List<ZNetPeer> peers = router.m_peers;
             RelaySend.RelayMessage message = new RelaySend.RelayMessage(data);
@@ -287,6 +295,17 @@ namespace NetworkPerformanceSystem.Runtime {
             for (int i = 0; i < peers.Count; i++) {
                 ZNetPeer peer = peers[i];
                 if (peer == null || !peer.IsReady() || peer.m_uid == data.m_senderPeerID) { continue; }
+
+                if (damageNumber) {
+                    if ((peer.GetRefPos() - pos).sqrMagnitude > numberSq) {
+                        suppressed++;
+                        DamageNumbers.RelayOutOfRange++;
+                        continue;
+                    }
+                    message.Send(peer);
+                    sent++;
+                    continue;
+                }
 
                 // Per peer, not once for the whole relay: simulation distance is negotiated
                 // individually now, so a peer that loads more of the world around itself has to

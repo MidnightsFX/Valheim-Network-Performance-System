@@ -228,6 +228,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendOwnerRpc(sb);
             AppendReferencePositions(sb);
             AppendOwnership(sb);
+            AppendCreatureLoad(sb);
             AppendShipHelm(sb);
             AppendExtrapolation(sb);
             AppendAllocationRelief(sb);
@@ -289,6 +290,12 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.QuietWildlife: return ValConfig.QuietWildlifeUpdates.Value;
                 case Mechanism.PlayerHistoryRepeats: return ValConfig.SendPlayerHistoryOnlyWhenChanged.Value;
                 case Mechanism.StructureUpdates: return ValConfig.HoldUnchangedStructures.Value;
+                // The measurement, like RttSampling: what M35 does with it is what the config controls.
+                case Mechanism.FrameReport: return true;
+                case Mechanism.CreatureAllowance: return ValConfig.BalanceCreaturesByFrameRate.Value && ValConfig.OwnershipArbitrateCreatures.Value;
+                // Everyone Nearby is the game's behaviour, and needs nothing from this mechanism
+                // beyond the relay distance M7 applies.
+                case Mechanism.DamageNumbers: return DamageNumbers.Current != DamageNumbers.Mode.EveryoneNearby;
                 default: return true;
             }
         }
@@ -316,7 +323,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 return;
             }
 
-            sb.AppendLine("  name                 rtt     jitter  sim     window    for rate   queue   skipped");
+            sb.AppendLine("  name                 rtt     jitter  fps    sim     window    for rate   queue   skipped");
             for (int i = 0; i < peers.Count; i++) {
                 ZNetPeer peer = peers[i];
                 long uid = peer.m_uid;
@@ -327,6 +334,10 @@ namespace NetworkPerformanceSystem.Runtime {
                     : "-";
                 string jitter = LatencyRegistry.HasMeasurement(uid)
                     ? $"{LatencyRegistry.MeasuredJitterMs(uid):F0}ms"
+                    : "-";
+                // M34: the frame rate the player's game reports - "-" for a player without the mod.
+                string fps = PeerCapacity.TryGetView(uid, out PeerCapacity.View load) && load.HasFps
+                    ? $"{load.Fps:F0}"
                     : "-";
                 string window = SendWindow.TryGetLastWindow(uid, out int w) ? $"{w / 1024f:F1}KB" : "vanilla";
                 // The Steam rate the window was sized for - the other half of the product.
@@ -340,7 +351,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     skipped = $"{pct:F1}% ({entry.SendsSkippedByBackpressure}/{entry.SendAttempts})";
                 }
 
-                sb.AppendLine($"  {Pad(name, 20)} {Pad(rtt, 7)} {Pad(jitter, 7)} {Pad(DescribeSimulationDistance(peer), 7)} {Pad(window, 9)} {Pad(rate, 10)} {Pad(queue, 7)} {skipped}");
+                sb.AppendLine($"  {Pad(name, 20)} {Pad(rtt, 7)} {Pad(jitter, 7)} {Pad(fps, 6)} {Pad(DescribeSimulationDistance(peer), 7)} {Pad(window, 9)} {Pad(rate, 10)} {Pad(queue, 7)} {skipped}");
             }
 
             string connections = RttProbe.DescribeSocketPaths(peers);
@@ -592,6 +603,87 @@ namespace NetworkPerformanceSystem.Runtime {
             }
             sb.AppendLine($"  session totals   {LossBackoff.TotalStepsDown} steps down, {LossBackoff.TotalStepsUp} steps up, {LossBackoff.TotalCleared} back at the global rate, " +
                           $"{LossBackoff.TotalExempted} exempted (slowing down did not help; {LossBackoff.ExemptPlayerCount} player(s) this session)");
+        }
+
+        /// <summary>
+        /// M34/M35 - how smoothly each player's game runs, and the creature allowance that keeps a
+        /// struggling one lightly loaded. On a client: this game's own report and whether it is
+        /// being sent.
+        /// </summary>
+        private static void AppendCreatureLoad(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Creature load (players' frame rate):");
+
+            if (!NpsEnv.IsHost()) {
+                if (!FrameSampler.Active) {
+                    sb.AppendLine(PatchGuard.GetDisableReason(Mechanism.FrameReport) is string reason ? $"  stood down: {reason}" : "  not reporting");
+                    return;
+                }
+                if (!FrameSampler.HasLastReport) {
+                    sb.AppendLine("  (no report yet - one every 2 seconds)");
+                    return;
+                }
+                FrameReport own = FrameSampler.LastReport;
+                sb.AppendLine($"  this game        {own.Fps:F0} fps, worst frame {own.WorstFrameMs:F0}ms, {own.SlowShare * 100f:F0}% of the time in frames over 50ms, running {own.OwnedAi} creature AIs{DescribeSim(own)}{DescribeFlags(own)}");
+                sb.AppendLine(LatencyRegistry.HasFreshTable
+                    ? $"  sent to host     {FrameSampler.ReportsSent} reports this session"
+                    : "  not sent         the host is not running this mod (no latency table from it)");
+                return;
+            }
+
+            if (!ValConfig.OwnershipArbitrateCreatures.Value) {
+                sb.AppendLine("  allowance off (needs Arbitrate Creatures); frame rates are still shown below");
+            } else if (PatchGuard.GetDisableReason(Mechanism.CreatureAllowance) is string standDown) {
+                sb.AppendLine($"  allowance stood down: {standDown}");
+            } else if (!ValConfig.BalanceCreaturesByFrameRate.Value) {
+                sb.AppendLine("  allowance off (Balance Creatures By Frame Rate is off); frame rates are still shown below");
+            } else {
+                float min = ValConfig.CreatureLoadMinOwnerFps.Value;
+                int minAllowance = ValConfig.CreatureLoadMinAllowance.Value;
+                sb.AppendLine($"  rule             under {min:F0} fps for {PeerCapacity.HoldSeconds:F0}s while running more than {minAllowance} creatures: no new creatures above three quarters");
+                sb.AppendLine($"                   of what they run, and the rest move, {CreatureLoadRules.MaxShedsPerOwnerPerPass} a pass, to players at {min + PeerCapacity.HealthyMarginFps:F0}+ fps (not ones only they are near);");
+                sb.AppendLine($"                   still slow a hold after reaching it: another quarter; at {minAllowance}, or half of where it started, and no faster: dropped,");
+                sb.AppendLine($"                   left alone {PeerCapacity.ExemptSeconds / 60f:F0} minutes; at {min + PeerCapacity.HealthyMarginFps:F0}+ fps for {PeerCapacity.RecoverSeconds:F0}s: one step back up");
+            }
+
+            List<long> reporting = new List<long>();
+            PeerCapacity.CollectReporting(reporting);
+            if (reporting.Count == 0) {
+                sb.AppendLine("  (no player has reported - players need this mod)");
+            } else {
+                sb.AppendLine("  name                 fps   worst   slow   sim ms/s  AIs   creatures  allowance  state");
+                for (int i = 0; i < reporting.Count; i++) {
+                    if (!PeerCapacity.TryGetView(reporting[i], out PeerCapacity.View view)) { continue; }
+                    FrameReport last = view.Last;
+                    string fps = view.HasFps ? $"{view.Fps:F0}" : "-";
+                    string sim = last.SimMsPerSecond >= 0f ? $"{last.SimMsPerSecond:F0}" : "-";
+                    string allowance = view.Steps > 0 ? $"{view.Allowance} (step {view.Steps})" : "-";
+                    string state = view.Exempt ? $"exempt {Elapsed(view.ExemptLeftSeconds)} more - creatures were not the cause"
+                                 : view.Steps > 0 ? $"held (was {view.OwnedAtStart} at {view.FpsAtStart:F0} fps)"
+                                 : view.Low ? "slow (hold running)"
+                                 : view.Receiver ? "has room"
+                                 : "ok";
+                    if (view.AgeSeconds > 10f) { state += $"; last report {view.AgeSeconds:F0}s ago"; }
+                    if (last.Unrepresentative) { state += "; " + DescribeFlags(last).TrimStart(',', ' '); }
+                    sb.AppendLine($"  {Pad(PeerCapacity.Name(reporting[i]), 20)} {Pad(fps, 5)} {Pad($"{last.WorstFrameMs:F0}ms", 7)} {Pad($"{last.SlowShare * 100f:F0}%", 6)} {Pad(sim, 9)} {Pad(last.OwnedAi.ToString(), 5)} {Pad(view.Owned.ToString(), 10)} {Pad(allowance, 10)} {state}");
+                }
+            }
+
+            sb.AppendLine($"  this pass        {OwnershipArbiter.LastPassSteered} creatures placed around a full player, {OwnershipArbiter.LastPassShed} moved off one, {OwnershipArbiter.LastPassShedBlocked} with nobody to take them");
+            sb.AppendLine($"  session totals   {PeerCapacity.ReportsAccepted} reports ({PeerCapacity.ReportsRejected} rejected); {PeerCapacity.TotalStepsDown} steps down, {PeerCapacity.TotalStepsUp} up, " +
+                          $"{PeerCapacity.TotalCleared} cleared, {PeerCapacity.TotalExempted} exempted; {OwnershipArbiter.TotalSteered} placed around, {OwnershipArbiter.TotalShed} moved off, {OwnershipArbiter.TotalShedBlocked} blocked");
+            sb.AppendLine("  fps is smoothed over a few reports. AIs = creatures the player's game says it runs; creatures = the server's count.");
+        }
+
+        private static string DescribeSim(FrameReport report) {
+            return report.SimMsPerSecond >= 0f ? $", {report.SimMsPerSecond:F0} ms/s in the game's fixed update ({report.FixedHz:F0}/s)" : "";
+        }
+
+        private static string DescribeFlags(FrameReport report) {
+            string flags = "";
+            if ((report.Flags & CreatureLoadRules.FlagLoading) != 0) { flags += ", loading"; }
+            if ((report.Flags & CreatureLoadRules.FlagUnfocused) != 0) { flags += ", in the background"; }
+            return flags;
         }
 
         private static string Elapsed(float seconds) {
@@ -1015,6 +1107,10 @@ namespace NetworkPerformanceSystem.Runtime {
             }
             if (!limiting) {
                 sb.AppendLine("  limit off (counted only: every request is sent, and passed on)");
+            } else {
+                sb.AppendLine($"  repeats held     {StatusEffectRepeats.RepeatSeconds:0.##}s, or a third of how long the effect lasts up to {StatusEffectRepeats.MaxRepeatSeconds:0.#}s (the most for one that never runs out)");
+                string holds = StatusEffectRepeats.DescribeHolds();
+                if (holds != null) { sb.AppendLine($"  seen             {holds}"); }
             }
             sb.AppendLine(StatusEffectRepeats.FloodsLogged > 0
                 ? $"  floods logged    {StatusEffectRepeats.FloodsLogged} (over {StatusEffectRepeats.FloodPerSecond} a second for one effect) - last: {StatusEffectRepeats.LastFlood}"
@@ -1079,6 +1175,7 @@ namespace NetworkPerformanceSystem.Runtime {
         /// receiver would have discarded anyway; the percentage is the share of relay traffic
         /// that was pure fan-out waste, which grows with player count.</summary>
         private static void AppendRoutedRpc(StringBuilder sb) {
+            AppendDamageNumbers(sb);
             if (!NpsEnv.IsHost()) { return; }
 
             sb.AppendLine();
@@ -1094,6 +1191,22 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendRelayRow(sb, "positional", RoutedRpcFilter.PositionalEvents, RoutedRpcFilter.PositionalSent, RoutedRpcFilter.PositionalSuppressed);
             sb.AppendLine($"  {Pad("global", 13)} {RoutedRpcFilter.GlobalEvents} events (relayed to everyone, by design)");
             sb.AppendLine($"  last second   sent {RoutedRpcFilter.SentLastSecond} msgs, suppressed {RoutedRpcFilter.SuppressedLastSecond} msgs");
+        }
+
+        /// <summary>M36 - who damage numbers go to, and what that has saved, since start.</summary>
+        private static void AppendDamageNumbers(StringBuilder sb) {
+            sb.AppendLine();
+            string standDown = PatchGuard.GetDisableReason(Mechanism.DamageNumbers);
+            if (standDown != null) {
+                sb.AppendLine($"Damage numbers: as the game sends them (stood down: {standDown})");
+                return;
+            }
+            sb.AppendLine($"Damage numbers: {DamageNumbers.CurrentName} (Routed RPC / Damage Numbers)");
+            sb.AppendLine($"  made here      {DamageNumbers.KeptLocal} shown here only, {DamageNumbers.SentToAttacker} sent to the player who landed the hit");
+            if (NpsEnv.IsHost()) {
+                float metres = UnityEngine.Mathf.Sqrt(DamageNumbers.RelayDistanceSq());
+                sb.AppendLine($"  relayed        {DamageNumbers.RelayOutOfRange} deliveries skipped for players over {metres:F0} m away, {DamageNumbers.RelayDropped} numbers not passed on (Off)");
+            }
         }
 
         /// <summary>The ZDO-targeted deliveries that went (or would have gone) to a peer holding the

@@ -28,9 +28,19 @@ namespace NetworkPerformanceSystem.Runtime {
     /// second player - and the first player's socket closed with 1.39 million messages queued.
     ///
     /// A request that repeats the last one exactly - same character, same effect, same
-    /// arguments - inside RepeatSeconds is not sent. On the owner it would do what the one before
+    /// arguments - inside the hold time is not sent. On the owner it would do what the one before
     /// it did: start the effect, or reset a timer that was reset a moment ago. The first request
     /// always goes, and so does anything that differs.
+    ///
+    /// The hold time follows the effect (HoldSecondsFor). A repeated request for an effect the
+    /// character already has does nothing on the owner but restart its timer
+    /// (SEMan.Internal_AddStatusEffect), and an effect area always asks for exactly that. So an
+    /// effect that lasts only needs refreshing well inside its duration: a third of it, between
+    /// RepeatSeconds and MaxRepeatSeconds, and MaxRepeatSeconds for one that never runs out - like
+    /// SafetyStatus's, whose repeats were 40-48% of every routed message the 2026-10-03 recordings
+    /// carried, still about 100 a second at four a second per creature. An effect this machine
+    /// does not know, or an add-only request that does not restart the timer, keeps RepeatSeconds,
+    /// so nothing that held before can lapse now.
     ///
     /// Two places, one rule:
     ///
@@ -46,9 +56,21 @@ namespace NetworkPerformanceSystem.Runtime {
     /// </summary>
     internal static class StatusEffectRepeats {
 
-        /// <summary>Four a second for one effect on one character. Effects kept alive by being
-        /// re-applied last seconds, not a quarter of one.</summary>
+        /// <summary>The shortest hold: four a second for one effect on one character. Used for an
+        /// effect this machine cannot look up, and for requests that do not restart the timer.</summary>
         internal const float RepeatSeconds = 0.25f;
+
+        /// <summary>The longest hold: an effect that lasts, or never runs out, is refreshed at
+        /// least this often, so one removed on the owner comes back within it.</summary>
+        internal const float MaxRepeatSeconds = 2f;
+
+        /// <summary>A lasting effect is refreshed once in this share of its duration, leaving the
+        /// rest as headroom for the message's trip.</summary>
+        internal const float RefreshShareOfDuration = 1f / 3f;
+
+        /// <summary>An effect hash this machine could not look up is tried again after this long:
+        /// mods add theirs when the item database is built, which can come after the first ask.</summary>
+        private const float UnknownRetrySeconds = 30f;
 
         /// <summary>Requests for one effect from one machine in one second that count as a flood.
         /// A guardian power or a hit lands a handful; an effect area at fault lands thousands.</summary>
@@ -69,6 +91,20 @@ namespace NetworkPerformanceSystem.Runtime {
         private const float ForgetFloodAfterSeconds = 300f;
 
         // -- pure --------------------------------------------------------------------------
+
+        /// <summary>
+        /// How long an exact repeat of a request is held back. Pure.
+        ///   * a request that does not restart the timer, or an effect this machine does not know
+        ///     -> RepeatSeconds, as before;
+        ///   * an effect that never runs out (duration 0) -> MaxRepeatSeconds;
+        ///   * otherwise a third of its duration, between RepeatSeconds and MaxRepeatSeconds.
+        /// </summary>
+        internal static float HoldSecondsFor(bool resetTime, bool known, float durationSeconds) {
+            if (!resetTime || !known) { return RepeatSeconds; }
+            if (!(durationSeconds > 0f) || float.IsInfinity(durationSeconds)) { return MaxRepeatSeconds; }
+            float hold = durationSeconds * RefreshShareOfDuration;
+            return hold < RepeatSeconds ? RepeatSeconds : hold > MaxRepeatSeconds ? MaxRepeatSeconds : hold;
+        }
 
         internal struct Key : IEquatable<Key> {
             internal long Sender;      // 0 for requests made on this machine
@@ -116,15 +152,15 @@ namespace NetworkPerformanceSystem.Runtime {
 
             /// <summary>
             /// False when this request repeats the last one that passed for its key, exactly, less
-            /// than RepeatSeconds after it. A held repeat does not move the clock, so the next one
-            /// to pass is RepeatSeconds after the last that did.
+            /// than holdSeconds after it. A held repeat does not move the clock, so the next one
+            /// to pass is holdSeconds after the last that did.
             /// </summary>
-            internal bool Pass(Key key, bool resetTime, int itemLevel, float skillLevel, int variant, float now) {
+            internal bool Pass(Key key, bool resetTime, int itemLevel, float skillLevel, int variant, float now, float holdSeconds) {
                 PruneIfDue(now);
 
                 if (_last.TryGetValue(key, out Last last)) {
                     float since = now - last.At;
-                    if (since >= 0f && since < RepeatSeconds
+                    if (since >= 0f && since < holdSeconds
                         && last.ResetTime == resetTime && last.ItemLevel == itemLevel
                         && last.SkillLevel.Equals(skillLevel) && last.Variant == variant) {
                         return false;
@@ -282,7 +318,7 @@ namespace NetworkPerformanceSystem.Runtime {
         /// </summary>
         internal static bool AllowLocal(ZDOID target, int effect, bool resetTime, int itemLevel, float skillLevel, int variant, float now) {
             LocalAsked++;
-            bool repeat = !Local.Pass(new Key(0L, target, effect), resetTime, itemLevel, skillLevel, variant, now);
+            bool repeat = !Local.Pass(new Key(0L, target, effect), resetTime, itemLevel, skillLevel, variant, now, HoldFor(effect, resetTime, now));
             bool held = repeat && Limiting;
             if (held) { LocalHeld++; }
 
@@ -345,12 +381,63 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>The host's half of the rule, apart from the package read so it runs offline.</summary>
         internal static bool AllowRelay(long sender, ZDOID target, int effect, bool resetTime, int itemLevel, float skillLevel, int variant, float now) {
             RelayAsked++;
-            bool repeat = !Relayed.Pass(new Key(sender, target, effect), resetTime, itemLevel, skillLevel, variant, now);
+            bool repeat = !Relayed.Pass(new Key(sender, target, effect), resetTime, itemLevel, skillLevel, variant, now, HoldFor(effect, resetTime, now));
             bool held = repeat && Limiting;
             if (held) { RelayHeld++; }
 
             if (RelayMeter.Note(sender, effect, target, held, now, out Report report)) { ReportRelay(report); }
             return !held;
+        }
+
+        // -- effect durations ----------------------------------------------------------------
+
+        /// <summary>Each effect's duration as this machine's item database gives it, looked up
+        /// once: ObjectDB.GetStatusEffect walks the whole list, and this runs for every request in
+        /// a flood. An effect it does not have is asked about again after UnknownRetrySeconds.</summary>
+        private static readonly Dictionary<int, float> KnownDurations = new Dictionary<int, float>();
+        private static readonly Dictionary<int, float> UnknownSince = new Dictionary<int, float>();
+
+        private static float HoldFor(int effect, bool resetTime, float now) {
+            if (!resetTime) { return RepeatSeconds; }
+            bool known = TryGetDuration(effect, now, out float duration);
+            return HoldSecondsFor(true, known, duration);
+        }
+
+        private static bool TryGetDuration(int effect, float now, out float duration) {
+            if (KnownDurations.TryGetValue(effect, out duration)) { return true; }
+            duration = 0f;
+            if (UnknownSince.TryGetValue(effect, out float since) && now >= since && now - since < UnknownRetrySeconds) { return false; }
+
+            try {
+                StatusEffect found = ObjectDB.instance != null ? ObjectDB.instance.GetStatusEffect(effect) : null;
+                if (found != null) {
+                    duration = found.m_ttl;
+                    KnownDurations[effect] = duration;
+                    UnknownSince.Remove(effect);
+                    return true;
+                }
+            } catch (Exception) {
+                // treated as unknown, which keeps the short hold
+            }
+            UnknownSince[effect] = now;
+            return false;
+        }
+
+        /// <summary>The effects asked for on other players' creatures so far and how long their
+        /// repeats are held, for nps_stats. Up to four, longest hold first.</summary>
+        internal static string DescribeHolds() {
+            if (KnownDurations.Count == 0) { return null; }
+            List<KeyValuePair<int, float>> entries = new List<KeyValuePair<int, float>>(KnownDurations);
+            entries.Sort((a, b) => HoldSecondsFor(true, true, b.Value).CompareTo(HoldSecondsFor(true, true, a.Value)));
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < entries.Count && i < 4; i++) {
+                if (i > 0) { sb.Append(", "); }
+                float hold = HoldSecondsFor(true, true, entries[i].Value);
+                string lasts = entries[i].Value > 0f ? $"lasts {entries[i].Value:0.#}s" : "never runs out";
+                sb.Append($"{EffectName(entries[i].Key)} every {hold:0.##}s ({lasts})");
+            }
+            if (entries.Count > 4) { sb.Append($", and {entries.Count - 4} more"); }
+            return sb.ToString();
         }
 
         // -- the log -----------------------------------------------------------------------
@@ -506,6 +593,8 @@ namespace NetworkPerformanceSystem.Runtime {
             LocalMeter.Clear();
             Relayed.Clear();
             RelayMeter.Clear();
+            KnownDurations.Clear();
+            UnknownSince.Clear();
             LocalAsked = 0;
             LocalHeld = 0;
             RelayAsked = 0;

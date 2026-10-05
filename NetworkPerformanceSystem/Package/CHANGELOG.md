@@ -1,5 +1,13 @@
 # Changelog
 
+**1.15.0**
+- Players with the mod now tell the server how smoothly their game is running.
+- A player whose game slows down in a big fight is given fewer creatures to run, and the rest move to players with room to spare.
+- Network monitoring and nps_stats show each player's frame rate and creature allowance.
+- Damage numbers are only sent to players close enough to see them.
+- New option to send damage numbers only to the player who landed the hit, or not at all.
+- Status effects that last a while are re-sent to other players' creatures far less often (instead of 4x per second)
+
 **1.14.0**
 - Players who are still joining and loading the world now get a separate, longer allowance before they are dropped, so the in-world timeout can be kept short.
 - A player whose game or connection dies is now sent back to the menu and freed from the server sooner, instead of sitting in a frozen world.

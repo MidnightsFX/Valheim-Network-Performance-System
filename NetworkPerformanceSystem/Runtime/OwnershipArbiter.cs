@@ -177,6 +177,10 @@ namespace NetworkPerformanceSystem.Runtime {
         /// nothing, and the per-pass cap should be spent on that first.</summary>
         private static readonly System.Comparison<PendingMove> ByPriority = (a, b) => {
             if (a.Creature != b.Creature) { return a.Creature ? -1 : 1; }
+            // Creatures moved off a struggling player (M35) wait behind every other creature move:
+            // those are fights being placed, these are load being spread. Within the sheds the
+            // cheapest in staleness go first.
+            if (a.Shed != b.Shed) { return a.Shed ? 1 : -1; }
             return b.Priority.CompareTo(a.Priority);
         };
 
@@ -185,6 +189,40 @@ namespace NetworkPerformanceSystem.Runtime {
         private static int _verdictsInUse;
         private static readonly Dictionary<long, int> OwnedCount = new Dictionary<long, int>();
         private static readonly Dictionary<long, int> MovesPerTarget = new Dictionary<long, int>();
+
+        // M35, the creature allowance. OwnedCreatures is the tally of creatures alone, per owner,
+        // as of the start of the pass. The three lists run parallel to Candidates and are rebuilt
+        // with it: how many more creatures each candidate may take this pass (int.MaxValue for
+        // anyone without an allowance - everyone, while M35 is off), whether it may take creatures
+        // moved off somebody else, and how many creature moves away from it are already queued.
+        private static readonly Dictionary<long, int> OwnedCreatures = new Dictionary<long, int>();
+        private static readonly List<int> CreatureRoom = new List<int>();
+        private static readonly List<bool> ShedReceiver = new List<bool>();
+        private static readonly List<int> PendingOut = new List<int>();
+        private static readonly List<int> PendingIn = new List<int>();
+        private static readonly List<int> ShedCollected = new List<int>();
+        private static readonly List<ShedEntry> ShedEntries = new List<ShedEntry>();
+        private static readonly List<ReceiverOption> ReceiverOptions = new List<ReceiverOption>();
+
+        /// <summary>The most creatures collected per over-allowance owner in one pass. Four of
+        /// them move at most; the rest only give the order something to choose from.</summary>
+        private const int MaxShedCollectedPerOwner = 64;
+
+        /// <summary>A creature that could be moved off a player over their allowance, collected
+        /// during the zone walk and chosen from once it is over (SelectSheds).</summary>
+        private struct ShedEntry {
+            internal ZDO Zdo;
+            internal SectorVerdict Sector;
+            internal int OwnerIndex;
+            internal long Owner;
+            internal bool Alert;
+            internal float DistSq;               // from its owner, in 3D
+        }
+
+        private static readonly System.Comparison<ShedEntry> ShedOrder = (a, b) => {
+            if (a.OwnerIndex != b.OwnerIndex) { return a.OwnerIndex.CompareTo(b.OwnerIndex); }
+            return CreatureLoadRules.CompareShed(a.Alert, a.DistSq, a.Zdo.m_uid.ID, b.Alert, b.DistSq, b.Zdo.m_uid.ID);
+        };
 
         /// <summary>Player id -> session id, for giving an abandoned ship to the player at its
         /// helm. Built at most once per pass and only when a rescued ship names a helmsman, so a
@@ -239,6 +277,12 @@ namespace NetworkPerformanceSystem.Runtime {
             /// later frame would have to revisit that.</summary>
             internal readonly List<int> PresentIndex = new List<int>();
 
+            /// <summary>The full score of each entry of Present, in the same order. TotalByOwner
+            /// alone cannot rank them: with two viewers every total is equal and the tie-break on
+            /// worst case and RTT decides, so picking a creature's owner among the candidates
+            /// with room (M35) needs all three numbers.</summary>
+            internal readonly List<Verdict> PresentScore = new List<Verdict>();
+
             internal void Clear() {
                 HasEligible = false;
                 BestUid = 0L;
@@ -246,6 +290,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 TotalByOwner.Clear();
                 Present.Clear();
                 PresentIndex.Clear();
+                PresentScore.Clear();
             }
         }
 
@@ -309,6 +354,10 @@ namespace NetworkPerformanceSystem.Runtime {
             /// creature from its loaded ring - while being the one machine that most needs to
             /// hear, because it is the one still writing.</summary>
             internal long OldOwner;
+
+            /// <summary>A creature moved off a player over their creature allowance (M35), to a
+            /// player with room. Queued behind every other creature move and reported apart.</summary>
+            internal bool Shed;
         }
 
         // Diagnostics. Rescue and optimisation are counted apart on purpose: they are different
@@ -403,6 +452,22 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static int LastPassLeaderRescued;
         internal static long TotalLeaderReturned;
         internal static long TotalLeaderRescued;
+
+        // M35. Steered counts creatures sent to someone other than the sector's best because the
+        // best was at their creature allowance. Shed counts creatures moved off a player over their
+        // allowance (applied, not queued); ShedBlocked counts ones that found nobody with room.
+        internal static int LastPassSteered;
+        internal static int LastPassShed;
+        internal static int LastPassShedBlocked;
+        internal static long TotalSteered;
+        internal static long TotalShed;
+        internal static long TotalShedBlocked;
+
+        /// <summary>M35 applies this pass: creatures are arbitrated and the allowance is on.</summary>
+        private static bool _allowanceActive;
+
+        /// <summary>Challenge Margin Ms, read once per pass for the shed receiver pick.</summary>
+        private static float _challengeMarginMs;
 
         // Tier 2's settings, read once per pass. ArbitrateZone already carries five arguments down
         // from RunPass and four more would be noise - but the real reason these are fields is that
@@ -503,6 +568,8 @@ namespace NetworkPerformanceSystem.Runtime {
             _followersEnabled = _creaturesEnabled && ValConfig.OwnershipFollowersStayWithLeader.Value;
             _keepWhileLoaded = ValConfig.OwnershipKeepWhileLoaded.Value;
             _structureOwnersWait = StructureUpdates.Active && StructureUpdates.OwnerChangesMayWait;
+            _allowanceActive = _creaturesEnabled && PeerCapacity.Balancing;
+            _challengeMarginMs = margin;
 
             LastPassGhostsExcluded = 0;
             BuildCandidates(zdoMan);
@@ -512,7 +579,8 @@ namespace NetworkPerformanceSystem.Runtime {
 
             CollectZonesToScan();
             GroupSharedBucket(zdoMan);
-            TallyOwnedLoad(zdoMan, loadPenalty > 0f);
+            TallyOwnedLoad(zdoMan, loadPenalty > 0f, _allowanceActive);
+            BuildCreatureRoom();
 
             SectorCache.Clear();
             _verdictsInUse = 0;
@@ -540,6 +608,9 @@ namespace NetworkPerformanceSystem.Runtime {
             LastPassLoadedKept = 0;
             LastPassLeaderKept = 0;
             LastPassLeaderRescued = 0;
+            LastPassSteered = 0;
+            LastPassShedBlocked = 0;
+            ShedEntries.Clear();
             _monitorSoleCreatures = 0;
             _monitorContestedCreatures = 0;
 
@@ -577,8 +648,12 @@ namespace NetworkPerformanceSystem.Runtime {
                 }
             }
 
+            if (_allowanceActive && ShedEntries.Count > 0) { SelectShedsGuarded(); }
             ApplyUpgrades(now);
             PruneHoldTable(now);
+
+            // M35 reads this pass's creature tally; it decides the allowances the next pass uses.
+            PeerCapacity.OnPassCompleted(now);
 
             watch.Stop();
             LastPassMs = (float)watch.Elapsed.TotalMilliseconds;
@@ -600,7 +675,7 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             if (Logger.Level >= BepInEx.Logging.LogLevel.Debug) {
-                Logger.LogDebug($"Ownership pass: considered {LastPassConsidered} ({LastPassUnownedOnEntry} unowned) over {ZonesToScan.Count} zones, rescued {LastPassRescued} ({LastPassHelmRescued} to a helmsman, {LastPassNearestRescued} to the nearest, {LastPassCreaturesRescued} creatures), released {LastPassReleased}, optimised {LastPassOptimised} ({LastPassCreaturesOptimised} creatures), deferred {LastPassDeferred}, creatures kept by a loading owner {LastPassCreaturesKept}, proximity {LastPassProximityPulled} pulled / {LastPassProximityKept} kept / {LastPassProximityRescued} rescued / {LastPassProximityHeld} held, interactive {LastPassInteractiveOptimised} ({LastPassInteractiveDeferred} deferred, {LastPassInteractiveHeld} held), static held {LastPassStaticHeld}, ghosts excluded {LastPassGhostsExcluded}, history {OwnerHistory.Count}, {LastPassMs:F1}ms.");
+                Logger.LogDebug($"Ownership pass: considered {LastPassConsidered} ({LastPassUnownedOnEntry} unowned) over {ZonesToScan.Count} zones, rescued {LastPassRescued} ({LastPassHelmRescued} to a helmsman, {LastPassNearestRescued} to the nearest, {LastPassCreaturesRescued} creatures), released {LastPassReleased}, optimised {LastPassOptimised} ({LastPassCreaturesOptimised} creatures), deferred {LastPassDeferred}, creatures kept by a loading owner {LastPassCreaturesKept}, allowance {LastPassSteered} steered / {LastPassShed} shed / {LastPassShedBlocked} blocked, proximity {LastPassProximityPulled} pulled / {LastPassProximityKept} kept / {LastPassProximityRescued} rescued / {LastPassProximityHeld} held, interactive {LastPassInteractiveOptimised} ({LastPassInteractiveDeferred} deferred, {LastPassInteractiveHeld} held), static held {LastPassStaticHeld}, ghosts excluded {LastPassGhostsExcluded}, history {OwnerHistory.Count}, {LastPassMs:F1}ms.");
             }
         }
 
@@ -690,6 +765,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (loadPenalty > 0f && OwnedCount.TryGetValue(owner.Uid, out int owned)) {
                     score.TotalCostMs += Mathf.Min(owned * loadPenalty, loadCap);
                 }
+                verdict.PresentScore.Add(score);          // parallel to Present; see PresentScore
 
                 // Priced before the CanOwn gate: a host barred from owning still owns ZDOs
                 // legitimately, and an incumbent missing from this table reads as infinite cost.
@@ -945,32 +1021,259 @@ namespace NetworkPerformanceSystem.Runtime {
         /// contested ones. OwnershipPolicy answers it from a small direct-mapped cache in front of
         /// its prefab table, so the cost per object is an index and a compare.
         /// </summary>
-        private static void TallyOwnedLoad(ZDOMan zdoMan, bool tallyLoad) {
+        /// <param name="tallyLoad">Count simulated objects for the load handicap.</param>
+        /// <param name="tallyCreatures">Count creatures alone for the creature allowance (M35).
+        /// The same walk answers both, so a pass that needs either pays for one.</param>
+        private static void TallyOwnedLoad(ZDOMan zdoMan, bool tallyLoad, bool tallyCreatures) {
             OwnedCount.Clear();
-            if (!tallyLoad) { return; }
+            OwnedCreatures.Clear();
+            if (!tallyLoad && !tallyCreatures) { return; }
 
             foreach (Vector2s zone in ZonesToScan) {
                 if (_scanSharedBucket && ZoneCompat.InSharedBucket(zone)) { continue; }   // once, below
-                TallyZone(ZoneObjects(zdoMan, zone));
-                TallyZone(ZonePortals(zdoMan, zone));
+                TallyZone(ZoneObjects(zdoMan, zone), tallyLoad, tallyCreatures);
+                TallyZone(ZonePortals(zdoMan, zone), tallyLoad, tallyCreatures);
             }
-            foreach (List<ZDO> group in SharedBucketObjects.Values) { TallyZone(group); }
-            foreach (List<ZDO> group in SharedBucketPortals.Values) { TallyZone(group); }
+            foreach (List<ZDO> group in SharedBucketObjects.Values) { TallyZone(group, tallyLoad, tallyCreatures); }
+            foreach (List<ZDO> group in SharedBucketPortals.Values) { TallyZone(group, tallyLoad, tallyCreatures); }
         }
 
-        private static void TallyZone(List<ZDO> objects) {
+        private static void TallyZone(List<ZDO> objects, bool tallyLoad, bool tallyCreatures) {
             if (objects == null) { return; }
 
             for (int i = 0; i < objects.Count; i++) {
                 ZDO zdo = objects[i];
                 if (zdo == null || !zdo.Persistent) { continue; }
                 if (!zdo.HasOwner()) { continue; }
-                if (zdo.Type != ZDO.ObjectType.Prioritized
-                    && !(_creaturesEnabled && OwnershipPolicy.IsCreature(zdo))) { continue; }
+
+                bool creature = false;
+                if (zdo.Type != ZDO.ObjectType.Prioritized) {
+                    if (!_creaturesEnabled || !OwnershipPolicy.IsCreature(zdo)) { continue; }
+                    creature = true;
+                } else if (!tallyLoad) {
+                    continue;                                                 // a ship or a player: load only
+                }
 
                 long owner = zdo.GetOwner();
-                OwnedCount.TryGetValue(owner, out int count);
-                OwnedCount[owner] = count + 1;
+                if (tallyLoad) {
+                    OwnedCount.TryGetValue(owner, out int count);
+                    OwnedCount[owner] = count + 1;
+                }
+                if (creature && tallyCreatures) {
+                    OwnedCreatures.TryGetValue(owner, out int creatures);
+                    OwnedCreatures[owner] = creatures + 1;
+                }
+            }
+        }
+
+        /// <summary>
+        /// M35: how many more creatures each candidate may take this pass - its allowance less
+        /// what it owns - and whether it may take creatures moved off somebody else. Everyone
+        /// without an allowance gets int.MaxValue, which is everyone while M35 is off, so every
+        /// test against these lists then reads exactly as the arbiter did before it existed.
+        /// </summary>
+        private static void BuildCreatureRoom() {
+            CreatureRoom.Clear();
+            ShedReceiver.Clear();
+            PendingOut.Clear();
+            PendingIn.Clear();
+            ShedCollected.Clear();
+
+            for (int i = 0; i < Candidates.Count; i++) {
+                int room = int.MaxValue;
+                bool receiver = false;
+                if (_allowanceActive) {
+                    long uid = Candidates[i].Uid;
+                    int allowance = PeerCapacity.AllowanceFor(uid);
+                    if (allowance != int.MaxValue) {
+                        OwnedCreatures.TryGetValue(uid, out int owned);
+                        room = allowance - owned;
+                    }
+                    receiver = Candidates[i].CanOwn && PeerCapacity.IsShedReceiver(uid);
+                }
+                CreatureRoom.Add(room);
+                ShedReceiver.Add(receiver);
+                PendingOut.Add(0);
+                PendingIn.Add(0);
+                ShedCollected.Add(0);
+            }
+        }
+
+        /// <summary>How many more creatures this candidate may take this pass.</summary>
+        private static int RoomOf(long uid) {
+            if (!_allowanceActive || !CandidateIndex.TryGetValue(uid, out int index)) { return int.MaxValue; }
+            return CreatureRoom[index];
+        }
+
+        /// <summary>The owner holds more creatures than their allowance.</summary>
+        private static bool OverAllowance(long uid) {
+            return _allowanceActive && RoomOf(uid) < 0;
+        }
+
+        /// <summary>A creature move to newOwner has been queued or made: one less it may take,
+        /// and one more on its way off oldOwner. The old owner's room is not given back here - the
+        /// move may yet be deferred, and until it is applied that player still runs it.</summary>
+        private static void ReserveCreature(long newOwner, long oldOwner) {
+            if (!_allowanceActive) { return; }
+            if (CandidateIndex.TryGetValue(newOwner, out int to)) {
+                PendingIn[to]++;
+                if (CreatureRoom[to] != int.MaxValue) { CreatureRoom[to]--; }
+            }
+            if (oldOwner != 0L && CandidateIndex.TryGetValue(oldOwner, out int from)) {
+                PendingOut[from]++;
+            }
+        }
+
+        /// <summary>
+        /// The candidate a creature should go to when the sector's best is at their allowance:
+        /// the best of the present candidates that may own and have room, by the cost function's
+        /// own ranking. 0 when there is none. The sector's best itself when it has room - which is
+        /// always, while M35 is off.
+        /// </summary>
+        private static long RoomyTarget(SectorVerdict verdict, out float total) {
+            total = verdict.BestTotalMs;
+            if (RoomOf(verdict.BestUid) > 0) { return verdict.BestUid; }
+
+            FillReceiverOptions(verdict, shedReceiversOnly: false);
+            int pick = CreatureLoadRules.PickWithRoom(ReceiverOptions, -1);
+            if (pick < 0) { return 0L; }
+            total = ReceiverOptions[pick].Total;
+            return Candidates[ReceiverOptions[pick].Index].Uid;
+        }
+
+        /// <summary>A rescued creature's owner when the sector's best is at their allowance: the
+        /// best candidate with room, or the best anyway when nobody has room - a rescue has to
+        /// land, because an unowned creature is frozen and cannot be hurt.</summary>
+        private static long RoomyRescueTarget(SectorVerdict verdict) {
+            if (RoomOf(verdict.BestUid) > 0) { return verdict.BestUid; }
+            long roomy = RoomyTarget(verdict, out _);
+            if (roomy == 0L) { return verdict.BestUid; }
+            LastPassSteered++;
+            TotalSteered++;
+            return roomy;
+        }
+
+        private static void FillReceiverOptions(SectorVerdict verdict, bool shedReceiversOnly) {
+            ReceiverOptions.Clear();
+            List<int> presentIndex = verdict.PresentIndex;
+            for (int i = 0; i < presentIndex.Count; i++) {
+                int index = presentIndex[i];
+                Verdict score = verdict.PresentScore[i];
+                OwnedCreatures.TryGetValue(Candidates[index].Uid, out int owned);
+                ReceiverOptions.Add(new ReceiverOption {
+                    Index = index,
+                    Total = score.TotalCostMs,
+                    Worst = score.WorstCostMs,
+                    Rtt = score.OwnerRttMs,
+                    Room = CreatureRoom[index],
+                    Load = owned + PendingIn[index],
+                    Eligible = Candidates[index].CanOwn && (!shedReceiversOnly || ShedReceiver[index]),
+                });
+            }
+        }
+
+        /// <summary>
+        /// Note a creature that could be moved off an owner over their allowance, if it may be:
+        /// not directly controlled, out of its hold, and not one only its owner is near (the
+        /// proximity rule stands - see CreatureLoadRules.ShedEligible). Which of them actually move,
+        /// and to whom, is decided once the whole pass has been walked (SelectSheds).
+        /// </summary>
+        /// <param name="soleScan">The proximity scan's answer for this creature when it ran
+        /// (an index, NobodyNear or SharedFight); int.MinValue to scan here.</param>
+        private static void CollectShed(ZDO zdo, SectorVerdict verdict, long owner, float now, float minHold, int soleScan) {
+            if (!CandidateIndex.TryGetValue(owner, out int ownerIndex)) { return; }
+            if (ShedCollected[ownerIndex] >= MaxShedCollectedPerOwner) { return; }
+            if (OwnershipPolicy.IsDirectlyControlled(zdo)) { return; }
+
+            Vector3 pos = zdo.GetPosition();
+            Candidate ownerCandidate = Candidates[ownerIndex];
+            float dx = ownerCandidate.RefPos.x - pos.x;
+            float dz = ownerCandidate.RefPos.z - pos.z;
+            float ownerSq = dx * dx + dz * dz;
+
+            int nearState;
+            bool ownerIsSole;
+            if (soleScan != int.MinValue) {
+                nearState = soleScan == SharedFight ? CreatureLoadRules.NearShared
+                          : soleScan == NobodyNear ? CreatureLoadRules.NearNobody
+                          : CreatureLoadRules.NearOne;
+                ownerIsSole = soleScan == ownerIndex;
+            } else {
+                int near = NearbyViewers(verdict, pos, out int sole);
+                nearState = near >= 2 ? CreatureLoadRules.NearShared : near == 1 ? CreatureLoadRules.NearOne : CreatureLoadRules.NearNobody;
+                ownerIsSole = near == 1 && sole == ownerIndex;
+            }
+            if (!CreatureLoadRules.ShedEligible(nearState, ownerIsSole, ownerSq, _proximityPullSq)) { return; }
+            if (now - Touch(zdo.m_uid, owner, now) < minHold) { return; }
+
+            float dy = ownerCandidate.RefPos.y - pos.y;
+            ShedEntries.Add(new ShedEntry {
+                Zdo = zdo,
+                Sector = verdict,
+                OwnerIndex = ownerIndex,
+                Owner = owner,
+                Alert = zdo.GetBool(ZDOVars.s_alert) || zdo.GetBool(ZDOVars.s_haveTargetHash),
+                DistSq = ownerSq + dy * dy,
+            });
+            ShedCollected[ownerIndex]++;
+        }
+
+        /// <summary>SelectSheds behind a catch: this runs on the host's main thread inside the
+        /// ownership pass, and a fault in it must cost the allowance, not the arbiter.</summary>
+        private static void SelectShedsGuarded() {
+            try {
+                SelectSheds();
+            } catch (System.Exception e) {
+                PendingSimulated.RemoveAll(move => move.Shed);
+                ShedEntries.Clear();
+                PatchGuard.Disable(Mechanism.CreatureAllowance,
+                    $"choosing creatures to move off a struggling player failed ({e.GetType().Name}: {e.Message}). " +
+                    "Creatures are placed as before for the rest of this session.");
+            }
+        }
+
+        /// <summary>
+        /// Move creatures off every owner who is over their allowance: up to four a pass each, by
+        /// CreatureLoadRules' order (not fighting first, then furthest from that owner), each to a
+        /// healthy player with room picked from that creature's own sector (PickReceiver). A
+        /// creature nobody can take stays where it is and is counted as blocked; the allowance
+        /// waits rather than stepping further while that is so (CreatureLoadRules.Step).
+        /// </summary>
+        private static void SelectSheds() {
+            ShedEntries.Sort(ShedOrder);
+
+            int i = 0;
+            while (i < ShedEntries.Count) {
+                int ownerIndex = ShedEntries[i].OwnerIndex;
+                int end = i;
+                while (end < ShedEntries.Count && ShedEntries[end].OwnerIndex == ownerIndex) { end++; }
+
+                int room = CreatureRoom[ownerIndex];
+                int overage = room == int.MaxValue ? 0 : -room - PendingOut[ownerIndex];
+                int quota = CreatureLoadRules.ShedsThisPass(overage, CreatureLoadRules.MaxShedsPerOwnerPerPass);
+
+                int taken = 0;
+                for (int k = i; k < end && taken < quota; k++) {
+                    ShedEntry entry = ShedEntries[k];
+                    FillReceiverOptions(entry.Sector, shedReceiversOnly: true);
+                    int pick = CreatureLoadRules.PickReceiver(ReceiverOptions, ownerIndex, _challengeMarginMs);
+                    if (pick < 0) {
+                        LastPassShedBlocked++;
+                        TotalShedBlocked++;
+                        continue;
+                    }
+
+                    long receiver = Candidates[ReceiverOptions[pick].Index].Uid;
+                    float ownerTotal = entry.Sector.TotalByOwner.TryGetValue(entry.Owner, out float known) ? known : ReceiverOptions[pick].Total;
+                    PendingSimulated.Add(new PendingMove {
+                        Zdo = entry.Zdo, NewOwner = receiver,
+                        Priority = ownerTotal - ReceiverOptions[pick].Total,      // staleness won (usually lost) by the move
+                        Sector = entry.Sector, Creature = true, Shed = true, OldOwner = entry.Owner,
+                    });
+                    ReserveCreature(receiver, entry.Owner);
+                    taken++;
+                }
+                i = end;
             }
         }
 
@@ -1333,9 +1636,11 @@ namespace NetworkPerformanceSystem.Runtime {
                 // simulated object in a contested zone. Everything that does not move was retired
                 // by the tier split above without reaching this.
                 bool keepWithOwner = false;
+                int soleScan = int.MinValue;                                  // not scanned; see CollectShed
                 if (_proximityEnabled) {
                     int sole = SoleNearbyViewer(verdict, zdo.GetPosition(), currentOwner,
                                                 out int ownerIndex, out float ownerSq);
+                    soleScan = sole;
                     if (sole >= 0 && Candidates[sole].CanOwn) {
                         Candidate near = Candidates[sole];
 
@@ -1360,6 +1665,9 @@ namespace NetworkPerformanceSystem.Runtime {
                                 Sector = verdict, Proximity = true,
                                 Creature = creature, OldOwner = currentOwner,
                             });
+                            // The one player near it takes it whatever their allowance says (the
+                            // proximity rule stands), but it still counts against them.
+                            if (creature) { ReserveCreature(near.Uid, currentOwner); }
                         } else {
                             LastPassProximityKept++;
                         }
@@ -1379,7 +1687,16 @@ namespace NetworkPerformanceSystem.Runtime {
                 // Tier 1's cost function from here down. A single compare that retires nearly
                 // every remaining ZDO in the zone - in a settled world the owner already is the
                 // best choice.
-                if (verdict.BestUid == currentOwner) { continue; }
+                //
+                // Every way out below that leaves a creature where it is also asks M35 whether its
+                // owner is over their creature allowance, and if so notes it as one that could be
+                // moved off them (CollectShed). Only these declining exits ask: a creature the
+                // cost function was going to move anyway moves the ordinary way.
+                bool shedCandidate = creature && OverAllowance(currentOwner);
+                if (verdict.BestUid == currentOwner) {
+                    if (shedCandidate) { CollectShed(zdo, verdict, currentOwner, now, minHold, soleScan); }
+                    continue;
+                }
 
                 // Directly-controlled objects follow their controller, never the cost function.
                 // This is what stops us yanking a ship out from under its helmsman. Tier 2 does not
@@ -1403,21 +1720,45 @@ namespace NetworkPerformanceSystem.Runtime {
                     ? knownTotal
                     : float.MaxValue;
 
-                float improvement = currentTotal - verdict.BestTotalMs;
-                if (improvement < margin) { continue; }
+                // M35: a creature never goes to a player already at their creature allowance. The
+                // best of the rest with room is asked instead - and if that is nobody, or the owner
+                // it already has, it stays put. Never back onto the full player in their place.
+                long target = verdict.BestUid;
+                float targetTotal = verdict.BestTotalMs;
+                bool steered = false;
+                if (creature && _allowanceActive && RoomOf(target) <= 0) {
+                    target = RoomyTarget(verdict, out targetTotal);
+                    if (target == 0L || target == currentOwner) {
+                        if (shedCandidate) { CollectShed(zdo, verdict, currentOwner, now, minHold, soleScan); }
+                        continue;
+                    }
+                    steered = true;
+                }
+
+                float improvement = currentTotal - targetTotal;
+                if (improvement < margin) {
+                    if (shedCandidate) { CollectShed(zdo, verdict, currentOwner, now, minHold, soleScan); }
+                    continue;
+                }
 
                 // The proximity layer's keep band, decided above: nobody is near and the owner is
                 // still close enough to have been fighting it.
                 if (keepWithOwner) {
                     LastPassProximityHeld++;
                     TotalProximityHeld++;
+                    if (shedCandidate) { CollectShed(zdo, verdict, currentOwner, now, minHold, soleScan); }
                     continue;
                 }
 
                 PendingSimulated.Add(new PendingMove {
-                    Zdo = zdo, NewOwner = verdict.BestUid, Priority = improvement, Sector = verdict,
+                    Zdo = zdo, NewOwner = target, Priority = improvement, Sector = verdict,
                     Creature = creature, OldOwner = currentOwner,
                 });
+                if (creature) { ReserveCreature(target, currentOwner); }
+                if (steered) {
+                    LastPassSteered++;
+                    TotalSteered++;
+                }
             }
         }
 
@@ -1492,6 +1833,9 @@ namespace NetworkPerformanceSystem.Runtime {
             int near = NearbyViewers(verdict, zdo.GetPosition(), out sole);
             if (near == 0 || now - Touch(zdo.m_uid, owner, now) < minHold) {
                 LastPassCreaturesKept++;
+                // Nobody near it, and its owner is over their creature allowance (M35): it is one
+                // that could go to a player with room.
+                if (near == 0 && OverAllowance(owner)) { CollectShed(zdo, verdict, owner, now, minHold, NobodyNear); }
                 return;
             }
 
@@ -1501,6 +1845,20 @@ namespace NetworkPerformanceSystem.Runtime {
                 target = Candidates[sole].Uid;
             } else {
                 target = verdict.BestUid;
+                // M35: not onto a player at their allowance. With nobody else to take it, it
+                // stays with the owner who still has it loaded.
+                if (_allowanceActive && RoomOf(target) <= 0) {
+                    long roomy = RoomyTarget(verdict, out _);
+                    if (roomy == 0L) {
+                        LastPassCreaturesKept++;
+                        return;
+                    }
+                    if (roomy != target) {
+                        LastPassSteered++;
+                        TotalSteered++;
+                    }
+                    target = roomy;
+                }
             }
 
             int ownerIndex = CandidateIndex[owner];                           // OwnerStillLoads found it
@@ -1511,6 +1869,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 Sector = verdict, Proximity = proximity,
                 Creature = true, OldOwner = owner,
             });
+            ReserveCreature(target, owner);
         }
 
         /// <summary>
@@ -1788,6 +2147,10 @@ namespace NetworkPerformanceSystem.Runtime {
             Rescue(zdo, newOwner, now);
             if (!creature) { return; }
 
+            // Counted against the new owner's creature allowance (M35) like any other creature
+            // they are given. Not as one leaving the old owner: they are not simulating it.
+            ReserveCreature(newOwner, 0L);
+
             LastPassCreaturesRescued++;
             TotalCreaturesRescued++;
             ForceSendTo(verdict, zdo.m_uid, oldOwner);
@@ -1854,15 +2217,15 @@ namespace NetworkPerformanceSystem.Runtime {
             // back to the sector's best candidate from each of the four exits below, and now falls
             // back through the proximity layer instead, which is the sector's best candidate
             // unless exactly one player is near.
-            if (!ShipHelmOwnership.Enabled) { return SoleNearbyOrBest(zdo, verdict); }
+            if (!ShipHelmOwnership.Enabled) { return SoleNearbyOrBest(zdo, verdict, creature); }
 
             long playerId = OwnershipPolicy.HelmsmanPlayerId(zdo);
-            if (playerId == 0L) { return SoleNearbyOrBest(zdo, verdict); }
+            if (playerId == 0L) { return SoleNearbyOrBest(zdo, verdict, creature); }
 
             long helmsman = PeerForPlayer(playerId);
-            if (helmsman == 0L) { return SoleNearbyOrBest(zdo, verdict); }
+            if (helmsman == 0L) { return SoleNearbyOrBest(zdo, verdict, creature); }
             if (helmsman != verdict.BestUid && (!IsPresent(verdict, helmsman) || !CanOwn(helmsman))) {
-                return SoleNearbyOrBest(zdo, verdict);
+                return SoleNearbyOrBest(zdo, verdict, creature);
             }
 
             LastPassHelmRescued++;
@@ -1884,11 +2247,17 @@ namespace NetworkPerformanceSystem.Runtime {
         ///
         /// The counters only move when the answer differs from the sector's best, so they read as
         /// "rescues this layer changed" rather than "rescues it looked at".
+        ///
+        /// A creature falling back to the sector's best skips a best that is at its creature
+        /// allowance (M35) for the best with room, when there is one. Ships and carts are not
+        /// creatures and never do.
         /// </summary>
-        private static long SoleNearbyOrBest(ZDO zdo, SectorVerdict verdict) {
-            if (!_proximityEnabled) { return verdict.BestUid; }
+        private static long SoleNearbyOrBest(ZDO zdo, SectorVerdict verdict, bool creature) {
+            if (!_proximityEnabled) { return creature ? RoomyRescueTarget(verdict) : verdict.BestUid; }
 
-            if (NearbyViewers(verdict, zdo.GetPosition(), out int sole) != 1 || !Candidates[sole].CanOwn) { return verdict.BestUid; }
+            if (NearbyViewers(verdict, zdo.GetPosition(), out int sole) != 1 || !Candidates[sole].CanOwn) {
+                return creature ? RoomyRescueTarget(verdict) : verdict.BestUid;
+            }
 
             long uid = Candidates[sole].Uid;
             if (uid != verdict.BestUid) {
@@ -1971,6 +2340,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 Zdo = zdo, NewOwner = leader, Priority = LeaderMovePriority,
                 Sector = verdict, Creature = true, Leader = true, OldOwner = oldOwner,
             });
+            ReserveCreature(leader, oldOwner);
         }
 
         /// <summary>
@@ -1985,6 +2355,7 @@ namespace NetworkPerformanceSystem.Runtime {
             OwnerHistory[zdo.m_uid] = new OwnershipRecord { Owner = leader, ChangedAt = now, LastSeenAt = now };
             LastPassLeaderRescued++;
             TotalLeaderRescued++;
+            ReserveCreature(leader, oldOwner);
 
             ZDOMan zdoMan = ZDOMan.instance;
             if (zdoMan == null) { return; }
@@ -2156,6 +2527,7 @@ namespace NetworkPerformanceSystem.Runtime {
             LastPassInteractiveCap = 0;
             LastPassProximityPulled = 0;
             LastPassLeaderReturned = 0;
+            LastPassShed = 0;
 
             // The configured cap is a floor, not a ceiling: it is tuned for a small group, and a
             // fixed number of transfers per pass means convergence time grows linearly with the
@@ -2215,8 +2587,10 @@ namespace NetworkPerformanceSystem.Runtime {
                     if (move.Leader) {
                         Monitoring.NoteCause(move.Zdo, HandoffCause.Leader);
                     } else {
-                        Monitoring.NoteCause(move.Zdo, move.Proximity ? HandoffCause.Proximity : HandoffCause.Optimise,
-                                             move.Priority, DescribeCandidates(move));
+                        HandoffCause cause = move.Shed ? HandoffCause.Capacity
+                                           : move.Proximity ? HandoffCause.Proximity
+                                           : HandoffCause.Optimise;
+                        Monitoring.NoteCause(move.Zdo, cause, move.Priority, DescribeCandidates(move));
                     }
                 }
                 move.Zdo.SetOwner(move.NewOwner);
@@ -2240,6 +2614,10 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (move.Leader) {
                     LastPassLeaderReturned++;
                     TotalLeaderReturned++;
+                }
+                if (move.Shed) {
+                    LastPassShed++;
+                    TotalShed++;
                 }
                 if (move.Creature) {
                     LastPassCreaturesOptimised++;
@@ -2366,6 +2744,13 @@ namespace NetworkPerformanceSystem.Runtime {
             return OwnedCount.TryGetValue(uid, out int owned) ? owned : 0;
         }
 
+        /// <summary>Creatures this peer owned as of the last pass. Zero while the creature
+        /// allowance (M35) is off, because then nothing tallies them. Read by PeerCapacity as
+        /// well as by monitoring.</summary>
+        internal static int OwnedCreaturesFor(long uid) {
+            return OwnedCreatures.TryGetValue(uid, out int owned) ? owned : 0;
+        }
+
         private static void CountCreatures(List<ZDO> objects, bool soleCandidate) {
             int count = 0;
             for (int i = 0; i < objects.Count; i++) {
@@ -2403,8 +2788,17 @@ namespace NetworkPerformanceSystem.Runtime {
                   .Append(",\"owned\":").Append(OwnedCountFor(candidate.Uid).ToString(invariant))
                   .Append(",\"distM\":").Append(Mathf.Sqrt(dx * dx + dz * dz).ToString("0", invariant))
                   .Append(",\"canOwn\":").Append(candidate.CanOwn ? "true" : "false")
-                  .Append(",\"viewer\":").Append(candidate.IsViewer ? "true" : "false")
-                  .Append('}');
+                  .Append(",\"viewer\":").Append(candidate.IsViewer ? "true" : "false");
+                // M35: the frame rate the player reported, and how many more creatures they could
+                // take when this move was decided (left out when they had no allowance).
+                if (PeerCapacity.TryGetView(candidate.Uid, out PeerCapacity.View load) && load.HasFps) {
+                    sb.Append(",\"fps\":").Append(load.Fps.ToString("0", invariant));
+                }
+                int room = RoomOf(candidate.Uid);
+                if (room != int.MaxValue) {
+                    sb.Append(",\"room\":").Append(room.ToString(invariant));
+                }
+                sb.Append('}');
             }
             sb.Append(']');
             return sb.ToString();
@@ -2495,6 +2889,23 @@ namespace NetworkPerformanceSystem.Runtime {
 
             _monitorSoleCreatures = 0;
             _monitorContestedCreatures = 0;
+
+            OwnedCreatures.Clear();
+            CreatureRoom.Clear();
+            ShedReceiver.Clear();
+            PendingOut.Clear();
+            PendingIn.Clear();
+            ShedCollected.Clear();
+            ShedEntries.Clear();
+            ReceiverOptions.Clear();
+            _allowanceActive = false;
+            _challengeMarginMs = 0f;
+            LastPassSteered = 0;
+            LastPassShed = 0;
+            LastPassShedBlocked = 0;
+            TotalSteered = 0;
+            TotalShed = 0;
+            TotalShedBlocked = 0;
         }
     }
 }

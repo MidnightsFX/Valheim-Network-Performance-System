@@ -29,13 +29,15 @@ NPS addresses these issues in a number of ways
 fixes with nothing installed on their end, and the server follows where they actually are rather than where they
 were two seconds ago. The server also sends settled or distant creatures, and fish and birds, to each player less often,
 holds back building, tree and rock updates that change nothing a player can see, and sends the world's list of past
-players only when it has actually changed.
+players only when it has actually changed. Damage numbers go only to players close enough to see them, and
+`Routed RPC / Damage Numbers` can limit them to the player who landed the hit, or stop sending them at all.
 
 **Installing on clients too** adds latency compensation, live position reporting and the clean exit
 from a dead session for those clients, and lets a ship they own pass to whoever takes its helm.
 Creatures they simulate stop re-sending themselves while standing still, which matters most next
 to a pen of tamed animals, and fish and birds they simulate are sent a few times a second instead of
-every frame, which matters most by water.
+every frame, which matters most by water. Their game also tells the server how smoothly it is
+running, so a player whose machine slows down in a big fight is given fewer creatures to run.
 Mixed groups are fine — benefits are per-player, and a client without the mod behaves
 exactly as vanilla. There is **no version lock**: nobody gets kicked for not having it.
 
@@ -46,6 +48,8 @@ Works on dedicated servers and on player-hosted games.
 An easy way to start is enabling the nps_stats display Run `nps_stats_collect` (needs `devcommands`, since sampling costs a Steam call per peer per tick), play, then `nps_stats`.
 
 A player the link-pressure table marks as `LOSSY` is already being dealt with: the server steps that one player's send rate down until their connection stops losing packets, and back up once it is clean, without changing anyone else's rate (`Steam Transport / Enable Loss Backoff`). A player whose loss does not improve - once their rate is below what their connection was already carrying, or at the lowest rate - has a connection problem the rate cannot fix: they go back to full speed and are left there until the server restarts. Loss measured during an outage at the server's end is ignored. The "Loss backoff" block shows who is backed off and by how much.
+
+Creatures normally go to whoever has the lowest ping, which can be the slowest machine in the group. A player with the mod whose frame rate stays under `Min Owner FPS` while they run a lot of creatures is held to fewer of them, and the rest move a few at a time to players whose games have room (`Creature Load / Balance Creatures By Frame Rate`). Creatures only that player is near stay with them. If taking creatures away does not make their game faster, they get them back and are left alone for ten minutes. The `fps` column of the peer table and the "Creature load" block show each player's frame rate and allowance.
 
 
 > **Lag, rubber-banding, hits not landing? Send a report.**

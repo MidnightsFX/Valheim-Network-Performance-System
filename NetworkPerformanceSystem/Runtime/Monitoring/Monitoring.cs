@@ -21,6 +21,7 @@ namespace NetworkPerformanceSystem.Runtime {
         Remote,          // arrived in a packet - some other machine changed the owner
         DragBack,        // arrived in a packet and undid a change this host had just made
         Leader,          // arbiter: a follower (tame following a player, or a summon) returned to its player
+        Capacity,        // M35: moved off a player over their creature allowance, to a player with room
     }
 
     /// <summary>
@@ -510,7 +511,7 @@ namespace NetworkPerformanceSystem.Runtime {
             // Both kinds of arbiter move carry who was weighed, and their distances - which the
             // cost function ignores and the proximity layer decides on, so one listing shows why
             // either of them did what it did.
-            if (cause == HandoffCause.Optimise || cause == HandoffCause.Proximity) {
+            if (cause == HandoffCause.Optimise || cause == HandoffCause.Proximity || cause == HandoffCause.Capacity) {
                 line.Num("gainMs", improvementMs, "0.#");
                 line.Raw("cands", candidates);
             }
@@ -547,6 +548,9 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Int("proxRescued", OwnershipArbiter.LastPassProximityRescued)
                 .Int("proxHeld", OwnershipArbiter.LastPassProximityHeld)
                 .Int("firstInOrder", OwnershipArbiter.LastPassFirstSendsInOrder)
+                .Int("steered", OwnershipArbiter.LastPassSteered)
+                .Int("shed", OwnershipArbiter.LastPassShed)
+                .Int("shedBlocked", OwnershipArbiter.LastPassShedBlocked)
                 .Int("soleCreatures", solePrioritized)
                 .Int("contestedCreatures", contestedPrioritized)
                 .Num("ms", OwnershipArbiter.LastPassMs, "0.##")
@@ -702,6 +706,23 @@ namespace NetworkPerformanceSystem.Runtime {
                         .Int("stList", structListed)
                         .Int("stNow", structNow);
                 }
+                // M34/M35: the player's last frame report (fps is the smoothed figure the
+                // allowance runs on), the creatures they own by the arbiter's count, and their
+                // allowance when they have one.
+                if (PeerCapacity.TryGetView(peer.m_uid, out PeerCapacity.View load) && load.HasReport) {
+                    FrameReport report = load.Last;
+                    line.Num("fps", load.HasFps ? load.Fps : report.Fps, "0.#")
+                        .Num("frameMs", report.MeanFrameMs, "0.#")
+                        .Num("worstMs", report.WorstFrameMs, "0.#")
+                        .Num("slow", report.SlowShare, "0.###")
+                        .Num("simMs", report.SimMsPerSecond, "0.#")
+                        .Num("fixedHz", report.FixedHz, "0.#")
+                        .Int("aiOwned", report.OwnedAi)
+                        .Int("crOwned", load.Owned)
+                        .Int("loadFlags", report.Flags);
+                    if (load.Steps > 0) { line.Int("allow", load.Allowance).Int("allowSteps", load.Steps); }
+                    if (load.Exempt) { line.Flag("allowExempt", true); }
+                }
 
                 EmitServer(line.End());
                 NotePeerSocket(now, peer, socketPath);
@@ -777,6 +798,31 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Num("delivered", delivered, "0.###")
                 .Num("atStart", deliveredAtStart, "0.###")
                 .Int("carried", Mathf.RoundToInt(carriedAtStart))
+                .End());
+        }
+
+        /// <summary>
+        /// M35 changed one player's creature allowance: "down" (set, or lowered a step), "up",
+        /// "clear" (no allowance any more), or "exempt" (lowering it did not make their game any
+        /// faster; cleared and left alone for ten minutes). "allow" is the allowance after the
+        /// change, -1 for none; "owned" the creatures they own now; "ownedAtStart" and
+        /// "fpsAtStart" what they owned and ran at when the first step was taken; "fps" the
+        /// smoothed frame rate the decision was made on.
+        /// </summary>
+        internal static void OnCreatureAllowance(long uid, string action, int steps, int allowance, int owned, int ownedAtStart,
+                                                 float fps, float fpsAtStart) {
+            if (!ServerRole) { return; }
+
+            EmitServer(Line.Begin("creature_allowance")
+                .Num("t", NowMs, "0.#")
+                .Id("uid", uid)
+                .Str("action", action)
+                .Int("steps", steps)
+                .Int("allow", allowance)
+                .Int("owned", owned)
+                .Int("ownedAtStart", ownedAtStart)
+                .Num("fps", fps, "0.#")
+                .Num("fpsAtStart", fpsAtStart, "0.#")
                 .End());
         }
 

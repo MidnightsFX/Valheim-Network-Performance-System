@@ -18,6 +18,13 @@ namespace NetworkPerformanceSystem.Runtime {
     /// the last ten seconds), and an older or vanilla host would drop the message unread anyway.
     /// A listen host files its own report directly. A dedicated server has no frames worth
     /// reporting and does nothing here.
+    ///
+    /// The report also says whether the game is the active window, and that one goes out the
+    /// moment it changes rather than at the next two-second mark: on some machines the game stops
+    /// running entirely while it is alt-tabbed, and the host keeps such a player for longer only
+    /// if it heard before they went quiet (ConnectionTimeout, Keep Players In The Background).
+    /// The send hands the message to Steam, whose own thread delivers it even if this one stops
+    /// straight after.
     /// </summary>
     internal static class FrameSampler {
 
@@ -26,6 +33,10 @@ namespace NetworkPerformanceSystem.Runtime {
         private static readonly FrameWindow Window = new FrameWindow();
         private static float _elapsed;
         private static bool _ticking;
+
+        private static bool _wasFocused = true;
+        private static bool _focusReportPending;
+        private static float _sinceSent;
 
         /// <summary>Set by FrameSamplerPatches when MonoUpdaters.FixedUpdate is hooked.</summary>
         internal static bool SimTimingAvailable;
@@ -41,11 +52,20 @@ namespace NetworkPerformanceSystem.Runtime {
             if (!Active) { return; }
             _ticking = true;
 
+            bool focused = Application.isFocused;
             Window.Add(dt);
             if (IsLoading()) { Window.MarkFlags(CreatureLoadRules.FlagLoading); }
+            if (!focused) { Window.MarkFlags(CreatureLoadRules.FlagUnfocusedFrames); }
+
+            if (focused != _wasFocused) {
+                _wasFocused = focused;
+                _focusReportPending = true;
+            }
 
             _elapsed += dt;
-            if (_elapsed < ReportIntervalSeconds) { return; }
+            _sinceSent += dt;
+            bool focusDue = _focusReportPending && _sinceSent >= CreatureLoadRules.MinFocusReportSeconds;
+            if (_elapsed < ReportIntervalSeconds && !focusDue) { return; }
             _elapsed = 0f;
 
             if (Window.Frames == 0) {
@@ -53,9 +73,11 @@ namespace NetworkPerformanceSystem.Runtime {
                 return;
             }
 
-            byte flags = Application.isFocused ? (byte)0 : CreatureLoadRules.FlagUnfocused;
+            byte flags = focused ? (byte)0 : CreatureLoadRules.FlagUnfocused;
             FrameReport report = Window.Snapshot(CountOwnedAi(), flags, Application.targetFrameRate, SimTimingAvailable);
             Window.Reset();
+            _focusReportPending = false;
+            _sinceSent = 0f;
 
             LastReport = report;
             HasLastReport = true;
@@ -107,6 +129,9 @@ namespace NetworkPerformanceSystem.Runtime {
             _elapsed = 0f;
             _ticking = false;
             HasLastReport = false;
+            _wasFocused = true;
+            _focusReportPending = false;
+            _sinceSent = 0f;
         }
     }
 }

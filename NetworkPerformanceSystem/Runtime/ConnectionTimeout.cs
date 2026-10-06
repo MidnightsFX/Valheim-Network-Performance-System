@@ -48,6 +48,21 @@ namespace NetworkPerformanceSystem.Runtime {
     /// it. (In the same data Steam went on acknowledging through every join-time freeze, at about
     /// 100 B/s - the transport lives on its own thread - so this is belt and braces.)</para>
     ///
+    /// <para>A THIRD, FOR A GAME IN THE BACKGROUND. On some machines the game stops running
+    /// altogether while it is not the active window - alt-tabbed or minimised - and a player who
+    /// steps away for longer than the in-world deadline comes back to a dropped connection. Seen
+    /// on 2026-10-06: three drops in a quarter of an hour, each closed from the server's end
+    /// (its in-world deadline was 30s), and each time the player's own game had not been running
+    /// through the gap - PeerLiveness credited the whole silence as exactly one second, its cap
+    /// for a stalled main thread. Players with this mod say when their game
+    /// leaves or comes back to the foreground (FrameSampler sends it at once), and with Keep
+    /// Players In The Background on, such a player gets Background Timeout Seconds instead - for
+    /// as long as the last word from their game was that it is in the background. Steam is the
+    /// lower layer again, so TimeoutConnected takes that deadline too; a game that is merely not
+    /// running still has Steam's own thread acknowledging, so it is a whole machine gone to sleep
+    /// that Steam would otherwise drop sooner. Their objects are not held: PeerLiveness stops
+    /// trusting a quiet peer to simulate anything long before either deadline.</para>
+    ///
     /// Everything is written after vanilla has written its own - a postfix on each seam - and read
     /// back, so a refused write is visible in the log rather than assumed to have worked.
     /// </summary>
@@ -89,19 +104,34 @@ namespace NetworkPerformanceSystem.Runtime {
         /// until its character exists. Never below InWorldTimeoutSeconds.</summary>
         internal static float JoiningTimeoutSeconds { get; private set; } = VanillaRpcTimeoutSeconds;
 
+        /// <summary>The ZRpc deadline for a peer whose game last said it is in the background,
+        /// when Keep Players In The Background is on; 0 when it is off. Never below either of the
+        /// other two.</summary>
+        internal static float BackgroundTimeoutSeconds { get; private set; }
+
         /// <summary>Whether ZRpc.Update rewrites the static per peer. Off while tuning is off, so
         /// the game's own value - or another mod's - is left alone.</summary>
         private static bool _perPeer;
 
-        /// <summary>
-        /// The ZRpcs whose player has reached the world: on a host, each peer whose client has
-        /// sent its character id; on a client, the server's, once our own character has spawned.
-        /// Sticky - a respawn clears the character id for a moment and is not a new join. Weak
-        /// keys, so a disconnected peer's ZRpc is not kept alive by being listed here.
-        /// </summary>
-        private static ConditionalWeakTable<ZRpc, object> _inWorld = new ConditionalWeakTable<ZRpc, object>();
+        /// <summary>What decides one connection's deadline.</summary>
+        private sealed class PeerState {
+            /// <summary>Its player has reached the world: on a host, the peer's client has sent
+            /// its character id; on a client, our own character has spawned. Sticky - a respawn
+            /// clears the character id for a moment and is not a new join.</summary>
+            internal bool InWorld;
 
-        private static readonly object Present = new object();
+            /// <summary>Host only: the last frame report from this player's game said it is not
+            /// the active window.</summary>
+            internal bool InBackground;
+
+            /// <summary>The background deadline has been logged as holding this player since they
+            /// last answered.</summary>
+            internal bool Held;
+        }
+
+        /// <summary>Per connection. Weak keys, so a disconnected peer's ZRpc is not kept alive by
+        /// being listed here.</summary>
+        private static ConditionalWeakTable<ZRpc, PeerState> _peers = new ConditionalWeakTable<ZRpc, PeerState>();
 
         /// <summary>The Steam readback from the last apply, for nps_stats. Null until we have run
         /// against a Steam interface.</summary>
@@ -128,12 +158,37 @@ namespace NetworkPerformanceSystem.Runtime {
             }
         }
 
+        /// <summary>Keep Players In The Background, on top of Active. It rides on the per-peer
+        /// deadline, so it has nothing to stand on while timeout tuning is off.</summary>
+        private static bool KeepInBackground =>
+            Active
+            && ValConfig.KeepPlayersInBackground != null
+            && ValConfig.BackgroundTimeoutSeconds != null
+            && ValConfig.KeepPlayersInBackground.Value;
+
         /// <summary>
         /// The deadline ZRpc enforces for this connection: the joining allowance until its player
-        /// has reached the world, the in-world one after.
+        /// has reached the world, the in-world one after - and the background one, when it is
+        /// longer, while their game says it is not the active window.
         /// </summary>
         internal static float DeadlineFor(ZRpc rpc) {
-            return rpc != null && _inWorld.TryGetValue(rpc, out _) ? InWorldTimeoutSeconds : JoiningTimeoutSeconds;
+            if (rpc == null || !_peers.TryGetValue(rpc, out PeerState state)) { return JoiningTimeoutSeconds; }
+            return DeadlineOf(state);
+        }
+
+        private static float BaseDeadlineOf(PeerState state) {
+            return state.InWorld ? InWorldTimeoutSeconds : JoiningTimeoutSeconds;
+        }
+
+        private static float DeadlineOf(PeerState state) {
+            float deadline = BaseDeadlineOf(state);
+            return state.InBackground && BackgroundTimeoutSeconds > deadline ? BackgroundTimeoutSeconds : deadline;
+        }
+
+        /// <summary>Whether the host is holding this connection to the background deadline right
+        /// now. For nps_stats and monitoring.</summary>
+        internal static bool IsInBackground(ZRpc rpc) {
+            return rpc != null && _peers.TryGetValue(rpc, out PeerState state) && state.InBackground;
         }
 
         /// <summary>Called from the ZRpc.Update prefix, before vanilla compares the silence against
@@ -141,16 +196,65 @@ namespace NetworkPerformanceSystem.Runtime {
         /// another peer's comparison.</summary>
         internal static void BeforeRpcUpdate(ZRpc rpc) {
             if (!_perPeer) { return; }
-            ZRpc.m_timeout = DeadlineFor(rpc);
+            if (rpc == null || !_peers.TryGetValue(rpc, out PeerState state)) {
+                ZRpc.m_timeout = JoiningTimeoutSeconds;
+                return;
+            }
+
+            float deadline = DeadlineOf(state);
+            ZRpc.m_timeout = deadline;
+            if (state.InBackground) { NoteBackgroundSilence(rpc, state, deadline); }
         }
+
+        /// <summary>
+        /// Say so once when the background deadline starts doing its job - a player in the
+        /// background whose silence has passed the deadline they would otherwise have been dropped
+        /// at - and again for the next stretch once they have answered in between.
+        /// </summary>
+        private static void NoteBackgroundSilence(ZRpc rpc, PeerState state, float deadline) {
+            float silent = rpc.GetTimeSinceLastPing();
+            if (state.Held) {
+                if (silent < 1f) { state.Held = false; }
+                return;
+            }
+
+            float usual = BaseDeadlineOf(state);
+            if (deadline <= usual || silent <= usual) { return; }
+            state.Held = true;
+            BackgroundHolds++;
+
+            ZNetPeer peer = ZNet.instance != null ? Patches.NetworkChannelPatches.FindPeerByRpc(rpc) : null;
+            string name = peer != null && !string.IsNullOrEmpty(peer.m_playerName) ? peer.m_playerName : "A player";
+            Logger.LogInfo($"{name}'s game is in the background and has not answered for {usual:F0}s. " +
+                           $"Keeping them connected for up to {deadline:F0}s while it stays there (Keep Players In The Background).");
+            if (peer != null && Monitoring.Active) { Monitoring.OnBackgroundHold(peer.m_uid, usual, deadline); }
+        }
+
+        /// <summary>Times the background deadline has kept a quiet player connected past the one
+        /// they would otherwise have had, this session.</summary>
+        internal static long BackgroundHolds { get; private set; }
 
         /// <summary>
         /// This connection's player is in the world from here on. Host: from the RPC_CharacterID
         /// postfix. Client: from the SetCharacterID postfix, for the server's ZRpc.
         /// </summary>
         internal static void NoteInWorld(ZRpc rpc) {
-            if (rpc == null || _inWorld.TryGetValue(rpc, out _)) { return; }
-            _inWorld.Add(rpc, Present);
+            if (rpc == null) { return; }
+            _peers.GetOrCreateValue(rpc).InWorld = true;
+        }
+
+        /// <summary>Host: a frame report from this connection's player said whether their game is
+        /// the active window (PeerCapacity.RPC_ClientLoad).</summary>
+        internal static void NoteFocus(ZRpc rpc, bool inBackground) {
+            if (rpc == null) { return; }
+            PeerState state;
+            if (inBackground) {
+                state = _peers.GetOrCreateValue(rpc);
+            } else if (!_peers.TryGetValue(rpc, out state)) {
+                return;
+            }
+            state.InBackground = inBackground;
+            if (!inBackground) { state.Held = false; }
         }
 
         /// <summary>Called from the ZRpc.SetLongTimeout postfix - the one place vanilla writes
@@ -181,7 +285,8 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static void Reset() {
             _longMode = false;
             _lastLoggedRpc = null;
-            _inWorld = new ConditionalWeakTable<ZRpc, object>();
+            _peers = new ConditionalWeakTable<ZRpc, PeerState>();
+            BackgroundHolds = 0;
         }
 
         /// <summary>
@@ -204,9 +309,13 @@ namespace NetworkPerformanceSystem.Runtime {
             if (_perPeer) {
                 InWorldTimeoutSeconds = Math.Max(ValConfig.ConnectionTimeoutSeconds.Value, _longMode ? vanilla : 0f);
                 JoiningTimeoutSeconds = Math.Max(ValConfig.LoadingTimeoutSeconds.Value, InWorldTimeoutSeconds);
+                BackgroundTimeoutSeconds = KeepInBackground
+                    ? Math.Max(ValConfig.BackgroundTimeoutSeconds.Value, JoiningTimeoutSeconds)
+                    : 0f;
             } else {
                 InWorldTimeoutSeconds = vanilla;
                 JoiningTimeoutSeconds = vanilla;
+                BackgroundTimeoutSeconds = 0f;
             }
 
             float before = ZRpc.m_timeout;
@@ -214,6 +323,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             string line = _perPeer
                 ? $"ZRpc ping timeout {before}s -> {JoiningTimeoutSeconds}s while joining, {InWorldTimeoutSeconds}s once in the world"
+                  + (BackgroundTimeoutSeconds > 0f ? $", {BackgroundTimeoutSeconds}s while their game is in the background" : "")
                 : $"ZRpc ping timeout {before}s -> {ZRpc.m_timeout}s (vanilla)";
             if (_longMode) { line += " [crossplay]"; }
             if (line == _lastLoggedRpc) { return; }
@@ -235,7 +345,8 @@ namespace NetworkPerformanceSystem.Runtime {
                 ? ValConfig.ConnectTimeoutSeconds.Value * MillisPerSecond
                 : VanillaSteamInitialMillis;
             int wantConnected = Active
-                ? Math.Max(ValConfig.LoadingTimeoutSeconds.Value, ValConfig.ConnectionTimeoutSeconds.Value) * MillisPerSecond
+                ? Math.Max(Math.Max(ValConfig.LoadingTimeoutSeconds.Value, ValConfig.ConnectionTimeoutSeconds.Value),
+                           KeepInBackground ? ValConfig.BackgroundTimeoutSeconds.Value : 0) * MillisPerSecond
                 : VanillaSteamConnectedMillis;
 
             int beforeInitial = ReadOr(ESteamNetworkingConfigValue.k_ESteamNetworkingConfig_TimeoutInitial, VanillaSteamInitialMillis);

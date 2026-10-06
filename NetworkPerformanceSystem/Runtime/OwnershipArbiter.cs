@@ -196,6 +196,14 @@ namespace NetworkPerformanceSystem.Runtime {
         // anyone without an allowance - everyone, while M35 is off), whether it may take creatures
         // moved off somebody else, and how many creature moves away from it are already queued.
         private static readonly Dictionary<long, int> OwnedCreatures = new Dictionary<long, int>();
+
+        /// <summary>M35: of each owner's creatures, how many sit where somebody else could run
+        /// them - a candidate that may own and has no allowance of its own has the zone in its
+        /// active area. PeerCapacity sets no allowance on a player for whom this is 0. Helpers is
+        /// those candidates, by index, collected once at the start of the tally.</summary>
+        private static readonly Dictionary<long, int> SharedCreatures = new Dictionary<long, int>();
+        private static readonly List<int> Helpers = new List<int>();
+
         private static readonly List<int> CreatureRoom = new List<int>();
         private static readonly List<bool> ShedReceiver = new List<bool>();
         private static readonly List<int> PendingOut = new List<int>();
@@ -1022,24 +1030,55 @@ namespace NetworkPerformanceSystem.Runtime {
         /// its prefab table, so the cost per object is an index and a compare.
         /// </summary>
         /// <param name="tallyLoad">Count simulated objects for the load handicap.</param>
-        /// <param name="tallyCreatures">Count creatures alone for the creature allowance (M35).
-        /// The same walk answers both, so a pass that needs either pays for one.</param>
+        /// <param name="tallyCreatures">Count creatures alone for the creature allowance (M35),
+        /// and which of them somebody else could run. The same walk answers both, so a pass that
+        /// needs either pays for one.</param>
         private static void TallyOwnedLoad(ZDOMan zdoMan, bool tallyLoad, bool tallyCreatures) {
             OwnedCount.Clear();
             OwnedCreatures.Clear();
+            SharedCreatures.Clear();
+            Helpers.Clear();
             if (!tallyLoad && !tallyCreatures) { return; }
+            if (tallyCreatures) { CollectHelpers(); }
 
             foreach (Vector2s zone in ZonesToScan) {
                 if (_scanSharedBucket && ZoneCompat.InSharedBucket(zone)) { continue; }   // once, below
-                TallyZone(ZoneObjects(zdoMan, zone), tallyLoad, tallyCreatures);
-                TallyZone(ZonePortals(zdoMan, zone), tallyLoad, tallyCreatures);
+                TallyZone(ZoneObjects(zdoMan, zone), zone, tallyLoad, tallyCreatures);
+                TallyZone(ZonePortals(zdoMan, zone), zone, tallyLoad, tallyCreatures);
             }
-            foreach (List<ZDO> group in SharedBucketObjects.Values) { TallyZone(group, tallyLoad, tallyCreatures); }
-            foreach (List<ZDO> group in SharedBucketPortals.Values) { TallyZone(group, tallyLoad, tallyCreatures); }
+            foreach (KeyValuePair<Vector2s, List<ZDO>> group in SharedBucketObjects) { TallyZone(group.Value, group.Key, tallyLoad, tallyCreatures); }
+            foreach (KeyValuePair<Vector2s, List<ZDO>> group in SharedBucketPortals) { TallyZone(group.Value, group.Key, tallyLoad, tallyCreatures); }
         }
 
-        private static void TallyZone(List<ZDO> objects, bool tallyLoad, bool tallyCreatures) {
+        /// <summary>The candidates a creature could be given to instead of a struggling owner:
+        /// allowed to own, and not held to an allowance of their own. The host counts when it may
+        /// own - the arbiter places creatures on it like on anyone else.</summary>
+        private static void CollectHelpers() {
+            for (int i = 0; i < Candidates.Count; i++) {
+                if (Candidates[i].CanOwn && PeerCapacity.AllowanceFor(Candidates[i].Uid) == int.MaxValue) { Helpers.Add(i); }
+            }
+        }
+
+        /// <summary>How many helpers have this zone in their active area - 0, 1, or 2 meaning
+        /// "two or more" - and which one when it is exactly one. The same presence test
+        /// BuildVerdict uses.</summary>
+        private static int HelpersPresent(Vector2s zone, out long sole) {
+            sole = 0L;
+            int count = 0;
+            for (int i = 0; i < Helpers.Count; i++) {
+                Candidate helper = Candidates[Helpers[i]];
+                if (!ZoneCompat.InActiveArea(zone, helper.Zone, ZoneCompat.ActiveZoneRadius)) { continue; }
+                if (++count >= 2) { sole = 0L; return 2; }
+                sole = helper.Uid;
+            }
+            return count;
+        }
+
+        private static void TallyZone(List<ZDO> objects, Vector2s zone, bool tallyLoad, bool tallyCreatures) {
             if (objects == null) { return; }
+
+            int helpers = -1;                                                 // asked at the first creature
+            long soleHelper = 0L;
 
             for (int i = 0; i < objects.Count; i++) {
                 ZDO zdo = objects[i];
@@ -1062,6 +1101,12 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (creature && tallyCreatures) {
                     OwnedCreatures.TryGetValue(owner, out int creatures);
                     OwnedCreatures[owner] = creatures + 1;
+
+                    if (helpers < 0) { helpers = HelpersPresent(zone, out soleHelper); }
+                    if (helpers >= 2 || (helpers == 1 && soleHelper != owner)) {
+                        SharedCreatures.TryGetValue(owner, out int shared);
+                        SharedCreatures[owner] = shared + 1;
+                    }
                 }
             }
         }
@@ -1141,16 +1186,37 @@ namespace NetworkPerformanceSystem.Runtime {
             return Candidates[ReceiverOptions[pick].Index].Uid;
         }
 
+        /// <summary>
+        /// Where a creature goes when the sector's best may be at their allowance: the best
+        /// itself when it has room; otherwise the best of the present candidates that may own
+        /// and have room (RoomyTarget), counted as steered; and the best ANYWAY when nobody else
+        /// has room. An allowance only says "give these to somebody else", so where there is
+        /// nobody else it does not hold - a struggling player who is the only one who can run a
+        /// creature gets it, exactly as with M35 off. Never 0 while the sector has an eligible
+        /// candidate.
+        /// </summary>
+        private static long PlaceCreature(SectorVerdict verdict, out float total, out bool steered) {
+            total = verdict.BestTotalMs;
+            steered = false;
+            if (RoomOf(verdict.BestUid) > 0) { return verdict.BestUid; }
+
+            long roomy = RoomyTarget(verdict, out float roomyTotal);
+            if (roomy == 0L) { return verdict.BestUid; }
+            total = roomyTotal;
+            steered = roomy != verdict.BestUid;
+            return roomy;
+        }
+
         /// <summary>A rescued creature's owner when the sector's best is at their allowance: the
         /// best candidate with room, or the best anyway when nobody has room - a rescue has to
         /// land, because an unowned creature is frozen and cannot be hurt.</summary>
         private static long RoomyRescueTarget(SectorVerdict verdict) {
-            if (RoomOf(verdict.BestUid) > 0) { return verdict.BestUid; }
-            long roomy = RoomyTarget(verdict, out _);
-            if (roomy == 0L) { return verdict.BestUid; }
-            LastPassSteered++;
-            TotalSteered++;
-            return roomy;
+            long target = PlaceCreature(verdict, out _, out bool steered);
+            if (steered) {
+                LastPassSteered++;
+                TotalSteered++;
+            }
+            return target;
         }
 
         private static void FillReceiverOptions(SectorVerdict verdict, bool shedReceiversOnly) {
@@ -1720,19 +1786,20 @@ namespace NetworkPerformanceSystem.Runtime {
                     ? knownTotal
                     : float.MaxValue;
 
-                // M35: a creature never goes to a player already at their creature allowance. The
-                // best of the rest with room is asked instead - and if that is nobody, or the owner
-                // it already has, it stays put. Never back onto the full player in their place.
+                // M35: a creature does not go to a player already at their creature allowance
+                // while somebody else present can take it. The best of the rest with room is asked
+                // instead, and if that is the owner it already has, it stays put. When nobody else
+                // has room the allowance does not hold and the cost function's choice stands
+                // (PlaceCreature) - the struggling player is then the only one who can run it.
                 long target = verdict.BestUid;
                 float targetTotal = verdict.BestTotalMs;
                 bool steered = false;
                 if (creature && _allowanceActive && RoomOf(target) <= 0) {
-                    target = RoomyTarget(verdict, out targetTotal);
-                    if (target == 0L || target == currentOwner) {
+                    target = PlaceCreature(verdict, out targetTotal, out steered);
+                    if (target == currentOwner) {
                         if (shedCandidate) { CollectShed(zdo, verdict, currentOwner, now, minHold, soleScan); }
                         continue;
                     }
-                    steered = true;
                 }
 
                 float improvement = currentTotal - targetTotal;
@@ -1845,19 +1912,14 @@ namespace NetworkPerformanceSystem.Runtime {
                 target = Candidates[sole].Uid;
             } else {
                 target = verdict.BestUid;
-                // M35: not onto a player at their allowance. With nobody else to take it, it
-                // stays with the owner who still has it loaded.
+                // M35: not onto a player at their allowance while somebody else present can take
+                // it. With nobody else, the allowance does not hold (PlaceCreature).
                 if (_allowanceActive && RoomOf(target) <= 0) {
-                    long roomy = RoomyTarget(verdict, out _);
-                    if (roomy == 0L) {
-                        LastPassCreaturesKept++;
-                        return;
-                    }
-                    if (roomy != target) {
+                    target = PlaceCreature(verdict, out _, out bool steered);
+                    if (steered) {
                         LastPassSteered++;
                         TotalSteered++;
                     }
-                    target = roomy;
                 }
             }
 
@@ -2751,6 +2813,12 @@ namespace NetworkPerformanceSystem.Runtime {
             return OwnedCreatures.TryGetValue(uid, out int owned) ? owned : 0;
         }
 
+        /// <summary>Of those, the creatures somebody else could run as of the last pass (see
+        /// SharedCreatures). Zero while the allowance is off.</summary>
+        internal static int SharedCreaturesFor(long uid) {
+            return SharedCreatures.TryGetValue(uid, out int shared) ? shared : 0;
+        }
+
         private static void CountCreatures(List<ZDO> objects, bool soleCandidate) {
             int count = 0;
             for (int i = 0; i < objects.Count; i++) {
@@ -2891,6 +2959,8 @@ namespace NetworkPerformanceSystem.Runtime {
             _monitorContestedCreatures = 0;
 
             OwnedCreatures.Clear();
+            SharedCreatures.Clear();
+            Helpers.Clear();
             CreatureRoom.Clear();
             ShedReceiver.Clear();
             PendingOut.Clear();

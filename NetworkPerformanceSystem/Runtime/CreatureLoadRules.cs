@@ -38,8 +38,14 @@ namespace NetworkPerformanceSystem.Runtime {
         internal float FixedHz => WindowSeconds > 0f ? FixedSteps / WindowSeconds : 0f;
 
         /// <summary>The window does not say how this machine copes with what it simulates: the
-        /// game was in the background, or loading - a teleport, a dungeon, a respawn.</summary>
-        internal bool Unrepresentative => (Flags & (CreatureLoadRules.FlagUnfocused | CreatureLoadRules.FlagLoading)) != 0;
+        /// game was in the background for some of it, or loading - a teleport, a dungeon, a
+        /// respawn.</summary>
+        internal bool Unrepresentative =>
+            (Flags & (CreatureLoadRules.FlagUnfocused | CreatureLoadRules.FlagLoading | CreatureLoadRules.FlagUnfocusedFrames)) != 0;
+
+        /// <summary>The game was not the active window when this report was sent - alt-tabbed or
+        /// minimised. Every version of the report means this by FlagUnfocused.</summary>
+        internal bool InBackground => (Flags & CreatureLoadRules.FlagUnfocused) != 0;
     }
 
     /// <summary>What happened to a player's creature allowance on one evaluation.</summary>
@@ -101,6 +107,11 @@ namespace NetworkPerformanceSystem.Runtime {
 
         /// <summary>Creatures this player owns as of the last ownership pass.</summary>
         internal int Owned;
+
+        /// <summary>How many of those somebody else could run: a player with no allowance of
+        /// their own, or the host, has the creature's zone in their active area. A player for
+        /// whom this is 0 is the only option for every creature they run.</summary>
+        internal int Shared;
     }
 
     /// <summary>A candidate owner as the receiver pick sees it. Built by the arbiter from a sector
@@ -122,9 +133,21 @@ namespace NetworkPerformanceSystem.Runtime {
     /// </summary>
     internal static class CreatureLoadRules {
 
+        /// <summary>The game was in the background when the report was sent.</summary>
         internal const byte FlagUnfocused = 1;
         internal const byte FlagLoading = 2;
         internal const byte FlagNoSimTiming = 4;
+
+        /// <summary>Some frames in the window ran in the background, whatever the game was doing
+        /// when it was sent - so the first report after alt-tabbing back is not averaged in at
+        /// the background frame cap. A 1.15.0 host does not know this bit and ignores it.</summary>
+        internal const byte FlagUnfocusedFrames = 8;
+
+        /// <summary>A report that says the game has just gone into, or come back from, the
+        /// background goes out at once rather than waiting for the next two-second report, and
+        /// the host takes it this soon after the last one. A game that stops running as soon as
+        /// it is not the active window never sends that next report.</summary>
+        internal const float MinFocusReportSeconds = 0.1f;
 
         internal const byte CurrentVersion = 1;
 
@@ -260,8 +283,11 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>
         /// One evaluation of a player's allowance, once per ownership pass.
         ///
-        ///   * frame rate under MinFps for HoldSeconds while owning more than MinAllowance -> an
-        ///     allowance of three quarters of what they own;
+        ///   * frame rate under MinFps for HoldSeconds while owning more than MinAllowance, some of
+        ///     it where somebody else could run it (Shared) -> an allowance of three quarters of
+        ///     what they own. A player who is the only option for every creature they run is
+        ///     never given one: there is nobody to give the rest to, and holding them under it
+        ///     would only leave creatures with nobody running them;
         ///   * still under, a full HoldSeconds after the allowance was REACHED (owned at or below
         ///     it) -> another step, or, once ShouldGiveUp says so, cleared and exempt for
         ///     ExemptSeconds. While creatures are still being moved off it waits: there is no
@@ -311,6 +337,9 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (state.Steps == 0) {
                     if (now - System.Math.Max(state.RunSince, state.LastChangeAt) < settings.HoldSeconds) { return AllowanceAction.None; }
                     if (input.Owned <= settings.MinAllowance) { return AllowanceAction.None; }
+                    // Alone with their creatures. The run keeps going, so the step comes at once
+                    // if somebody who could take some arrives while this player is still slow.
+                    if (input.Shared <= 0) { return AllowanceAction.None; }
 
                     NoteStepDown(ref state, now, settings);
                     state.Steps = 1;

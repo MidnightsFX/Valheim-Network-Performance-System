@@ -719,10 +719,14 @@ namespace NetworkPerformanceSystem.Runtime {
                         .Num("fixedHz", report.FixedHz, "0.#")
                         .Int("aiOwned", report.OwnedAi)
                         .Int("crOwned", load.Owned)
+                        .Int("crShared", load.Shared)
                         .Int("loadFlags", report.Flags);
                     if (load.Steps > 0) { line.Int("allow", load.Allowance).Int("allowSteps", load.Steps); }
                     if (load.Exempt) { line.Flag("allowExempt", true); }
                 }
+                // The host is holding this player to the background deadline (Keep Players In The
+                // Background): their game's last report said it is not the active window.
+                if (ConnectionTimeout.IsInBackground(peer.m_rpc)) { line.Flag("bg", true); }
 
                 EmitServer(line.End());
                 NotePeerSocket(now, peer, socketPath);
@@ -823,6 +827,24 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Int("ownedAtStart", ownedAtStart)
                 .Num("fps", fps, "0.#")
                 .Num("fpsAtStart", fpsAtStart, "0.#")
+                .End());
+        }
+
+        /// <summary>
+        /// A player whose game is in the background has been silent past the deadline they would
+        /// otherwise have been dropped at ("usualS"), and is being kept up to "deadlineS" (Keep
+        /// Players In The Background). Whether they came back is in the peer records that follow:
+        /// "ghost" clears when they answer again, and the peer stops appearing if they were
+        /// dropped. One record per silent stretch.
+        /// </summary>
+        internal static void OnBackgroundHold(long uid, float usualSeconds, float deadlineSeconds) {
+            if (!ServerRole) { return; }
+
+            EmitServer(Line.Begin("background_hold")
+                .Num("t", NowMs, "0.#")
+                .Id("uid", uid)
+                .Num("usualS", usualSeconds, "0")
+                .Num("deadlineS", deadlineSeconds, "0")
                 .End());
         }
 

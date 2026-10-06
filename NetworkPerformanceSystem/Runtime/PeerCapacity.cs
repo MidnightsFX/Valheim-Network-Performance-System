@@ -18,8 +18,11 @@ namespace NetworkPerformanceSystem.Runtime {
     /// rate stays under Min Owner FPS while they run more than Min Creature Allowance creatures
     /// is given an allowance: three quarters of what they own. The arbiter stops giving them
     /// creatures while they are at it and moves the excess, a few a pass, to players whose games
-    /// have room (OwnershipArbiter's steering and shedding). The rules are LossBackoff's, applied
-    /// to creatures instead of bytes - CreatureLoadRules.Step:
+    /// have room (OwnershipArbiter's steering and shedding). An allowance is only ever about
+    /// handing creatures to somebody else: a player who is alone with their creatures is never
+    /// given one, and where nobody else present can take a creature it goes to them whatever
+    /// their allowance says. The rules are LossBackoff's, applied to creatures instead of bytes -
+    /// CreatureLoadRules.Step:
     ///
     ///   * still struggling a full hold after the allowance was reached -> another step;
     ///   * at the minimum, or at half of what they started with, and no faster than when it
@@ -64,6 +67,7 @@ namespace NetworkPerformanceSystem.Runtime {
             internal float FpsEwma;
             internal bool HasFps;
             internal int Owned;
+            internal int Shared;
             internal AllowanceState State = AllowanceState.Fresh();
         }
 
@@ -74,6 +78,7 @@ namespace NetworkPerformanceSystem.Runtime {
             internal bool HasFps;
             internal float Fps;
             internal int Owned;
+            internal int Shared;                     // of Owned, where somebody else could run them
             internal int Steps;
             internal int Allowance;                  // int.MaxValue when none
             internal int OwnedAtStart;
@@ -122,19 +127,32 @@ namespace NetworkPerformanceSystem.Runtime {
             }
             if (!CreatureLoadRules.TryDecode(bytes, out FrameReport report)) { ReportsRejected++; return; }
 
-            OnReport(peer.m_uid, report, Time.realtimeSinceStartup);
+            if (!OnReport(peer.m_uid, report, Time.realtimeSinceStartup)) { return; }
+
+            // Whether their game is the active window decides how long they may go quiet before
+            // they are dropped (Keep Players In The Background).
+            ConnectionTimeout.NoteFocus(rpc, report.InBackground);
         }
 
-        /// <summary>A report, from a client or from a listen host's own sampler.</summary>
-        internal static void OnReport(long uid, FrameReport report, float now) {
-            if (uid == 0L) { return; }
+        /// <summary>A report, from a client or from a listen host's own sampler. False when it
+        /// came too soon after the last one and was dropped.</summary>
+        internal static bool OnReport(long uid, FrameReport report, float now) {
+            if (uid == 0L) { return false; }
 
             if (!Peers.TryGetValue(uid, out Entry e)) {
                 e = new Entry();
                 Peers[uid] = e;
-            } else if (e.HasReport && now - e.LastAt < MinReportIntervalSeconds) {
-                ReportsRejected++;
-                return;
+            } else if (e.HasReport) {
+                // One that says the game has just gone into, or come back from, the background
+                // is sent the moment it happens (FrameSampler), so it is taken early - at half the
+                // client's own spacing, since the two can arrive closer together than they left.
+                float minInterval = report.InBackground != e.Last.InBackground
+                    ? CreatureLoadRules.MinFocusReportSeconds * 0.5f
+                    : MinReportIntervalSeconds;
+                if (now - e.LastAt < minInterval) {
+                    ReportsRejected++;
+                    return false;
+                }
             }
 
             e.Last = report;
@@ -144,10 +162,11 @@ namespace NetworkPerformanceSystem.Runtime {
 
             // A window spent loading or in the background says nothing about how this machine
             // copes with what it runs; it is kept for display and left out of the average.
-            if (report.Unrepresentative) { return; }
+            if (report.Unrepresentative) { return true; }
             float fps = report.Fps;
             e.FpsEwma = e.HasFps ? e.FpsEwma + (fps - e.FpsEwma) * FpsAlpha : fps;
             e.HasFps = true;
+            return true;
         }
 
         // -- the decision ------------------------------------------------------------------
@@ -169,6 +188,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 }
 
                 e.Owned = OwnershipArbiter.OwnedCreaturesFor(pair.Key);
+                e.Shared = OwnershipArbiter.SharedCreaturesFor(pair.Key);
                 if (!balancing) { continue; }
 
                 AllowanceInputs input = new AllowanceInputs {
@@ -176,6 +196,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     Usable = e.HasFps && now - e.LastAt <= FreshSeconds && !e.Last.Unrepresentative,
                     Fps = e.FpsEwma,
                     Owned = e.Owned,
+                    Shared = e.Shared,
                 };
 
                 int stepsBefore = e.State.Steps;
@@ -313,6 +334,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 HasFps = e.HasFps,
                 Fps = e.FpsEwma,
                 Owned = e.Owned,
+                Shared = e.Shared,
                 Steps = e.State.Steps,
                 Allowance = AllowanceOf(e, min),
                 OwnedAtStart = e.State.OwnedAtStart,

@@ -157,6 +157,8 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<int> ConnectTimeoutSeconds;
         public static ConfigEntry<int> ConnectionTimeoutSeconds;
         public static ConfigEntry<int> LoadingTimeoutSeconds;
+        public static ConfigEntry<bool> KeepPlayersInBackground;
+        public static ConfigEntry<int> BackgroundTimeoutSeconds;
 
         // M21 - ghost peers stop being trusted to simulate long before they are hung up on
         public static ConfigEntry<bool> EvictGhostOwners;
@@ -446,6 +448,11 @@ namespace NetworkPerformanceSystem {
             LoadingTimeoutSeconds = BindServerConfig("Connection Timeout", "Loading Timeout Seconds", 90,
                 "How long a player who is still joining - connecting, downloading and loading the world, until their character appears - may go without a packet before they are dropped, in seconds. Loading a large modded world can freeze a player's game for a minute or more, so this is kept apart from 'Connection Timeout Seconds'. Never shorter than that setting.",
                 true, 30, 900);
+            KeepPlayersInBackground = BindServerConfig("Connection Timeout", "Keep Players In The Background", true,
+                "Do not drop a player for going quiet while their game is in the background - alt-tabbed or minimised. On some computers the game stops running entirely while it is not the active window, and the player then comes back to a lost connection once 'Connection Timeout Seconds' has passed. With this on, a player whose game said it went into the background gets 'Background Timeout Seconds' instead, for as long as it stays there. Turn it off to drop them like anyone else. Players need this mod for the server to know; their creatures are still handed to other players after 'Ghost Owner Evict Seconds'.");
+            BackgroundTimeoutSeconds = BindServerConfig("Connection Timeout", "Background Timeout Seconds", 600,
+                "How long a player whose game is in the background may go without a packet before they are dropped, in seconds, when 'Keep Players In The Background' is on. Never shorter than 'Loading Timeout Seconds'.",
+                false, 30, 3600);
             EvictGhostOwners = BindServerConfig("Connection Timeout", "Evict Ghost Owners", true,
                 "Stop giving objects to a player who has stopped answering. A peer that goes quiet keeps its slot for the full 'Connection Timeout Seconds' so it can come back, but the things it was simulating - creatures especially - are handed to players who are actually there.");
             GhostOwnerEvictSeconds = BindServerConfig("Connection Timeout", "Ghost Owner Evict Seconds", 10f,
@@ -513,6 +520,8 @@ namespace NetworkPerformanceSystem {
             ConnectTimeoutSeconds.SettingChanged += OnConnectionTimeoutSettingChanged;
             ConnectionTimeoutSeconds.SettingChanged += OnConnectionTimeoutSettingChanged;
             LoadingTimeoutSeconds.SettingChanged += OnConnectionTimeoutSettingChanged;
+            KeepPlayersInBackground.SettingChanged += OnConnectionTimeoutSettingChanged;
+            BackgroundTimeoutSeconds.SettingChanged += OnConnectionTimeoutSettingChanged;
 
             // Jotunn's CustomRPC limit is derived from the window ceiling, so it follows these two
             // - including the edit Jotunn makes on a client when the server's values arrive at join.

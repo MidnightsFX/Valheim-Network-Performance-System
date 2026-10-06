@@ -1,5 +1,9 @@
 # Changelog
 
+**1.15.1**
+- A struggling player who is the only one near creatures keeps running them.
+- Players who alt-tab have their own idle timeout rate (objects are still moved away from an idle player within 10s)
+
 **1.15.0**
 - Players with the mod now tell the server how smoothly their game is running.
 - A player whose game slows down in a big fight is given fewer creatures to run, and the rest move to players with room to spare.

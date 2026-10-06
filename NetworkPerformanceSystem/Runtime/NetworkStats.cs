@@ -640,8 +640,9 @@ namespace NetworkPerformanceSystem.Runtime {
             } else {
                 float min = ValConfig.CreatureLoadMinOwnerFps.Value;
                 int minAllowance = ValConfig.CreatureLoadMinAllowance.Value;
-                sb.AppendLine($"  rule             under {min:F0} fps for {PeerCapacity.HoldSeconds:F0}s while running more than {minAllowance} creatures: no new creatures above three quarters");
-                sb.AppendLine($"                   of what they run, and the rest move, {CreatureLoadRules.MaxShedsPerOwnerPerPass} a pass, to players at {min + PeerCapacity.HealthyMarginFps:F0}+ fps (not ones only they are near);");
+                sb.AppendLine($"  rule             under {min:F0} fps for {PeerCapacity.HoldSeconds:F0}s while running more than {minAllowance} creatures, some where somebody else could:");
+                sb.AppendLine($"                   no new creatures above three quarters of what they run while somebody else can take them, and the rest move,");
+                sb.AppendLine($"                   {CreatureLoadRules.MaxShedsPerOwnerPerPass} a pass, to players at {min + PeerCapacity.HealthyMarginFps:F0}+ fps (not ones only they are near);");
                 sb.AppendLine($"                   still slow a hold after reaching it: another quarter; at {minAllowance}, or half of where it started, and no faster: dropped,");
                 sb.AppendLine($"                   left alone {PeerCapacity.ExemptSeconds / 60f:F0} minutes; at {min + PeerCapacity.HealthyMarginFps:F0}+ fps for {PeerCapacity.RecoverSeconds:F0}s: one step back up");
             }
@@ -658,9 +659,13 @@ namespace NetworkPerformanceSystem.Runtime {
                     string fps = view.HasFps ? $"{view.Fps:F0}" : "-";
                     string sim = last.SimMsPerSecond >= 0f ? $"{last.SimMsPerSecond:F0}" : "-";
                     string allowance = view.Steps > 0 ? $"{view.Allowance} (step {view.Steps})" : "-";
+                    // Shared: how many of their creatures somebody else could run. None means the
+                    // allowance has nothing to act on, so it is not set, and one already set does
+                    // not stop them getting creatures nobody else can take.
+                    bool alone = view.Owned > 0 && view.Shared == 0;
                     string state = view.Exempt ? $"exempt {Elapsed(view.ExemptLeftSeconds)} more - creatures were not the cause"
-                                 : view.Steps > 0 ? $"held (was {view.OwnedAtStart} at {view.FpsAtStart:F0} fps)"
-                                 : view.Low ? "slow (hold running)"
+                                 : view.Steps > 0 ? $"held (was {view.OwnedAtStart} at {view.FpsAtStart:F0} fps)" + (alone ? "; nobody near to take any" : "")
+                                 : view.Low ? (alone ? "slow, but nobody near to take creatures" : "slow (hold running)")
                                  : view.Receiver ? "has room"
                                  : "ok";
                     if (view.AgeSeconds > 10f) { state += $"; last report {view.AgeSeconds:F0}s ago"; }
@@ -704,6 +709,20 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine("Connection timeouts:");
             sb.AppendLine($"  drop after       {ConnectionTimeout.InWorldTimeoutSeconds}s without a packet once in the world (ZRpc ping)");
             sb.AppendLine($"  while joining    {ConnectionTimeout.JoiningTimeoutSeconds}s, until the player's character has spawned");
+            if (ConnectionTimeout.BackgroundTimeoutSeconds > 0f) {
+                string held = "";
+                if (NpsEnv.IsHost()) {
+                    int inBackground = 0;
+                    List<ZNetPeer> peers = ZNet.instance.GetPeers();
+                    for (int i = 0; i < peers.Count; i++) {
+                        if (ConnectionTimeout.IsInBackground(peers[i].m_rpc)) { inBackground++; }
+                    }
+                    held = $"; {inBackground} player(s) there now, {ConnectionTimeout.BackgroundHolds} kept past the usual deadline this session";
+                }
+                sb.AppendLine($"  in background    {ConnectionTimeout.BackgroundTimeoutSeconds}s while a player's game says it is alt-tabbed or minimised{held}");
+            } else if (ConnectionTimeout.Active) {
+                sb.AppendLine("  in background    no longer than anyone else (Keep Players In The Background is off)");
+            }
             sb.AppendLine(ConnectionTimeout.LastSteamReadback == null
                 ? "  steam layer      not applied (no Steam networking interface in this process)"
                 : $"  steam layer      {ConnectionTimeout.LastSteamReadback}");

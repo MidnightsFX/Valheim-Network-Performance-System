@@ -43,6 +43,9 @@ namespace NetworkPerformanceSystem.Patches {
 
             // M35: a player's frame report. Only the host acts on one.
             peer.m_rpc.Register<ZPackage>(PeerCapacity.RpcClientLoad, PeerCapacity.RPC_ClientLoad);
+
+            // M37: the host's grant for this player's upload rate. Only a client acts on one.
+            peer.m_rpc.Register<ZPackage>(UploadGrant.RpcUploadRate, UploadGrant.RPC_UploadRate);
         }
 
         // -- RTT sampling ------------------------------------------------------------------
@@ -87,6 +90,14 @@ namespace NetworkPerformanceSystem.Patches {
                 // M26: the same status carries the share of our packets that reached this peer,
                 // and how much we are sending them.
                 LossBackoff.Observe(peer, link.QualityRemote, link.OutBytesPerSec);
+
+                // M37: the host reads every link from here; a client's reading of its own upload
+                // goes into its next frame report.
+                if (NpsEnv.IsHost()) {
+                    AutoSendRate.Observe(peer, link, ping);
+                } else {
+                    FrameSampler.NoteUpload(link);
+                }
             }
         }
 
@@ -117,8 +128,10 @@ namespace NetworkPerformanceSystem.Patches {
 
             if (NpsEnv.IsHost()) {
                 TickLatencyTable(dt);
+                AutoSendRate.Tick(dt);                                        // M37, host-side only
             } else {
                 GhostWatchdog.Tick();                                         // M22, client-side only
+                UploadGrant.Tick();                                           // M37, a grant the host stopped renewing lapses
             }
 
             // Both roles. While monitoring is off this is two config reads and a comparison.
@@ -164,6 +177,7 @@ namespace NetworkPerformanceSystem.Patches {
             LiveRefPos.ForgetPeer(netPeer.m_uid);
             SteamTransport.ForgetPeer(netPeer.m_uid);
             LossBackoff.ForgetPeer(netPeer.m_uid);
+            AutoSendRate.ForgetPeer(netPeer.m_uid);
             PeerCapacity.ForgetPeer(netPeer.m_uid);
             CreaturePacing.ForgetPeer(netPeer.m_uid);
             StructureUpdates.ForgetPeer(netPeer.m_uid);
@@ -185,6 +199,8 @@ namespace NetworkPerformanceSystem.Patches {
             LiveRefPos.Reset();
             SteamTransport.Reset();
             LossBackoff.Reset();
+            AutoSendRate.Reset();
+            UploadGrant.Reset();
             PeerCapacity.Reset();
             FrameSampler.Reset();
             DamageNumbers.Reset();

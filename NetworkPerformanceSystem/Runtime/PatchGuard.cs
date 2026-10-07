@@ -38,12 +38,13 @@ namespace NetworkPerformanceSystem.Runtime {
         CreaturePacing,    // M28 - ZDOMan.CreateSyncList: the host sends settled or distant creatures to each peer less often
         FightingCreaturesFirst, // M29 - ZDOMan.CreateSyncList (client): a player's alert or targeting creatures go out right after players and ships
         StatusEffectRepeats,    // M30 - SEMan.AddStatusEffect / ZRoutedRpc.RPC_RoutedRPC: a status effect asked for on somebody else's creature goes out a few times a second, and a flood of them is named in the log
-        QuietWildlife,          // M31 - ZSyncTransform.OwnerSync (owner) + M28's ZDOMan.CreateSyncList postfix (host): fish and birds are written and relayed a few times a second instead of every frame
+        QuietWildlife,          // M31 - ZSyncTransform.OwnerSync (owner) + M28's ZDOMan.CreateSyncList postfix (host): fish, birds and floating objects are written and relayed a few times a second instead of every frame
         PlayerHistoryRepeats,   // M32 - ZNet.SendHistoricalPlayerList: the world's player history goes to a player only when it differs from the copy they have, and what keeps marking it changed is named in the log
         StructureUpdates,       // M33 - ZDO.Deserialize / ZDO.SetOwnerInternal / ZDOMan.CreateSyncList / ZDOMan.SendZDOs (host): a building, tree or rock a player already has is not re-sent until something about it they could see changed
         FrameReport,            // M34 - ZNet.Update + MonoUpdaters.FixedUpdate (client): each player's game tells the host its frame rate every two seconds
-        CreatureAllowance,      // M35 - the arbiter (host): a player whose frame rate drops under a fight is given fewer creatures, and the rest move to players with room
+        CreatureAllowance,      // M35 - the arbiter (host): a player whose frame rate drops, or whose upload stays full, under a fight is given fewer creatures, and the rest move to players with room
         DamageNumbers,          // M36 - DamageText.ShowText / ZRoutedRpc.HandleRoutedRPC + M7's relay: damage numbers go to everyone nearby, only the attacker, or nobody
+        AutoSendRate,           // M37 - M1's ping postfix + ZNet.Update (host): the send rate, and each player's upload grant, found from load and congestion between the game's 150 KB/s and a maximum
     }
 
     /// <summary>

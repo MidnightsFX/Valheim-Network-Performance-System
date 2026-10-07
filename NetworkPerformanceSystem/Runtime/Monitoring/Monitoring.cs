@@ -22,6 +22,7 @@ namespace NetworkPerformanceSystem.Runtime {
         DragBack,        // arrived in a packet and undid a change this host had just made
         Leader,          // arbiter: a follower (tame following a player, or a summon) returned to its player
         Capacity,        // M35: moved off a player over their creature allowance, to a player with room
+        Upload,          // M35: the same, where the allowance is the upload one - their upload to the server is full
     }
 
     /// <summary>
@@ -511,7 +512,8 @@ namespace NetworkPerformanceSystem.Runtime {
             // Both kinds of arbiter move carry who was weighed, and their distances - which the
             // cost function ignores and the proximity layer decides on, so one listing shows why
             // either of them did what it did.
-            if (cause == HandoffCause.Optimise || cause == HandoffCause.Proximity || cause == HandoffCause.Capacity) {
+            if (cause == HandoffCause.Optimise || cause == HandoffCause.Proximity || cause == HandoffCause.Capacity
+                || cause == HandoffCause.Upload) {
                 line.Num("gainMs", improvementMs, "0.#");
                 line.Raw("cands", candidates);
             }
@@ -723,10 +725,25 @@ namespace NetworkPerformanceSystem.Runtime {
                         .Int("loadFlags", report.Flags);
                     if (load.Steps > 0) { line.Int("allow", load.Allowance).Int("allowSteps", load.Steps); }
                     if (load.Exempt) { line.Flag("allowExempt", true); }
+                    // The upload allowance: their upload is full and no grant fixes it in time.
+                    if (load.UploadStuck) { line.Flag("upStuck", true); }
+                    if (load.UploadSteps > 0) { line.Int("upAllow", load.UploadAllowance).Int("upAllowSteps", load.UploadSteps); }
+                    if (load.UploadExempt) { line.Flag("upAllowExempt", true); }
                 }
                 // The host is holding this player to the background deadline (Keep Players In The
                 // Background): their game's last report said it is not the active window.
                 if (ConnectionTimeout.IsInBackground(peer.m_rpc)) { line.Flag("bg", true); }
+
+                // M37: whether this link asks for more, its ping at its best, what this player's
+                // own upload is doing by their report, and the grant they hold for it.
+                if (AutoSendRate.TryGetView(peer.m_uid, out AutoSendRate.View auto)) {
+                    line.Flag("full", auto.Full)
+                        .Num("rttBase", auto.BaselineMs, "0.#");
+                    if (auto.GrantCapable) {
+                        line.Flag("upFull", auto.UploadFull)
+                            .Int("upGrant", auto.GrantBytesPerSec);
+                    }
+                }
 
                 EmitServer(line.End());
                 NotePeerSocket(now, peer, socketPath);
@@ -806,12 +823,39 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
+        /// M37 moved a rate: the server's send rate for everyone (dir "out", uid 0) or one
+        /// player's upload grant (dir "in"). delivered is the total in that direction (out) or
+        /// that player's (in), peak what the line has carried cleanly, ceiling what it was seen
+        /// not to carry (-1 = none yet).
+        /// </summary>
+        internal static void OnAutoRate(string dir, string action, int fromBytesPerSec, int toBytesPerSec, int players, int full,
+                                        float delivered, float peak, float ceiling, string reason, long uid) {
+            if (!ServerRole) { return; }
+
+            JsonLine line = Line.Begin("auto_rate")
+                .Num("t", NowMs, "0.#")
+                .Str("dir", dir)
+                .Str("action", action)
+                .Int("from", fromBytesPerSec)
+                .Int("to", toBytesPerSec)
+                .Int("n", players)
+                .Int("full", full)
+                .Int("delivered", Mathf.RoundToInt(delivered))
+                .Int("peak", Mathf.RoundToInt(peak))
+                .Int("ceiling", Mathf.RoundToInt(ceiling));
+            if (uid != 0L) { line.Id("uid", uid); }
+            if (!string.IsNullOrEmpty(reason)) { line.Str("reason", reason); }
+            EmitServer(line.End());
+        }
+
+        /// <summary>
         /// M35 changed one player's creature allowance: "down" (set, or lowered a step), "up",
         /// "clear" (no allowance any more), or "exempt" (lowering it did not make their game any
         /// faster; cleared and left alone for ten minutes). "allow" is the allowance after the
         /// change, -1 for none; "owned" the creatures they own now; "ownedAtStart" and
         /// "fpsAtStart" what they owned and ran at when the first step was taken; "fps" the
-        /// smoothed frame rate the decision was made on.
+        /// smoothed frame rate the decision was made on. "reason" is "fps" here and "upload" for
+        /// the upload allowance (OnCreatureAllowanceUpload).
         /// </summary>
         internal static void OnCreatureAllowance(long uid, string action, int steps, int allowance, int owned, int ownedAtStart,
                                                  float fps, float fpsAtStart) {
@@ -820,6 +864,7 @@ namespace NetworkPerformanceSystem.Runtime {
             EmitServer(Line.Begin("creature_allowance")
                 .Num("t", NowMs, "0.#")
                 .Id("uid", uid)
+                .Str("reason", "fps")
                 .Str("action", action)
                 .Int("steps", steps)
                 .Int("allow", allowance)
@@ -827,6 +872,34 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Int("ownedAtStart", ownedAtStart)
                 .Num("fps", fps, "0.#")
                 .Num("fpsAtStart", fpsAtStart, "0.#")
+                .End());
+        }
+
+        /// <summary>
+        /// The same for a player's upload allowance, with "reason":"upload": their upload to the
+        /// server stayed full with no higher rate coming in time. "upKBps" is what arrived from
+        /// them when the decision was made and "upAtStartKBps" when the first step was taken,
+        /// "upRate" the rate they may upload at (the game's, or their M37 grant), and "mayRise"
+        /// whether a grant could still have raised it - true means it was full for 30 s on
+        /// anyway. "exempt" here means it was still full at Min Creature Allowance.
+        /// </summary>
+        internal static void OnCreatureAllowanceUpload(long uid, string action, int steps, int allowance, int owned, int ownedAtStart,
+                                                       float uploadBytesPerSec, float uploadAtStartBytesPerSec, int rateBytesPerSec, bool mayRise) {
+            if (!ServerRole) { return; }
+
+            EmitServer(Line.Begin("creature_allowance")
+                .Num("t", NowMs, "0.#")
+                .Id("uid", uid)
+                .Str("reason", "upload")
+                .Str("action", action)
+                .Int("steps", steps)
+                .Int("allow", allowance)
+                .Int("owned", owned)
+                .Int("ownedAtStart", ownedAtStart)
+                .Num("upKBps", uploadBytesPerSec / 1024f, "0.#")
+                .Num("upAtStartKBps", uploadAtStartBytesPerSec / 1024f, "0.#")
+                .Int("upRate", rateBytesPerSec / 1024)
+                .Flag("mayRise", mayRise)
                 .End());
         }
 

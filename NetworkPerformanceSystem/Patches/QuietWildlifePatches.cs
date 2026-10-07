@@ -9,9 +9,9 @@ namespace NetworkPerformanceSystem.Patches {
     /// M31 - the owner half of QuietWildlife. See it for why; this file is only the hook. The host
     /// half is CreaturePacingPatches' postfix.
     ///
-    /// A prefix on ZSyncTransform.OwnerSync that skips the whole method on a frame a fish or bird
-    /// this machine owns is not due. It sits alongside M27's transpiler on the same method: the
-    /// prefix runs first, and M27 never applies to these anyway.
+    /// A prefix on ZSyncTransform.OwnerSync that skips the whole method on a frame a fish, bird or
+    /// floating object this machine owns is not due. It sits alongside M27's transpiler on the
+    /// same method: the prefix runs first, and M27 never applies to these anyway.
     ///
     /// It runs for every ZSyncTransform in the scene every frame, so the tests are ordered by
     /// cost, cheapest first, and almost everything leaves at the first or the fourth:
@@ -20,8 +20,10 @@ namespace NetworkPerformanceSystem.Patches {
     ///                        somebody else owns.
     ///   2-3. view and ZDO  - the ZNetView by reference, without Unity's overloaded compare.
     ///   4. KindOf          - one array slot for nearly every prefab.
-    ///   5-6. setting, ZDO.IsOwner - the latter so a just-lost object runs and clears m_wasOwner.
-    ///   7. HoldThisFrame   - the schedule, and the hooked-fish test only when not due.
+    ///   5-6. the kind's setting, ZDO.IsOwner - the latter so a just-lost object runs and clears
+    ///                        m_wasOwner.
+    ///   7. HoldThisFrame   - the schedule, and only when not due the hooked-fish test or, for a
+    ///                        floating object, whether another player is close to or on it.
     /// </summary>
     [HarmonyPatch]
     internal static class QuietWildlifePatches {
@@ -34,7 +36,7 @@ namespace NetworkPerformanceSystem.Patches {
             if (ownerSync == null || wasOwner == null || nview == null) {
                 PatchGuard.Disable(Mechanism.QuietWildlife,
                     "ZSyncTransform.OwnerSync or its m_wasOwner / m_nview fields were not found. Either the game updated or " +
-                    "another mod replaced them. Fish and birds keep sending themselves on every frame, as vanilla.");
+                    "another mod replaced them. Fish, birds and floating objects keep sending themselves on every frame, as vanilla.");
                 return false;
             }
             return true;
@@ -51,7 +53,7 @@ namespace NetworkPerformanceSystem.Patches {
 
             QuietWildlife.Kind kind = QuietWildlife.KindOf(zdo);
             if (kind == QuietWildlife.Kind.None) { return true; }
-            if (!QuietWildlife.OwnerActive || !zdo.IsOwner()) { return true; }
+            if (!QuietWildlife.OwnerActiveFor(kind) || !zdo.IsOwner()) { return true; }
 
             return !QuietWildlife.HoldThisFrame(zdo, kind, Time.timeAsDouble, Time.deltaTime);
         }

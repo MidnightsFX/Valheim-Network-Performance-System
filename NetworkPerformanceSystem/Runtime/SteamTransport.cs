@@ -101,9 +101,30 @@ namespace NetworkPerformanceSystem.Runtime {
             Apply("config changed");
         }
 
+        /// <summary>
+        /// M37's choice for every connection, bytes/sec; 0 = none, which leaves the game's rate.
+        /// Send Rate KBps, when set, wins over it: a fixed rate is the admin saying they have sized
+        /// the line themselves. Kept for the session only - the next one starts at the game's rate.
+        /// </summary>
+        internal static int AutoRateBytesPerSec { get; private set; }
+
+        /// <summary>
+        /// M37 moved the rate. Written like a settings change, but quietly - M37 logs its own line
+        /// saying why, and a rate that moves every minute or so would otherwise fill the log with
+        /// readbacks. At or under the game's rate it is the same as none.
+        /// </summary>
+        internal static void SetAutoRate(int bytesPerSec, string reason) {
+            int want = bytesPerSec > VanillaSendRateBytesPerSec ? bytesPerSec : 0;
+            if (want == AutoRateBytesPerSec) { return; }
+            AutoRateBytesPerSec = want;
+            if (!_steamUp) { return; }
+            Apply(reason, quiet: true);
+        }
+
         internal static void Reset() {
             _lastWarnedPairing = -1;
             MismatchStreak.Clear();
+            AutoRateBytesPerSec = 0;                             // the next socket's Apply puts the game's rate back
         }
 
         /// <summary>The configured rate in bytes/sec, or 0 for "the game's". Pure.</summary>
@@ -118,15 +139,17 @@ namespace NetworkPerformanceSystem.Runtime {
             return minBytesPerSec > 0 && minBytesPerSec == maxBytesPerSec ? minBytesPerSec : 0;
         }
 
-        private static void Apply(string reason) {
+        private static void Apply(string reason, bool quiet = false) {
             if (!PatchGuard.IsActive(Mechanism.SteamTransport)) { return; }
             if (!SteamNetConfig.Available) { return; }                       // reports itself once, then goes quiet
 
             bool tuning = ValConfig.EnableSteamTransportTuning.Value;
 
             // The rate is the host's to set, for its own sends. A client leaves its upload at the
-            // game's pace whatever the server's config says.
-            int wantRate = tuning && NpsEnv.IsHost() ? WantedBytes(ValConfig.SteamSendRateKBps.Value) : 0;
+            // game's pace whatever the server's config says - a client's upload is raised only by
+            // the host's grant, at connection scope (M37), never through this global value.
+            int fixedRate = WantedBytes(ValConfig.SteamSendRateKBps.Value);
+            int wantRate = tuning && NpsEnv.IsHost() ? (fixedRate > 0 ? fixedRate : AutoRateBytesPerSec) : 0;
             int wantNagle = tuning ? ValConfig.SteamNagleMicros.Value : VanillaNagleMicros;
 
             int beforeMax = ReadOr(ESteamNetworkingConfigValue.k_ESteamNetworkingConfig_SendRateMax, VanillaSendRateBytesPerSec);
@@ -170,8 +193,10 @@ namespace NetworkPerformanceSystem.Runtime {
                 $"SendRateMax {Kb(beforeMax)} -> {Kb(afterMax)}, " +
                 $"Nagle {beforeNagle} -> {afterNagle}us";
 
-            Logger.LogInfo($"Steam transport ({SteamNetConfig.InterfaceName}, {reason}): {LastReadback}" +
-                           (afterNagle == 0 ? " [Nagle off]" : ""));
+            if (!quiet) {
+                Logger.LogInfo($"Steam transport ({SteamNetConfig.InterfaceName}, {reason}): {LastReadback}" +
+                               (afterNagle == 0 ? " [Nagle off]" : ""));
+            }
 
             WarnIfUnpinned(afterMin, afterMax);
         }
@@ -223,7 +248,14 @@ namespace NetworkPerformanceSystem.Runtime {
             if (pinned <= 0) { return; }
             if (Time.realtimeSinceStartup - _lastApplyRealtime < MismatchSettleSeconds) { return; }
 
-            int expected = LossBackoff.ExpectedRate(peerUid, pinned, out float sinceChange);
+            int expected;
+            float sinceChange;
+            if (NpsEnv.IsHost()) {
+                expected = LossBackoff.ExpectedRate(peerUid, pinned, out sinceChange);
+            } else {
+                // A client's one connection runs at the host's upload grant while it has one (M37).
+                expected = UploadGrant.ExpectedRate(pinned, out sinceChange);
+            }
             if (sinceChange < MismatchSettleSeconds) { return; }             // Steam has not re-clamped that connection yet
 
             if (observedBytesPerSec == expected) {

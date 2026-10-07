@@ -34,6 +34,21 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>Application.targetFrameRate, -1 for none.</summary>
         internal int FrameCap;
 
+        // Version 2 (M37): this player's upload to the host, from their side of the connection.
+        // -1 where unknown - a version 1 report, a listen host's own, or no reading in the window.
+
+        /// <summary>The most bytes waiting in Steam to go to the host at any reading in the window.</summary>
+        internal int UploadPending;
+
+        /// <summary>Steam's share of this player's packets that reached the host, last reading.</summary>
+        internal float UploadQuality;
+
+        /// <summary>Share of the window's readings at which the upload was full: delivering close
+        /// to its rate with a queue behind it (ThroughputRules.IsFullSample).</summary>
+        internal float UploadFullShare;
+
+        internal bool HasUpload => UploadFullShare >= 0f;
+
         internal float Fps => WindowSeconds > 0f ? Frames / WindowSeconds : 0f;
         internal float FixedHz => WindowSeconds > 0f ? FixedSteps / WindowSeconds : 0f;
 
@@ -60,13 +75,14 @@ namespace NetworkPerformanceSystem.Runtime {
     internal enum AllowanceRun : byte { None, Low, Healthy }
 
     /// <summary>
-    /// Everything the host keeps per player to decide their creature allowance. A plain struct so
-    /// the rules below can be run offline against a recording.
+    /// Everything the host keeps per player to decide one of their creature allowances - the
+    /// frame-rate one or the upload one. A plain struct so the rules below can be run offline
+    /// against a recording.
     /// </summary>
     internal struct AllowanceState {
         internal int Steps;                     // 0 = no allowance
         internal int OwnedAtStart;              // creatures owned when the first step was taken
-        internal float FpsAtStart;
+        internal float ValueAtStart;            // fps, or upload bytes/sec arriving, at the first step
         internal AllowanceRun Run;
         internal float RunSince;
         internal int RunSamples;
@@ -114,6 +130,53 @@ namespace NetworkPerformanceSystem.Runtime {
         internal int Shared;
     }
 
+    /// <summary>
+    /// One player's upload to the host as the upload allowance reads it: M37's measurement of
+    /// what arrives from them (AutoSendRate.TryGetUpload). Known is false when there is no fresh
+    /// one - a player just joined, or this host is not reading links.
+    /// </summary>
+    internal struct UploadReading {
+        internal bool Known;
+
+        /// <summary>ThroughputRules.IsFull on their upload: delivering close to the rate they
+        /// may send at - with a queue behind it, when their frame report says what waits on
+        /// their machine - for most of the last twenty seconds.</summary>
+        internal bool Full;
+
+        /// <summary>Bytes/sec arriving from them, smoothed over a couple of seconds.</summary>
+        internal float Delivered;
+
+        /// <summary>The rate their game may upload at: the game's 150 KB/s, or M37's grant.</summary>
+        internal int Rate;
+
+        /// <summary>Share of their packets that arrive; -1 while Steam has no figure.</summary>
+        internal float Quality;
+
+        /// <summary>M37 could still raise their grant: it is running, their game takes grants,
+        /// their link delivers cleanly enough to be raised, and the grant is under its cap.</summary>
+        internal bool GrantMayRise;
+
+        /// <summary>When their grant last changed; -inf when never.</summary>
+        internal float GrantChangedAt;
+    }
+
+    internal struct UploadAllowanceInputs {
+        internal float Now;
+
+        /// <summary>A fresh reading stands behind Stuck and Room, and the player is not loading.</summary>
+        internal bool Usable;
+
+        /// <summary>Their upload is full and a grant will not fix it soon (UploadStuck).</summary>
+        internal bool Stuck;
+
+        /// <summary>Their upload has room to spare, even for what one step back up would return
+        /// (UploadRoomForStepUp).</summary>
+        internal bool Room;
+        internal float Delivered;
+        internal int Owned;
+        internal int Shared;
+    }
+
     /// <summary>A candidate owner as the receiver pick sees it. Built by the arbiter from a sector
     /// verdict.</summary>
     internal struct ReceiverOption {
@@ -124,6 +187,11 @@ namespace NetworkPerformanceSystem.Runtime {
         internal int Room;                      // creatures it may still take; int.MaxValue = no allowance
         internal int Load;                      // creatures it runs, counting ones given to it this pass
         internal bool Eligible;                 // may own, and (for sheds) is a healthy receiver
+
+        /// <summary>Bytes/sec of upload room it has left, counting the creatures given to it this
+        /// pass at the shedding player's cost per creature; +inf when unknown (the host, whose
+        /// creatures cost no player's upload).</summary>
+        internal float UploadRoom;
     }
 
     /// <summary>
@@ -149,11 +217,15 @@ namespace NetworkPerformanceSystem.Runtime {
         /// it is not the active window never sends that next report.</summary>
         internal const float MinFocusReportSeconds = 0.1f;
 
-        internal const byte CurrentVersion = 1;
+        internal const byte CurrentVersion = 2;
 
         /// <summary>Version 1's fields. A newer report is read this far and the rest ignored, so
-        /// fields are only ever appended.</summary>
+        /// fields are only ever appended - a 1.15 host reads a version 2 report as version 1.</summary>
         internal const int Version1Bytes = 30;
+
+        /// <summary>Version 2 appends the upload figures: pending (int), quality and full share
+        /// (floats).</summary>
+        internal const int Version2Bytes = Version1Bytes + 12;
 
         /// <summary>Anything longer is not a report this mod built.</summary>
         internal const int MaxReportBytes = 128;
@@ -177,6 +249,26 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>At most this many creatures are moved off one player per ownership pass.</summary>
         internal const int MaxShedsPerOwnerPerPass = 4;
 
+        /// <summary>While M37 could still raise a full upload's grant, it gets this long after the
+        /// grant last changed (or the upload filled) before creatures move. Raising a grant takes a
+        /// minute or more a step - the 2026-10-06 replay needed two and a half minutes to reach
+        /// 366 KB/s - and the owner's creatures stall for every viewer meanwhile.</summary>
+        internal const float UploadWaitSeconds = 30f;
+
+        /// <summary>An upload with room: arriving at no more than this share of its rate...</summary>
+        internal const float UploadRoomShare = 0.75f;
+
+        /// <summary>...and losing no more than this share of its packets. A lossy upload is held at
+        /// the game's rate by M37 and has no room to give whatever it carries now.</summary>
+        internal const float UploadRoomQuality = 0.95f;
+
+        /// <summary>A player only takes creatures moved off somebody else once their upload has
+        /// lost no more than UploadRoomQuality allows for this long. Loss that comes and goes
+        /// passes a test of the last few seconds: in the 2026-10-06 replay one player's upload
+        /// lost 3-12% most of the night, cleared for a few seconds at a time, and picked up a
+        /// dozen creatures in those gaps.</summary>
+        internal const float UploadCleanSeconds = 60f;
+
         // -- wire --------------------------------------------------------------------------
 
         internal static byte[] Encode(FrameReport report) {
@@ -193,6 +285,9 @@ namespace NetworkPerformanceSystem.Runtime {
                 writer.Write(ClampUShort(report.FixedSteps));
                 writer.Write(ClampUShort(report.OwnedAi));
                 writer.Write((short)System.Math.Max(short.MinValue, System.Math.Min(short.MaxValue, report.FrameCap)));
+                writer.Write(report.UploadPending);
+                writer.Write(report.UploadQuality);
+                writer.Write(report.UploadFullShare);
                 writer.Flush();
                 return stream.ToArray();
             }
@@ -218,6 +313,15 @@ namespace NetworkPerformanceSystem.Runtime {
                     report.FixedSteps = reader.ReadUInt16();
                     report.OwnedAi = reader.ReadUInt16();
                     report.FrameCap = reader.ReadInt16();
+                    if (version >= 2 && bytes.Length >= Version2Bytes) {
+                        report.UploadPending = reader.ReadInt32();
+                        report.UploadQuality = reader.ReadSingle();
+                        report.UploadFullShare = reader.ReadSingle();
+                    } else {
+                        report.UploadPending = -1;
+                        report.UploadQuality = -1f;
+                        report.UploadFullShare = -1f;
+                    }
                 }
             } catch (System.Exception) {
                 return false;
@@ -238,6 +342,9 @@ namespace NetworkPerformanceSystem.Runtime {
             report.FixedSteps = System.Math.Max(0, System.Math.Min(ushort.MaxValue, report.FixedSteps));
             report.OwnedAi = System.Math.Max(0, System.Math.Min(ushort.MaxValue, report.OwnedAi));
             if (report.FrameCap < -1) { report.FrameCap = -1; }
+            if (report.UploadPending < -1) { report.UploadPending = -1; }
+            report.UploadQuality = report.UploadQuality < 0f ? -1f : Finite(report.UploadQuality, -1f, 0f, 1f);
+            report.UploadFullShare = report.UploadFullShare < 0f ? -1f : Finite(report.UploadFullShare, -1f, 0f, 1f);
             return report;
         }
 
@@ -273,10 +380,18 @@ namespace NetworkPerformanceSystem.Runtime {
         /// under the improvement bar even when it is working.
         /// </summary>
         internal static bool ShouldGiveUp(int steps, int allowance, int ownedAtStart, int minAllowance, float fps, float fpsAtStart) {
+            return GivesUp(steps, allowance, ownedAtStart, minAllowance, Improved(fps, fpsAtStart), halvedGivesUp: true);
+        }
+
+        /// <summary>ShouldGiveUp with the verdict on whether it helped already made. halvedGivesUp
+        /// false asks only at the minimum: an upload that is still full says nothing about whether
+        /// fewer creatures helped - it reads the same at any demand over its rate - so it is
+        /// stepped as far as the minimum before it is called creatures' fault or not.</summary>
+        internal static bool GivesUp(int steps, int allowance, int ownedAtStart, int minAllowance, bool improved, bool halvedGivesUp) {
             if (steps <= 0) { return false; }
-            if (Improved(fps, fpsAtStart)) { return false; }
+            if (improved) { return false; }
             bool atFloor = allowance <= minAllowance;
-            bool halved = allowance * 2 <= ownedAtStart;
+            bool halved = halvedGivesUp && allowance * 2 <= ownedAtStart;
             return atFloor || halved;
         }
 
@@ -298,23 +413,115 @@ namespace NetworkPerformanceSystem.Runtime {
         ///     handed them back every minute.
         /// </summary>
         internal static AllowanceAction Step(ref AllowanceState state, AllowanceInputs input, AllowanceSettings settings) {
-            float now = input.Now;
+            AllowanceRun kind = input.Fps < settings.MinFps ? AllowanceRun.Low
+                              : input.Fps >= settings.MinFps + settings.HealthyMarginFps ? AllowanceRun.Healthy
+                              : AllowanceRun.None;
+            return Advance(ref state, input.Now, input.Usable, kind, input.Fps, Improved(input.Fps, state.ValueAtStart),
+                           halvedGivesUp: true, input.Owned, input.Shared, settings);
+        }
 
+        // -- the upload allowance ----------------------------------------------------------
+
+        /// <summary>
+        /// Whether a player's upload is full with no grant coming to fix it soon: full, and either
+        /// M37 cannot raise their grant (it is off, their game takes no grants, the grant is at
+        /// its cap or held under a ceiling their link failed at, or their link loses too much to
+        /// be raised), or the upload has stayed full UploadWaitSeconds since the grant last
+        /// changed. fullSince is when the reading first said full in this run.
+        /// </summary>
+        internal static bool UploadStuck(UploadReading r, float fullSince, float now) {
+            if (!r.Known || !r.Full) { return false; }
+            if (!r.GrantMayRise) { return true; }
+            return now - System.Math.Max(fullSince, r.GrantChangedAt) >= UploadWaitSeconds;
+        }
+
+        /// <summary>Whether a player's upload can take more: not full, arriving at no more than
+        /// UploadRoomShare of its rate, and not losing more than UploadRoomQuality allows. A player
+        /// whose upload is not read (the host itself) has room: creatures it runs cost no
+        /// player's upload.</summary>
+        internal static bool UploadHasRoom(UploadReading r) {
+            if (!r.Known) { return true; }
+            if (r.Full || r.Rate <= 0) { return false; }
+            if (r.Quality >= 0f && r.Quality < UploadRoomQuality) { return false; }
+            return r.Delivered <= UploadRoomShare * r.Rate;
+        }
+
+        /// <summary>Bytes/sec an upload can still take before it stops having room; +inf when it
+        /// is not read.</summary>
+        internal static float UploadRoomBytes(UploadReading r) {
+            if (!r.Known) { return float.PositiveInfinity; }
+            return UploadRoomShare * r.Rate - r.Delivered;
+        }
+
+        /// <summary>
+        /// What one of a player's creatures costs their upload, bytes/sec: what arrives from them
+        /// over what they run, and - once they are held - no more than it was when the first step
+        /// was taken (the upload then over the creatures then). Everything a player sends is
+        /// counted against their creatures, so with only a few left the first figure is mostly
+        /// their own character; the one from the start was taken with the creatures dominating.
+        /// 0 when there is nothing to go on.
+        /// </summary>
+        internal static float UploadPerCreature(UploadReading r, int owned, AllowanceState state) {
+            if (!r.Known) { return 0f; }
+            float each = owned > 0 ? r.Delivered / owned : float.PositiveInfinity;
+            if (state.Steps > 0 && state.OwnedAtStart > 0) {
+                each = System.Math.Min(each, state.ValueAtStart / state.OwnedAtStart);
+            }
+            return float.IsPositiveInfinity(each) ? 0f : each;
+        }
+
+        /// <summary>
+        /// Whether a held player's upload has room for what one step back up would return: it has
+        /// room now (UploadHasRoom), and still would with that step's creatures at what each costs
+        /// (UploadPerCreature). Without the second half a player at 70% of their rate on the
+        /// allowance is handed back a third more creatures, fills, and is stepped down again half
+        /// a minute later.
+        /// </summary>
+        internal static bool UploadRoomForStepUp(UploadReading r, int owned, AllowanceState state, int minAllowance) {
+            if (!r.Known || !UploadHasRoom(r)) { return false; }
+            float back = CreaturesBackOneStep(state, minAllowance) * UploadPerCreature(r, owned, state);
+            return r.Delivered + back <= UploadRoomShare * r.Rate;
+        }
+
+        /// <summary>How many creatures one step back up from this state hands back: the next
+        /// allowance up less this one, and for the last step what they ran when it started.</summary>
+        internal static int CreaturesBackOneStep(AllowanceState state, int minAllowance) {
+            if (state.Steps <= 0) { return 0; }
+            int now = AllowanceFor(state.OwnedAtStart, state.Steps, minAllowance);
+            int up = state.Steps == 1 ? state.OwnedAtStart : AllowanceFor(state.OwnedAtStart, state.Steps - 1, minAllowance);
+            return System.Math.Max(0, up - now);
+        }
+
+        /// <summary>
+        /// One evaluation of a player's upload allowance: Step's rules with "stuck" in place of a
+        /// low frame rate and "room" in place of a healthy one. The one difference is when it gives
+        /// up: only at the minimum (see GivesUp), and then the player is left alone for
+        /// ExemptSeconds - their upload is full of something other than creatures.
+        /// </summary>
+        internal static AllowanceAction StepUpload(ref AllowanceState state, UploadAllowanceInputs input, AllowanceSettings settings) {
+            AllowanceRun kind = input.Stuck ? AllowanceRun.Low
+                              : input.Room ? AllowanceRun.Healthy
+                              : AllowanceRun.None;
+            return Advance(ref state, input.Now, input.Usable, kind, input.Delivered, improved: false,
+                           halvedGivesUp: false, input.Owned, input.Shared, settings);
+        }
+
+        /// <summary>The rules both allowances share; see Step. kind is this evaluation's verdict:
+        /// Low (struggling), Healthy (room to spare) or None (neither).</summary>
+        private static AllowanceAction Advance(ref AllowanceState state, float now, bool usable, AllowanceRun kind, float value,
+                                               bool improved, bool halvedGivesUp, int owned, int shared, AllowanceSettings settings) {
             if (state.Exempt) {
                 if (now < state.ExemptUntil) { return AllowanceAction.None; }
                 state.Exempt = false;
             }
 
-            if (!input.Usable) {
+            if (!usable) {
                 state.Run = AllowanceRun.None;
                 state.RunSince = now;
                 state.RunSamples = 0;
                 return AllowanceAction.None;
             }
 
-            AllowanceRun kind = input.Fps < settings.MinFps ? AllowanceRun.Low
-                              : input.Fps >= settings.MinFps + settings.HealthyMarginFps ? AllowanceRun.Healthy
-                              : AllowanceRun.None;
             if (kind != state.Run) {
                 state.Run = kind;
                 state.RunSince = now;
@@ -324,7 +531,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             int allowance = AllowanceFor(state.OwnedAtStart, state.Steps, settings.MinAllowance);
             if (state.Steps > 0) {
-                if (input.Owned <= allowance) {
+                if (owned <= allowance) {
                     if (state.ReachedAt < 0f) { state.ReachedAt = now; }
                 } else {
                     state.ReachedAt = -1f;
@@ -336,15 +543,15 @@ namespace NetworkPerformanceSystem.Runtime {
             if (kind == AllowanceRun.Low) {
                 if (state.Steps == 0) {
                     if (now - System.Math.Max(state.RunSince, state.LastChangeAt) < settings.HoldSeconds) { return AllowanceAction.None; }
-                    if (input.Owned <= settings.MinAllowance) { return AllowanceAction.None; }
+                    if (owned <= settings.MinAllowance) { return AllowanceAction.None; }
                     // Alone with their creatures. The run keeps going, so the step comes at once
                     // if somebody who could take some arrives while this player is still slow.
-                    if (input.Shared <= 0) { return AllowanceAction.None; }
+                    if (shared <= 0) { return AllowanceAction.None; }
 
                     NoteStepDown(ref state, now, settings);
                     state.Steps = 1;
-                    state.OwnedAtStart = input.Owned;
-                    state.FpsAtStart = input.Fps;
+                    state.OwnedAtStart = owned;
+                    state.ValueAtStart = value;
                     state.LastChangeAt = now;
                     state.ReachedAt = -1f;
                     return AllowanceAction.Down;
@@ -353,7 +560,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (state.ReachedAt < 0f) { return AllowanceAction.None; }
                 if (now - System.Math.Max(state.ReachedAt, state.LastChangeAt) < settings.HoldSeconds) { return AllowanceAction.None; }
 
-                if (ShouldGiveUp(state.Steps, allowance, state.OwnedAtStart, settings.MinAllowance, input.Fps, state.FpsAtStart)) {
+                if (GivesUp(state.Steps, allowance, state.OwnedAtStart, settings.MinAllowance, improved, halvedGivesUp)) {
                     state.Steps = 0;
                     state.OwnedAtStart = 0;
                     state.LastChangeAt = now;
@@ -438,8 +645,13 @@ namespace NetworkPerformanceSystem.Runtime {
         /// everyone healthy instead of piling onto whoever has the next-lowest ping. Room cannot
         /// do that job: a player healthy enough to take creatures never has an allowance of their
         /// own, so every receiver has unlimited room. Ties go to the better-ranked one.
+        ///
+        /// byUploadRoom is for a creature moved off a player whose upload is full: there it is the
+        /// one with the most upload room left (UploadRoom) that takes it, then the fewest
+        /// creatures - so the upload a creature costs lands where there is room for it, rather
+        /// than on a player who runs few creatures but whose own upload is close to full.
         /// </summary>
-        internal static int PickReceiver(List<ReceiverOption> options, int excludeIndex, float marginMs) {
+        internal static int PickReceiver(List<ReceiverOption> options, int excludeIndex, float marginMs, bool byUploadRoom = false) {
             int best = PickWithRoom(options, excludeIndex);
             if (best < 0) { return -1; }
 
@@ -450,6 +662,10 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (i == best || !option.Eligible || option.Room <= 0 || option.Index == excludeIndex) { continue; }
                 if (option.Total > bar) { continue; }
                 ReceiverOption current = options[chosen];
+                if (byUploadRoom && option.UploadRoom != current.UploadRoom) {
+                    if (option.UploadRoom > current.UploadRoom) { chosen = i; }
+                    continue;
+                }
                 if (option.Load < current.Load
                     || (option.Load == current.Load
                         && IsBetter(option.Total, option.Worst, option.Rtt, current.Total, current.Worst, current.Rtt))) {
@@ -512,6 +728,10 @@ namespace NetworkPerformanceSystem.Runtime {
         private double _simMs;
         private int _fixedSteps;
         private byte _flags;
+        private int _uploadSamples;
+        private int _uploadFull;
+        private int _uploadPending = -1;
+        private float _uploadQuality = -1f;
 
         internal int Frames => _frames;
         internal double Seconds => _seconds;
@@ -533,6 +753,14 @@ namespace NetworkPerformanceSystem.Runtime {
             _flags |= flags;
         }
 
+        /// <summary>One reading of this player's upload to the host (M37), at the ping cadence.</summary>
+        internal void AddUpload(int pendingBytes, float quality, bool full) {
+            _uploadSamples++;
+            if (full) { _uploadFull++; }
+            if (pendingBytes > _uploadPending) { _uploadPending = pendingBytes; }
+            if (quality >= 0f) { _uploadQuality = quality; }
+        }
+
         internal FrameReport Snapshot(int ownedAi, byte flags, int frameCap, bool simTimed) {
             float seconds = (float)_seconds;
             byte all = (byte)(_flags | flags | (simTimed ? 0 : CreatureLoadRules.FlagNoSimTiming));
@@ -548,6 +776,9 @@ namespace NetworkPerformanceSystem.Runtime {
                 FixedSteps = _fixedSteps,
                 OwnedAi = ownedAi,
                 FrameCap = frameCap,
+                UploadPending = _uploadSamples > 0 ? _uploadPending : -1,
+                UploadQuality = _uploadSamples > 0 ? _uploadQuality : -1f,
+                UploadFullShare = _uploadSamples > 0 ? (float)_uploadFull / _uploadSamples : -1f,
             };
         }
 
@@ -559,6 +790,10 @@ namespace NetworkPerformanceSystem.Runtime {
             _simMs = 0d;
             _fixedSteps = 0;
             _flags = 0;
+            _uploadSamples = 0;
+            _uploadFull = 0;
+            _uploadPending = -1;
+            _uploadQuality = -1f;
         }
     }
 }

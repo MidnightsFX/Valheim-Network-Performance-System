@@ -33,6 +33,24 @@ namespace NetworkPerformanceSystem.Runtime {
     /// Players without the mod never report, so nothing here applies to them and the arbiter
     /// treats them exactly as before. Reports are tiny (30 bytes every two seconds) and travel
     /// on a direct peer RPC an older or vanilla host drops unread.
+    ///
+    /// A second allowance, run by the same rules, watches each player's upload to the host
+    /// (Balance Creatures By Upload). Every creature a player runs is sent from their machine, at
+    /// a few KB/s each in a fight, and a player's upload is paced at 150 KB/s unless M37 grants
+    /// more. In the 2026-10-06 plains fight one player ran 40-55 goblins with his upload pinned
+    /// at 150 KB/s for five minutes; eleven of fifteen sampled stalls in the fight - 1.4 to 12.6
+    /// seconds with no update while moving - were his goblins, while two other players uploaded
+    /// 50-60 KB/s. Every game ran at 58-254 fps, so the frame-rate allowance never moved one.
+    /// M37's grant helps where the player's line has room, but took two and a half minutes to
+    /// reach 366 KB/s in a replay, and cannot help where the line itself is the limit.
+    ///
+    /// So a player whose upload is full - by M37's own test of the upload, which reads what their
+    /// machine still has queued when their report carries it - and whom a grant will not fix
+    /// soon (CreatureLoadRules.UploadStuck) is stepped down the same way, and creatures moved off
+    /// them go to the players with the most upload room left. Only players whose uploads have
+    /// room take creatures from anybody, for either reason. It gives up only at the minimum: an
+    /// upload still full there is full of something else. The tighter of the two allowances is
+    /// the one the arbiter sees.
     /// </summary>
     internal static class PeerCapacity {
 
@@ -69,6 +87,14 @@ namespace NetworkPerformanceSystem.Runtime {
             internal int Owned;
             internal int Shared;
             internal AllowanceState State = AllowanceState.Fresh();
+
+            // The upload allowance. UploadNow is the last pass's reading, kept whether or not
+            // anything was decided on it: it says whether this player has room to take creatures.
+            internal AllowanceState Upload = AllowanceState.Fresh();
+            internal UploadReading UploadNow;
+            internal float UploadFullSince = float.NegativeInfinity;
+            internal bool UploadStuck;
+            internal float UploadLossyAt = float.NegativeInfinity;   // the last pass it lost too much
         }
 
         internal struct View {
@@ -87,6 +113,15 @@ namespace NetworkPerformanceSystem.Runtime {
             internal bool Exempt;
             internal float ExemptLeftSeconds;
             internal bool Receiver;                  // may take creatures moved off somebody else
+
+            internal UploadReading Upload;
+            internal bool UploadStuck;               // full, and no grant will fix it soon
+            internal int UploadSteps;
+            internal int UploadAllowance;            // int.MaxValue when none
+            internal int UploadOwnedAtStart;
+            internal float UploadAtStart;            // bytes/sec arriving when the first step was taken
+            internal bool UploadExempt;
+            internal float UploadExemptLeftSeconds;
         }
 
         private static readonly Dictionary<long, Entry> Peers = new Dictionary<long, Entry>();
@@ -98,14 +133,30 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static long TotalStepsUp;
         internal static long TotalCleared;
         internal static long TotalExempted;
+        internal static long TotalUploadStepsDown;
+        internal static long TotalUploadStepsUp;
+        internal static long TotalUploadCleared;
+        internal static long TotalUploadExempted;
 
-        /// <summary>Everything the allowance needs: the mechanism, its switch, and creature
-        /// arbitration, which is what puts creatures in the arbiter's hands at all.</summary>
-        internal static bool Balancing =>
+        /// <summary>What either allowance needs: the mechanism, and creature arbitration, which
+        /// is what puts creatures in the arbiter's hands at all.</summary>
+        private static bool Arbitrating =>
             PatchGuard.IsActive(Mechanism.CreatureAllowance)
-            && ValConfig.BalanceCreaturesByFrameRate != null
-            && ValConfig.BalanceCreaturesByFrameRate.Value
+            && ValConfig.OwnershipArbitrateCreatures != null
             && ValConfig.OwnershipArbitrateCreatures.Value;
+
+        internal static bool BalancingFrameRate =>
+            Arbitrating
+            && ValConfig.BalanceCreaturesByFrameRate != null
+            && ValConfig.BalanceCreaturesByFrameRate.Value;
+
+        internal static bool BalancingUploads =>
+            Arbitrating
+            && ValConfig.BalanceCreaturesByUpload != null
+            && ValConfig.BalanceCreaturesByUpload.Value;
+
+        /// <summary>Either allowance is on: the arbiter counts creatures and asks for room.</summary>
+        internal static bool Balancing => BalancingFrameRate || BalancingUploads;
 
         // -- intake ------------------------------------------------------------------------
 
@@ -176,7 +227,8 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static void OnPassCompleted(float now) {
             if (Peers.Count == 0) { return; }
 
-            bool balancing = Balancing;
+            bool byFps = BalancingFrameRate;
+            bool byUpload = BalancingUploads;
             AllowanceSettings settings = Settings();
 
             Scratch.Clear();
@@ -189,33 +241,77 @@ namespace NetworkPerformanceSystem.Runtime {
 
                 e.Owned = OwnershipArbiter.OwnedCreaturesFor(pair.Key);
                 e.Shared = OwnershipArbiter.SharedCreaturesFor(pair.Key);
-                if (!balancing) { continue; }
+                ReadUpload(pair.Key, e, now, byUpload);
 
-                AllowanceInputs input = new AllowanceInputs {
-                    Now = now,
-                    Usable = e.HasFps && now - e.LastAt <= FreshSeconds && !e.Last.Unrepresentative,
-                    Fps = e.FpsEwma,
-                    Owned = e.Owned,
-                    Shared = e.Shared,
-                };
-
-                int stepsBefore = e.State.Steps;
-                int allowanceBefore = AllowanceOf(e, settings.MinAllowance);
-                int ownedAtStartBefore = e.State.OwnedAtStart;
-                float fpsAtStartBefore = e.State.FpsAtStart;
-
-                AllowanceAction action = CreatureLoadRules.Step(ref e.State, input, settings);
-                if (action == AllowanceAction.None) { continue; }
-
-                Announce(pair.Key, e, action, stepsBefore, allowanceBefore, ownedAtStartBefore, fpsAtStartBefore, settings);
+                if (byFps) { StepFrameRate(pair.Key, e, now, settings); }
+                if (byUpload) { StepUpload(pair.Key, e, now, settings); }
             }
 
             for (int i = 0; i < Scratch.Count; i++) {
-                if (Peers.TryGetValue(Scratch[i], out Entry gone) && gone.State.Steps > 0) {
+                if (Peers.TryGetValue(Scratch[i], out Entry gone) && (gone.State.Steps > 0 || gone.Upload.Steps > 0)) {
                     Logger.LogInfo($"Creature load: {Name(Scratch[i])} has not reported for {ForgetSeconds:F0}s; their creature allowance is dropped.");
                 }
                 Peers.Remove(Scratch[i]);
             }
+        }
+
+        private static void StepFrameRate(long uid, Entry e, float now, AllowanceSettings settings) {
+            AllowanceInputs input = new AllowanceInputs {
+                Now = now,
+                Usable = e.HasFps && now - e.LastAt <= FreshSeconds && !e.Last.Unrepresentative,
+                Fps = e.FpsEwma,
+                Owned = e.Owned,
+                Shared = e.Shared,
+            };
+
+            int stepsBefore = e.State.Steps;
+            int allowanceBefore = AllowanceOf(e.State, settings.MinAllowance);
+            int ownedAtStartBefore = e.State.OwnedAtStart;
+            float fpsAtStartBefore = e.State.ValueAtStart;
+
+            AllowanceAction action = CreatureLoadRules.Step(ref e.State, input, settings);
+            if (action == AllowanceAction.None) { return; }
+
+            Announce(uid, e, action, stepsBefore, allowanceBefore, ownedAtStartBefore, fpsAtStartBefore, settings);
+        }
+
+        /// <summary>This pass's reading of the player's upload, and how long it has been full.
+        /// Off, or not read, it is unknown - which counts as room to take creatures.</summary>
+        private static void ReadUpload(long uid, Entry e, float now, bool byUpload) {
+            UploadReading reading = default;
+            if (byUpload) { AutoSendRate.TryGetUpload(uid, now, out reading); }
+            e.UploadNow = reading;
+            if (reading.Full) {
+                if (e.UploadFullSince == float.NegativeInfinity) { e.UploadFullSince = now; }
+            } else {
+                e.UploadFullSince = float.NegativeInfinity;
+            }
+            if (reading.Known && reading.Quality >= 0f && reading.Quality < CreatureLoadRules.UploadRoomQuality) { e.UploadLossyAt = now; }
+            e.UploadStuck = CreatureLoadRules.UploadStuck(reading, e.UploadFullSince, now);
+        }
+
+        private static void StepUpload(long uid, Entry e, float now, AllowanceSettings settings) {
+            UploadReading up = e.UploadNow;
+            bool loading = e.HasReport && (e.Last.Flags & CreatureLoadRules.FlagLoading) != 0;
+            UploadAllowanceInputs input = new UploadAllowanceInputs {
+                Now = now,
+                Usable = up.Known && !loading,
+                Stuck = e.UploadStuck,
+                Room = CreatureLoadRules.UploadRoomForStepUp(up, e.Owned, e.Upload, settings.MinAllowance),
+                Delivered = up.Delivered,
+                Owned = e.Owned,
+                Shared = e.Shared,
+            };
+
+            int stepsBefore = e.Upload.Steps;
+            int allowanceBefore = AllowanceOf(e.Upload, settings.MinAllowance);
+            int ownedAtStartBefore = e.Upload.OwnedAtStart;
+            float atStartBefore = e.Upload.ValueAtStart;
+
+            AllowanceAction action = CreatureLoadRules.StepUpload(ref e.Upload, input, settings);
+            if (action == AllowanceAction.None) { return; }
+
+            AnnounceUpload(uid, e, action, stepsBefore, allowanceBefore, ownedAtStartBefore, atStartBefore, settings);
         }
 
         private static AllowanceSettings Settings() {
@@ -229,14 +325,14 @@ namespace NetworkPerformanceSystem.Runtime {
             };
         }
 
-        private static int AllowanceOf(Entry e, int minAllowance) {
-            return CreatureLoadRules.AllowanceFor(e.State.OwnedAtStart, e.State.Steps, minAllowance);
+        private static int AllowanceOf(AllowanceState state, int minAllowance) {
+            return CreatureLoadRules.AllowanceFor(state.OwnedAtStart, state.Steps, minAllowance);
         }
 
         private static void Announce(long uid, Entry e, AllowanceAction action, int stepsBefore, int allowanceBefore,
                                      int ownedAtStartBefore, float fpsAtStartBefore, AllowanceSettings settings) {
             string name = Name(uid);
-            int allowance = AllowanceOf(e, settings.MinAllowance);
+            int allowance = AllowanceOf(e.State, settings.MinAllowance);
 
             switch (action) {
                 case AllowanceAction.Down:
@@ -270,7 +366,54 @@ namespace NetworkPerformanceSystem.Runtime {
                                                allowance == int.MaxValue ? -1 : allowance, e.Owned,
                                                action == AllowanceAction.Exempt ? ownedAtStartBefore : e.State.OwnedAtStart,
                                                e.FpsEwma,
-                                               action == AllowanceAction.Exempt ? fpsAtStartBefore : e.State.FpsAtStart);
+                                               action == AllowanceAction.Exempt ? fpsAtStartBefore : e.State.ValueAtStart);
+            }
+        }
+
+        private static void AnnounceUpload(long uid, Entry e, AllowanceAction action, int stepsBefore, int allowanceBefore,
+                                           int ownedAtStartBefore, float atStartBefore, AllowanceSettings settings) {
+            string name = Name(uid);
+            int allowance = AllowanceOf(e.Upload, settings.MinAllowance);
+            UploadReading up = e.UploadNow;
+            string upload = $"{AutoSendRate.Kb(up.Delivered)} of {AutoSendRate.Kb(up.Rate)}";
+
+            switch (action) {
+                case AllowanceAction.Down:
+                    TotalUploadStepsDown++;
+                    if (stepsBefore == 0) {
+                        string why = up.GrantMayRise
+                            ? $"still full {CreatureLoadRules.UploadWaitSeconds:F0}s on, faster than its rate can be raised"
+                            : "and a higher upload rate cannot fix it";
+                        Logger.LogInfo($"Creature load: {name}'s upload to the server is full ({upload}, {why}) while they run {e.Owned} creatures; " +
+                                       $"they get no new creatures above {allowance}, and the rest move a few at a time to players whose uploads have room.");
+                    } else {
+                        Logger.LogInfo($"Creature load: {name}'s upload is still full ({upload}) with {e.Owned} creatures; " +
+                                       $"upload allowance {allowanceBefore} -> {allowance} (step {e.Upload.Steps}).");
+                    }
+                    break;
+                case AllowanceAction.Up:
+                    TotalUploadStepsUp++;
+                    Logger.LogInfo($"Creature load: {name}'s upload has room ({upload}); upload allowance {allowanceBefore} -> {allowance} (step {e.Upload.Steps}).");
+                    break;
+                case AllowanceAction.Clear:
+                    TotalUploadCleared++;
+                    Logger.LogInfo($"Creature load: {name}'s upload has room ({upload}); no upload allowance any more.");
+                    break;
+                case AllowanceAction.Exempt:
+                    TotalUploadExempted++;
+                    Logger.LogWarning($"Creature load: {name}'s upload is still full ({upload}) after being held to {allowanceBefore} creatures " +
+                                      $"({ownedAtStartBefore} when it started), so creatures are not what fills it. " +
+                                      $"Their upload allowance is dropped and they are left alone for {ExemptSeconds / 60f:F0} minutes.");
+                    break;
+            }
+
+            if (Monitoring.Active) {
+                Monitoring.OnCreatureAllowanceUpload(uid, ActionName(action), e.Upload.Steps,
+                                                     allowance == int.MaxValue ? -1 : allowance, e.Owned,
+                                                     action == AllowanceAction.Exempt ? ownedAtStartBefore : e.Upload.OwnedAtStart,
+                                                     up.Delivered,
+                                                     action == AllowanceAction.Exempt ? atStartBefore : e.Upload.ValueAtStart,
+                                                     up.Rate, up.GrantMayRise);
             }
         }
 
@@ -284,15 +427,27 @@ namespace NetworkPerformanceSystem.Runtime {
             }
         }
 
-        /// <summary>The settings changed. Switched off, every allowance goes at once so creatures
+        /// <summary>The settings changed. Either allowance switched off goes at once, so creatures
         /// return to the ordinary rules without waiting out a recover time.</summary>
         internal static void OnConfigChanged() {
-            if (Balancing) { return; }
+            bool byFps = BalancingFrameRate;
+            bool byUpload = BalancingUploads;
+            if (byFps && byUpload) { return; }
 
             int dropped = 0;
             foreach (Entry e in Peers.Values) {
-                if (e.State.Steps > 0) { dropped++; }
-                e.State = AllowanceState.Fresh();
+                if (!byFps) {
+                    if (e.State.Steps > 0) { dropped++; }
+                    e.State = AllowanceState.Fresh();
+                }
+                if (!byUpload) {
+                    if (e.Upload.Steps > 0) { dropped++; }
+                    e.Upload = AllowanceState.Fresh();
+                    e.UploadNow = default;
+                    e.UploadFullSince = float.NegativeInfinity;
+                    e.UploadStuck = false;
+                    e.UploadLossyAt = float.NegativeInfinity;
+                }
             }
             if (dropped > 0) {
                 Logger.LogInfo($"Creature load: balancing is off; {dropped} creature allowance(s) dropped.");
@@ -302,22 +457,54 @@ namespace NetworkPerformanceSystem.Runtime {
         // -- views -------------------------------------------------------------------------
 
         /// <summary>The most creatures this player may own: int.MaxValue unless they are held to
-        /// an allowance right now.</summary>
+        /// an allowance right now - the tighter one when they are held to both.</summary>
         internal static int AllowanceFor(long uid) {
-            if (!Peers.TryGetValue(uid, out Entry e) || e.State.Steps == 0) { return int.MaxValue; }
-            if (!Balancing) { return int.MaxValue; }
-            return AllowanceOf(e, ValConfig.CreatureLoadMinAllowance.Value);
+            if (!Peers.TryGetValue(uid, out Entry e)) { return int.MaxValue; }
+            int min = ValConfig.CreatureLoadMinAllowance.Value;
+            int allowance = int.MaxValue;
+            if (e.State.Steps > 0 && BalancingFrameRate) { allowance = AllowanceOf(e.State, min); }
+            if (e.Upload.Steps > 0 && BalancingUploads) { allowance = System.Math.Min(allowance, AllowanceOf(e.Upload, min)); }
+            return allowance;
+        }
+
+        /// <summary>The upload allowance is the one this player is held to (it is no looser than
+        /// the frame-rate one): creatures moved off them go where uploads have room, and the
+        /// handoff is recorded as Upload rather than Capacity.</summary>
+        internal static bool IsUploadLimited(long uid) {
+            if (!BalancingUploads || !Peers.TryGetValue(uid, out Entry e) || e.Upload.Steps == 0) { return false; }
+            int min = ValConfig.CreatureLoadMinAllowance.Value;
+            int upload = AllowanceOf(e.Upload, min);
+            return !(e.State.Steps > 0 && BalancingFrameRate) || upload <= AllowanceOf(e.State, min);
+        }
+
+        /// <summary>What one of this player's creatures costs their upload, bytes/sec
+        /// (CreatureLoadRules.UploadPerCreature): what the creatures moved off them will cost
+        /// whoever takes them. 0 when unknown.</summary>
+        internal static float UploadPerCreature(long uid) {
+            if (!Peers.TryGetValue(uid, out Entry e)) { return 0f; }
+            return CreatureLoadRules.UploadPerCreature(e.UploadNow, e.Owned, e.Upload);
+        }
+
+        /// <summary>Bytes/sec of upload room this player has left (CreatureLoadRules.UploadRoomBytes);
+        /// +inf when it is not read - the host, a player just joined, or the upload rule off.</summary>
+        internal static float UploadRoomFor(long uid) {
+            if (!Peers.TryGetValue(uid, out Entry e)) { return float.PositiveInfinity; }
+            return CreatureLoadRules.UploadRoomBytes(e.UploadNow);
         }
 
         /// <summary>Whether this player may take creatures moved off somebody else: a fresh,
-        /// representative report, comfortably above Min Owner FPS, and not held to an allowance
-        /// of their own. A player who has never reported - no mod, or a dedicated server - never
-        /// is: there is no telling whether their game has room.</summary>
-        internal static bool IsShedReceiver(long uid) {
+        /// representative report, comfortably above Min Owner FPS, not held to an allowance of
+        /// their own, and an upload with room that has not lost packets for UploadCleanSeconds
+        /// (CreatureLoadRules; always, while the upload rule is off). A player who has never
+        /// reported - no mod, or a dedicated server - never is: there is no telling whether their
+        /// game has room.</summary>
+        internal static bool IsShedReceiver(long uid, float now) {
             if (!Peers.TryGetValue(uid, out Entry e)) { return false; }
             if (!e.HasFps || e.Last.Unrepresentative) { return false; }
-            if (Time.realtimeSinceStartup - e.LastAt > FreshSeconds) { return false; }
+            if (now - e.LastAt > FreshSeconds) { return false; }
             if (e.State.Steps > 0 || e.State.Run == AllowanceRun.Low) { return false; }
+            if (e.Upload.Steps > 0 || e.UploadStuck || !CreatureLoadRules.UploadHasRoom(e.UploadNow)) { return false; }
+            if (now - e.UploadLossyAt < CreatureLoadRules.UploadCleanSeconds) { return false; }
             return e.FpsEwma >= ValConfig.CreatureLoadMinOwnerFps.Value + HealthyMarginFps;
         }
 
@@ -336,13 +523,21 @@ namespace NetworkPerformanceSystem.Runtime {
                 Owned = e.Owned,
                 Shared = e.Shared,
                 Steps = e.State.Steps,
-                Allowance = AllowanceOf(e, min),
+                Allowance = AllowanceOf(e.State, min),
                 OwnedAtStart = e.State.OwnedAtStart,
-                FpsAtStart = e.State.FpsAtStart,
+                FpsAtStart = e.State.ValueAtStart,
                 Low = e.HasFps && e.FpsEwma < ValConfig.CreatureLoadMinOwnerFps.Value,
                 Exempt = e.State.Exempt && now < e.State.ExemptUntil,
                 ExemptLeftSeconds = e.State.Exempt ? e.State.ExemptUntil - now : 0f,
-                Receiver = Balancing && IsShedReceiver(uid),
+                Receiver = Balancing && IsShedReceiver(uid, now),
+                Upload = e.UploadNow,
+                UploadStuck = e.UploadStuck,
+                UploadSteps = e.Upload.Steps,
+                UploadAllowance = AllowanceOf(e.Upload, min),
+                UploadOwnedAtStart = e.Upload.OwnedAtStart,
+                UploadAtStart = e.Upload.ValueAtStart,
+                UploadExempt = e.Upload.Exempt && now < e.Upload.ExemptUntil,
+                UploadExemptLeftSeconds = e.Upload.Exempt ? e.Upload.ExemptUntil - now : 0f,
             };
             return true;
         }
@@ -355,7 +550,7 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static int LimitedNow() {
             int limited = 0;
             foreach (Entry e in Peers.Values) {
-                if (e.State.Steps > 0) { limited++; }
+                if (e.State.Steps > 0 || e.Upload.Steps > 0) { limited++; }
             }
             return limited;
         }

@@ -142,8 +142,15 @@ namespace NetworkPerformanceSystem.Runtime {
             int configured = ValConfig.SendWindowMaxBytes != null
                 ? ValConfig.SendWindowMaxBytes.Value
                 : SendWindow.VanillaWindowBytes;
-            int ceiling = Math.Max(SendWindow.VanillaWindowBytes, configured);
+            int ceiling = Math.Max(SendWindow.VanillaWindowBytes, LargestWindowBytes(configured));
             return Math.Max(_original, ceiling + HeadroomBytes);
+        }
+
+        /// <summary>The largest window SendWindow can hand out at any rate: its ceiling follows
+        /// the connection's rate (EffectiveMaxBytes), and M37 moves rates at run time without a
+        /// settings change to re-derive this from. Pure.</summary>
+        internal static int LargestWindowBytes(int configuredMaxBytes) {
+            return Math.Max(configuredMaxBytes, SendWindow.RateScaledMaxBytes);
         }
 
         /// <summary>
@@ -164,7 +171,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 _lastLogged = EffectiveLimit;
 
                 string derivation = WindowSizingOn()
-                    ? $"Max Window Bytes {ValConfig.SendWindowMaxBytes.Value} + {HeadroomBytes} headroom"
+                    ? $"largest send window {LargestWindowBytes(ValConfig.SendWindowMaxBytes.Value)} + {HeadroomBytes} headroom"
                     : "send window sizing is off; Jotunn's own value";
                 Logger.LogInfo($"Jotunn CustomRPC send queue limit ({reason}): {before} -> {EffectiveLimit} bytes ({derivation})");
             } catch (Exception e) {

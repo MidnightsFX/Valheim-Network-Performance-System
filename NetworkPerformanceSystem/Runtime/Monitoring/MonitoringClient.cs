@@ -148,6 +148,13 @@ namespace NetworkPerformanceSystem.Runtime {
         private static long _fightingMovedAtReport;
         private static long _wildHeldAtReport;
         private static long _wildPassedAtReport;
+        private static long _floatHeldAtReport;
+        private static long _floatPassedAtReport;
+        private static long _floatCloseAtReport;
+        private static long _wildRelayListedAtReport;
+        private static long _wildRelayHeldAtReport;
+        private static long _floatRelayListedAtReport;
+        private static long _floatRelayHeldAtReport;
 
         internal static void OnStarted() {
             Monitoring.EmitClient(Monitoring.Line.Begin("c_session")
@@ -642,6 +649,23 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Int("qwHeld", Window(QuietWildlife.FramesHeld, _wildHeldAtReport))
                 .Int("qwPass", Window(QuietWildlife.FramesPassed, _wildPassedAtReport));
 
+            // The same for floating objects (ice, logs, dropped items), under their own setting:
+            // frames skipped, due, and not due but written anyway because another player was
+            // within FloatingCloseMetres of the object or standing on it.
+            line.Flag("float", QuietWildlife.FloatingOwnerActive)
+                .Int("qfHeld", Window(QuietWildlife.FloatingFramesHeld, _floatHeldAtReport))
+                .Int("qfPass", Window(QuietWildlife.FloatingFramesPassed, _floatPassedAtReport))
+                .Int("qfClose", Window(QuietWildlife.FloatingFramesClose, _floatCloseAtReport));
+
+            // M31's relay half on the host this window: fish/bird and floating object sends it was
+            // asked about, and how many of them it held back for a later tick.
+            if (NpsEnv.IsHost()) {
+                line.Int("qwRelList", Window(QuietWildlife.RelayListed, _wildRelayListedAtReport))
+                    .Int("qwRelHeld", Window(QuietWildlife.RelayHeld, _wildRelayHeldAtReport))
+                    .Int("qfRelList", Window(QuietWildlife.FloatingRelayListed, _floatRelayListedAtReport))
+                    .Int("qfRelHeld", Window(QuietWildlife.FloatingRelayHeld, _floatRelayHeldAtReport));
+            }
+
             Monitoring.EmitClient(line.End());
 
             _frames = 0;
@@ -671,6 +695,13 @@ namespace NetworkPerformanceSystem.Runtime {
             _fightingMovedAtReport = FightingCreaturesFirst.CreaturesMoved;
             _wildHeldAtReport = QuietWildlife.FramesHeld;
             _wildPassedAtReport = QuietWildlife.FramesPassed;
+            _floatHeldAtReport = QuietWildlife.FloatingFramesHeld;
+            _floatPassedAtReport = QuietWildlife.FloatingFramesPassed;
+            _floatCloseAtReport = QuietWildlife.FloatingFramesClose;
+            _wildRelayListedAtReport = QuietWildlife.RelayListed;
+            _wildRelayHeldAtReport = QuietWildlife.RelayHeld;
+            _floatRelayListedAtReport = QuietWildlife.FloatingRelayListed;
+            _floatRelayHeldAtReport = QuietWildlife.FloatingRelayHeld;
         }
 
         internal static void Reset() {

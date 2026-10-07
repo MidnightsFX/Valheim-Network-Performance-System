@@ -37,6 +37,9 @@ namespace NetworkPerformanceSystem.Runtime {
             internal int LastMs;
             internal float LastSampleRealtime;
             internal bool HasSample;
+
+            /// <summary>The connection's ping with nothing queued on it; see PingBaseline.</summary>
+            internal readonly PingBaseline Best = new PingBaseline();
         }
 
         /// <summary>Host side: live measurements, keyed by peer session id.</summary>
@@ -97,6 +100,13 @@ namespace NetworkPerformanceSystem.Runtime {
 
             state.LastMs = pingMs;
             state.LastSampleRealtime = Time.realtimeSinceStartup;
+            state.Best.Add(state.LastSampleRealtime, pingMs);
+        }
+
+        /// <summary>The peer's ping at its best (PingBaseline) in milliseconds, or 0 until there
+        /// is one. Either side: each measures its own sockets.</summary>
+        internal static float BaselineRttMs(long peerUid) {
+            return Measured.TryGetValue(peerUid, out PeerLatency state) && state.Best.Value > 0f ? state.Best.Value : 0f;
         }
 
         /// <summary>

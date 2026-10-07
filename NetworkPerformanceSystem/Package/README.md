@@ -27,17 +27,26 @@ NPS addresses these issues in a number of ways
 
 **Server-only works.** Vanilla clients get the send window, ownership, scheduler, station-request and creature-hit
 fixes with nothing installed on their end, and the server follows where they actually are rather than where they
-were two seconds ago. The server also sends settled or distant creatures, and fish and birds, to each player less often,
+were two seconds ago. The server also sends settled or distant creatures, fish and birds, and drifting ice, logs and
+dropped items in water, to each player less often,
 holds back building, tree and rock updates that change nothing a player can see, and sends the world's list of past
 players only when it has actually changed. Damage numbers go only to players close enough to see them, and
 `Routed RPC / Damage Numbers` can limit them to the player who landed the hit, or stop sending them at all.
+The server finds its own send rate, too: above the game's 150 KB/s per player while somebody's connection is
+full - in a big fight - up to `Auto Send Rate Max KBps` (500), and only as far as its own line has shown it can
+carry, shared among however many players are on (`Steam Transport / Auto Send Rate`).
 
 **Installing on clients too** adds latency compensation, live position reporting and the clean exit
 from a dead session for those clients, and lets a ship they own pass to whoever takes its helm.
 Creatures they simulate stop re-sending themselves while standing still, which matters most next
-to a pen of tamed animals, and fish and birds they simulate are sent a few times a second instead of
-every frame, which matters most by water. Their game also tells the server how smoothly it is
-running, so a player whose machine slows down in a big fight is given fewer creatures to run.
+to a pen of tamed animals, and fish, birds and anything floating in water they simulate are sent a few
+times a second instead of every frame, which matters most by water - a Jotun invasion on a coast, or
+a ship in sea ice (`Creature Updates / Quiet Floating Objects`; anything a player stands on or is
+next to still goes out every frame). Their game also tells the server how smoothly it is
+running, so a player whose machine slows down in a big fight is given fewer creatures to run, and
+how much of their own upload is waiting, so the server can let them upload faster than the game's
+150 KB/s while it is full (`Steam Transport / Auto Player Uploads`), or give them fewer creatures
+when that is not enough.
 Mixed groups are fine — benefits are per-player, and a client without the mod behaves
 exactly as vanilla. There is **no version lock**: nobody gets kicked for not having it.
 
@@ -47,9 +56,13 @@ Works on dedicated servers and on player-hosted games.
 
 An easy way to start is enabling the nps_stats display Run `nps_stats_collect` (needs `devcommands`, since sampling costs a Steam call per peer per tick), play, then `nps_stats`.
 
-A player the link-pressure table marks as `LOSSY` is already being dealt with: the server steps that one player's send rate down until their connection stops losing packets, and back up once it is clean, without changing anyone else's rate (`Steam Transport / Enable Loss Backoff`). A player whose loss does not improve - once their rate is below what their connection was already carrying, or at the lowest rate - has a connection problem the rate cannot fix: they go back to full speed and are left there until the server restarts. Loss measured during an outage at the server's end is ignored. The "Loss backoff" block shows who is backed off and by how much.
+A player the link-pressure table marks as `LOSSY` is already being dealt with: the server steps that one player's send rate down until their connection stops losing packets, and back up once it is clean, without changing anyone else's rate (`Steam Transport / Enable Loss Backoff`). A player whose loss does not improve - once their rate is below what their connection was already carrying, or at the lowest rate - has a connection problem the rate cannot fix: they go back to full speed (never above the game's 150 KB/s) and are left there until the server restarts. Loss measured during an outage at the server's end is ignored. The "Loss backoff" block shows who is backed off and by how much.
+
+The send rate moves by itself (`Steam Transport / Auto Send Rate`, on by default). Every link starts at the game's 150 KB/s. While a player's connection is full and the server's frames have room, the rate goes up a quarter at a time, never more than a quarter above what the line has carried cleanly. It comes back down a quarter at once when several players lose packets or their ping rises together. The server remembers the total its line was carrying when that happened, and from then on shares it among the players on, so more players means less each. A player who loses packets only on their own connection is held lower by loss backoff, which remembers the rate they lost packets at. A step that does not raise what full players receive is undone, because something else is holding them back. The "Auto send rate" block in `nps_stats` shows the rate, what the line has carried, any ceiling it found, and each player's upload grant. If you know your server's upload, put it in `Server Upload Limit KBps` (1 Mbit/s is about 122 KB/s) so the rate never has to find the limit by hitting it. Setting `Send Rate KBps` to a fixed value turns all of this off.
 
 Creatures normally go to whoever has the lowest ping, which can be the slowest machine in the group. A player with the mod whose frame rate stays under `Min Owner FPS` while they run a lot of creatures is held to fewer of them, and the rest move a few at a time to players whose games have room (`Creature Load / Balance Creatures By Frame Rate`). Creatures only that player is near stay with them, and a player who is the only one who can run a creature always gets it - someone playing alone is never held to fewer. If taking creatures away does not make their game faster, they get them back and are left alone for ten minutes. The `fps` column of the peer table and the "Creature load" block show each player's frame rate and allowance.
+
+Every creature a player runs is sent from their machine, so whoever ends up running a big fight can fill their own upload to the server, and then their creatures stall for everyone else. A player with the mod whose upload stays full, when a faster upload (`Steam Transport / Auto Player Uploads`) cannot fix it at all or within half a minute, is held to fewer creatures the same way, and the rest move a few at a time to the players whose uploads have the most room (`Creature Load / Balance Creatures By Upload`, on by default, and it works with `Auto Send Rate` off too). Only players whose upload has room, and has not lost packets for a minute, take creatures from anybody, for either reason. If their upload is still full at `Min Creature Allowance`, creatures are not what fills it: they get them back and are left alone for ten minutes. The "Creature load" block shows each player's upload and the rate they may send at, and which allowance holds them.
 
 A player who alt-tabs or minimises the game is not dropped while it sits in the background (`Connection Timeout / Keep Players In The Background`, on by default). Some computers stop running the game entirely while it is not the active window, and without this the server hangs up on them after `Connection Timeout Seconds`. Players with the mod tell the server when their game goes into the background, and the server then waits `Background Timeout Seconds` (10 minutes by default) instead. Turn it off to drop idle players like anyone else. Their creatures still go to other players after `Ghost Owner Evict Seconds`.
 

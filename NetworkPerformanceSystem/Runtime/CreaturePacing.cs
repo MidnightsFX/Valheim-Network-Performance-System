@@ -37,9 +37,10 @@ namespace NetworkPerformanceSystem.Runtime {
     /// ShouldSend: AddForceSendZdos drops an id from the force-send set when ShouldSend says no,
     /// which would silently cancel those corrections.
     ///
-    /// The same pass applies M31's host half to fish and birds (HoldWildlife; see QuietWildlife),
-    /// under that mechanism's own setting. Their counts are kept on QuietWildlife, so the creature
-    /// totals here and in the monitoring peer record stay creatures only.
+    /// The same pass applies M31's host half to fish and birds, and to floating objects
+    /// (HoldWildlife; see QuietWildlife), each under its own setting. Their counts are kept on
+    /// QuietWildlife, so the creature totals here and in the monitoring peer record stay
+    /// creatures only.
     /// </summary>
     internal static class CreaturePacing {
 
@@ -94,12 +95,13 @@ namespace NetworkPerformanceSystem.Runtime {
 
         /// <summary>
         /// Drops the creatures (when <paramref name="creatures"/>), the fish and birds (when
-        /// <paramref name="wildlife"/>) and the buildings, trees and rocks (when
-        /// <paramref name="structures"/>, M33) this peer is not due for from a finished sync list,
-        /// in place and in order, so whatever AddForceSendZdos put at the head stays there.
+        /// <paramref name="wildlife"/>), the floating objects (when <paramref name="floating"/>)
+        /// and the buildings, trees and rocks (when <paramref name="structures"/>, M33) this peer
+        /// is not due for from a finished sync list, in place and in order, so whatever
+        /// AddForceSendZdos put at the head stays there.
         /// </summary>
         internal static void Filter(ZDOMan.ZDOPeer peer, List<ZDO> toSync, Vector3 refPos, float now,
-                                    bool creatures, bool wildlife, bool structures, bool ownerMayWait) {
+                                    bool creatures, bool wildlife, bool floating, bool structures, bool ownerMayWait) {
             if (peer == null || toSync == null || toSync.Count == 0) { return; }
 
             PruneIfDue(now);
@@ -107,6 +109,9 @@ namespace NetworkPerformanceSystem.Runtime {
             int kept = 0;
             int listed = 0;
             int deferred = 0;
+            // What this player stands on, looked up the first time a floating object is listed.
+            ZDOID standsOn = ZDOID.None;
+            bool standsOnKnown = false;
             for (int i = 0; i < toSync.Count; i++) {
                 ZDO zdo = toSync[i];
                 if (zdo != null) {
@@ -123,11 +128,28 @@ namespace NetworkPerformanceSystem.Runtime {
                             continue;
                         }
                     } else {
-                        QuietWildlife.Kind kind = wildlife ? QuietWildlife.KindOf(zdo) : QuietWildlife.Kind.None;
-                        if (kind != QuietWildlife.Kind.None) {
-                            QuietWildlife.RelayListed++;
-                            if (HoldWildlife(peer, zdo, refPos, now, kind, out bool near)) {
-                                if (near) { QuietWildlife.RelayHeldNear++; } else { QuietWildlife.RelayHeldFar++; }
+                        QuietWildlife.Kind kind = wildlife || floating ? QuietWildlife.KindOf(zdo) : QuietWildlife.Kind.None;
+                        bool paced = kind == QuietWildlife.Kind.Floating ? floating
+                                   : kind != QuietWildlife.Kind.None && wildlife;
+                        if (paced) {
+                            bool isFloating = kind == QuietWildlife.Kind.Floating;
+                            if (isFloating) {
+                                QuietWildlife.FloatingRelayListed++;
+                                if (!standsOnKnown) {
+                                    standsOn = QuietWildlife.StandingOn(peer);
+                                    standsOnKnown = true;
+                                }
+                            } else {
+                                QuietWildlife.RelayListed++;
+                            }
+                            if (HoldWildlife(peer, zdo, refPos, now, kind, standsOn, out bool near)) {
+                                if (isFloating) {
+                                    if (near) { QuietWildlife.FloatingRelayHeldNear++; } else { QuietWildlife.FloatingRelayHeldFar++; }
+                                } else if (near) {
+                                    QuietWildlife.RelayHeldNear++;
+                                } else {
+                                    QuietWildlife.RelayHeldFar++;
+                                }
                                 continue;
                             }
                         } else if (structures && StructureUpdates.IsHeldStructure(zdo)
@@ -179,18 +201,21 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
-        /// M31 - whether this peer waits for this fish or bird: true holds it. The never-hold rules
-        /// are Decide's first four, plus a fish on a fishing line; then QuietWildlife's relay
-        /// interval for its kind and distance. <paramref name="near"/> says which interval held it.
+        /// M31 - whether this peer waits for this fish, bird or floating object: true holds it. The
+        /// never-hold rules are Decide's first four, plus a fish on a fishing line and a floating
+        /// object the player stands on (<paramref name="peerStandsOn"/>); then QuietWildlife's
+        /// relay interval for its kind and distance, which never holds a floating object close to
+        /// the player. <paramref name="near"/> says which interval held it.
         /// </summary>
         internal static bool HoldWildlife(ZDOMan.ZDOPeer peer, ZDO zdo, Vector3 refPos, float now,
-                                          QuietWildlife.Kind kind, out bool near) {
+                                          QuietWildlife.Kind kind, ZDOID peerStandsOn, out bool near) {
             near = false;
             if (!peer.m_zdos.TryGetValue(zdo.m_uid, out ZDOMan.ZDOPeer.PeerZDOInfo info)) { return false; }
             if (zdo.OwnerRevision > info.m_ownerRevision) { return false; }
             if (peer.m_forceSend.Contains(zdo.m_uid)) { return false; }
             if (peer.m_peer != null && zdo.GetOwner() == peer.m_peer.m_uid) { return false; }
             if (kind == QuietWildlife.Kind.Fish && QuietWildlife.IsHooked(zdo)) { return false; }
+            if (kind == QuietWildlife.Kind.Floating && zdo.m_uid == peerStandsOn) { return false; }
 
             Vector3 position = zdo.GetPosition();
             float dx = position.x - refPos.x;
@@ -198,7 +223,8 @@ namespace NetworkPerformanceSystem.Runtime {
             float dz = position.z - refPos.z;
             float distanceSq = dx * dx + dy * dy + dz * dz;
 
-            if (now - info.m_syncTime >= QuietWildlife.RelayIntervalSeconds(kind, distanceSq)) { return false; }
+            float interval = QuietWildlife.RelayIntervalSeconds(kind, distanceSq);
+            if (interval <= 0f || now - info.m_syncTime >= interval) { return false; }
             near = distanceSq < QuietWildlife.RelayNearSq;
             return true;
         }

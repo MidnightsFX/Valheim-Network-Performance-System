@@ -206,6 +206,18 @@ namespace NetworkPerformanceSystem.Runtime {
 
         private static readonly List<int> CreatureRoom = new List<int>();
         private static readonly List<bool> ShedReceiver = new List<bool>();
+
+        /// <summary>Each candidate's upload room, bytes/sec, as of the last pass (PeerCapacity.UploadRoomFor);
+        /// +inf where it is not read. Creatures moved off a full upload go to the most of it.</summary>
+        private static readonly List<float> UploadRoom = new List<float>();
+
+        /// <summary>Creatures each player was given on the last pass, by session id, and the same
+        /// per candidate this pass. Their upload is read a sample or two behind, so it does not
+        /// show them yet: a creature moved off a full upload counts them against the receiver's
+        /// room too. Without it the 2026-10-06 replay filled the first receiver's upload within a
+        /// minute and stepped it down in turn.</summary>
+        private static readonly Dictionary<long, int> ReceivedLastPass = new Dictionary<long, int>();
+        private static readonly List<int> RecentIn = new List<int>();
         private static readonly List<int> PendingOut = new List<int>();
         private static readonly List<int> PendingIn = new List<int>();
         private static readonly List<int> ShedCollected = new List<int>();
@@ -366,6 +378,10 @@ namespace NetworkPerformanceSystem.Runtime {
             /// <summary>A creature moved off a player over their creature allowance (M35), to a
             /// player with room. Queued behind every other creature move and reported apart.</summary>
             internal bool Shed;
+
+            /// <summary>Of those, one moved because the player's upload allowance is the one they
+            /// are held to (their upload is full): recorded as HandoffCause.Upload.</summary>
+            internal bool UploadShed;
         }
 
         // Diagnostics. Rescue and optimisation are counted apart on purpose: they are different
@@ -588,7 +604,7 @@ namespace NetworkPerformanceSystem.Runtime {
             CollectZonesToScan();
             GroupSharedBucket(zdoMan);
             TallyOwnedLoad(zdoMan, loadPenalty > 0f, _allowanceActive);
-            BuildCreatureRoom();
+            BuildCreatureRoom(now);
 
             SectorCache.Clear();
             _verdictsInUse = 0;
@@ -658,6 +674,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             if (_allowanceActive && ShedEntries.Count > 0) { SelectShedsGuarded(); }
             ApplyUpgrades(now);
+            NoteReceived();
             PruneHoldTable(now);
 
             // M35 reads this pass's creature tally; it decides the allowances the next pass uses.
@@ -1113,13 +1130,16 @@ namespace NetworkPerformanceSystem.Runtime {
 
         /// <summary>
         /// M35: how many more creatures each candidate may take this pass - its allowance less
-        /// what it owns - and whether it may take creatures moved off somebody else. Everyone
-        /// without an allowance gets int.MaxValue, which is everyone while M35 is off, so every
-        /// test against these lists then reads exactly as the arbiter did before it existed.
+        /// what it owns - whether it may take creatures moved off somebody else, and how much
+        /// upload room it has for them. Everyone without an allowance gets int.MaxValue, which is
+        /// everyone while M35 is off, so every test against these lists then reads exactly as the
+        /// arbiter did before it existed.
         /// </summary>
-        private static void BuildCreatureRoom() {
+        private static void BuildCreatureRoom(float now) {
             CreatureRoom.Clear();
             ShedReceiver.Clear();
+            UploadRoom.Clear();
+            RecentIn.Clear();
             PendingOut.Clear();
             PendingIn.Clear();
             ShedCollected.Clear();
@@ -1127,6 +1147,8 @@ namespace NetworkPerformanceSystem.Runtime {
             for (int i = 0; i < Candidates.Count; i++) {
                 int room = int.MaxValue;
                 bool receiver = false;
+                float upload = float.PositiveInfinity;
+                int recent = 0;
                 if (_allowanceActive) {
                     long uid = Candidates[i].Uid;
                     int allowance = PeerCapacity.AllowanceFor(uid);
@@ -1134,10 +1156,14 @@ namespace NetworkPerformanceSystem.Runtime {
                         OwnedCreatures.TryGetValue(uid, out int owned);
                         room = allowance - owned;
                     }
-                    receiver = Candidates[i].CanOwn && PeerCapacity.IsShedReceiver(uid);
+                    receiver = Candidates[i].CanOwn && PeerCapacity.IsShedReceiver(uid, now);
+                    upload = PeerCapacity.UploadRoomFor(uid);
+                    ReceivedLastPass.TryGetValue(uid, out recent);
                 }
                 CreatureRoom.Add(room);
                 ShedReceiver.Add(receiver);
+                UploadRoom.Add(upload);
+                RecentIn.Add(recent);
                 PendingOut.Add(0);
                 PendingIn.Add(0);
                 ShedCollected.Add(0);
@@ -1219,13 +1245,18 @@ namespace NetworkPerformanceSystem.Runtime {
             return target;
         }
 
-        private static void FillReceiverOptions(SectorVerdict verdict, bool shedReceiversOnly) {
+        /// <param name="uploadPerCreature">What one creature costs the upload it lands on,
+        /// bytes/sec, for a creature moved off a full upload: each creature given to a candidate
+        /// this pass or the last is taken off its upload room, and a candidate with none left is
+        /// not offered it. 0 otherwise.</param>
+        private static void FillReceiverOptions(SectorVerdict verdict, bool shedReceiversOnly, float uploadPerCreature = 0f) {
             ReceiverOptions.Clear();
             List<int> presentIndex = verdict.PresentIndex;
             for (int i = 0; i < presentIndex.Count; i++) {
                 int index = presentIndex[i];
                 Verdict score = verdict.PresentScore[i];
                 OwnedCreatures.TryGetValue(Candidates[index].Uid, out int owned);
+                float uploadRoom = UploadRoom[index] - (PendingIn[index] + RecentIn[index]) * uploadPerCreature;
                 ReceiverOptions.Add(new ReceiverOption {
                     Index = index,
                     Total = score.TotalCostMs,
@@ -1233,8 +1264,20 @@ namespace NetworkPerformanceSystem.Runtime {
                     Rtt = score.OwnerRttMs,
                     Room = CreatureRoom[index],
                     Load = owned + PendingIn[index],
-                    Eligible = Candidates[index].CanOwn && (!shedReceiversOnly || ShedReceiver[index]),
+                    Eligible = Candidates[index].CanOwn && (!shedReceiversOnly || ShedReceiver[index])
+                               && !(uploadPerCreature > 0f && uploadRoom <= 0f),
+                    UploadRoom = uploadRoom,
                 });
+            }
+        }
+
+        /// <summary>After the pass's moves: who was given creatures, for the next pass's upload
+        /// room (ReceivedLastPass).</summary>
+        private static void NoteReceived() {
+            ReceivedLastPass.Clear();
+            if (!_allowanceActive) { return; }
+            for (int i = 0; i < Candidates.Count && i < PendingIn.Count; i++) {
+                if (PendingIn[i] > 0) { ReceivedLastPass[Candidates[i].Uid] = PendingIn[i]; }
             }
         }
 
@@ -1301,7 +1344,8 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>
         /// Move creatures off every owner who is over their allowance: up to four a pass each, by
         /// CreatureLoadRules' order (not fighting first, then furthest from that owner), each to a
-        /// healthy player with room picked from that creature's own sector (PickReceiver). A
+        /// healthy player with room picked from that creature's own sector (PickReceiver) - the
+        /// one with the most upload room left when it is the owner's upload that is full. A
         /// creature nobody can take stays where it is and is counted as blocked; the allowance
         /// waits rather than stepping further while that is so (CreatureLoadRules.Step).
         /// </summary>
@@ -1317,12 +1361,15 @@ namespace NetworkPerformanceSystem.Runtime {
                 int room = CreatureRoom[ownerIndex];
                 int overage = room == int.MaxValue ? 0 : -room - PendingOut[ownerIndex];
                 int quota = CreatureLoadRules.ShedsThisPass(overage, CreatureLoadRules.MaxShedsPerOwnerPerPass);
+                long ownerUid = ShedEntries[i].Owner;
+                bool byUpload = quota > 0 && PeerCapacity.IsUploadLimited(ownerUid);
+                float perCreature = byUpload ? PeerCapacity.UploadPerCreature(ownerUid) : 0f;
 
                 int taken = 0;
                 for (int k = i; k < end && taken < quota; k++) {
                     ShedEntry entry = ShedEntries[k];
-                    FillReceiverOptions(entry.Sector, shedReceiversOnly: true);
-                    int pick = CreatureLoadRules.PickReceiver(ReceiverOptions, ownerIndex, _challengeMarginMs);
+                    FillReceiverOptions(entry.Sector, shedReceiversOnly: true, perCreature);
+                    int pick = CreatureLoadRules.PickReceiver(ReceiverOptions, ownerIndex, _challengeMarginMs, byUpload);
                     if (pick < 0) {
                         LastPassShedBlocked++;
                         TotalShedBlocked++;
@@ -1334,7 +1381,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     PendingSimulated.Add(new PendingMove {
                         Zdo = entry.Zdo, NewOwner = receiver,
                         Priority = ownerTotal - ReceiverOptions[pick].Total,      // staleness won (usually lost) by the move
-                        Sector = entry.Sector, Creature = true, Shed = true, OldOwner = entry.Owner,
+                        Sector = entry.Sector, Creature = true, Shed = true, UploadShed = byUpload, OldOwner = entry.Owner,
                     });
                     ReserveCreature(receiver, entry.Owner);
                     taken++;
@@ -2649,7 +2696,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     if (move.Leader) {
                         Monitoring.NoteCause(move.Zdo, HandoffCause.Leader);
                     } else {
-                        HandoffCause cause = move.Shed ? HandoffCause.Capacity
+                        HandoffCause cause = move.Shed ? (move.UploadShed ? HandoffCause.Upload : HandoffCause.Capacity)
                                            : move.Proximity ? HandoffCause.Proximity
                                            : HandoffCause.Optimise;
                         Monitoring.NoteCause(move.Zdo, cause, move.Priority, DescribeCandidates(move));
@@ -2866,6 +2913,11 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (room != int.MaxValue) {
                     sb.Append(",\"room\":").Append(room.ToString(invariant));
                 }
+                // The upload room the creature allowance saw for them, KB/s (left out when unread).
+                int index = verdict.PresentIndex[i];
+                if (_allowanceActive && index < UploadRoom.Count && !float.IsInfinity(UploadRoom[index])) {
+                    sb.Append(",\"upRoomKB\":").Append((UploadRoom[index] / 1024f).ToString("0", invariant));
+                }
                 sb.Append('}');
             }
             sb.Append(']');
@@ -2963,6 +3015,9 @@ namespace NetworkPerformanceSystem.Runtime {
             Helpers.Clear();
             CreatureRoom.Clear();
             ShedReceiver.Clear();
+            UploadRoom.Clear();
+            RecentIn.Clear();
+            ReceivedLastPass.Clear();
             PendingOut.Clear();
             PendingIn.Clear();
             ShedCollected.Clear();

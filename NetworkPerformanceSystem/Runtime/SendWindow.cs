@@ -108,10 +108,41 @@ namespace NetworkPerformanceSystem.Runtime {
 
             LatencyRegistry.TryGetSteamSendRate(uid, out int observed);
             rate = PickRate(observed, SteamTransport.PinnedSendRateBytesPerSec);
-            window = Compute(rate, LatencyRegistry.MeasuredRttMs(uid), SendIntervalMs(),
-                             ValConfig.SendWindowBdpFactor.Value, ValConfig.SendWindowMaxBytes.Value);
+            float rtt = WindowRttMs(LatencyRegistry.MeasuredRttMs(uid), LatencyRegistry.BaselineRttMs(uid));
+            window = Compute(rate, rtt, SendIntervalMs(),
+                             ValConfig.SendWindowBdpFactor.Value, EffectiveMaxBytes(rate, ValConfig.SendWindowMaxBytes.Value));
             return true;
         }
+
+        /// <summary>
+        /// A window this mod hands out never has to be bigger than a quarter of a second at the
+        /// connection's rate, and Max Window Bytes was sized for the game's 150 KB/s: at 500 KB/s
+        /// and 150ms the window needs about 113 KB, and 65536 would hold that player to about
+        /// 300 KB/s. So the ceiling follows the rate up to this, never below the setting.
+        /// </summary>
+        internal const int RateScaledMaxBytes = 196608;
+        internal const float RateScaledSeconds = 0.25f;
+
+        /// <summary>The window ceiling for a connection paced at this rate: Max Window Bytes, or a
+        /// quarter of a second of the rate (at most RateScaledMaxBytes), whichever is larger. Pure.</summary>
+        internal static int EffectiveMaxBytes(int rateBytesPerSec, int configuredMaxBytes) {
+            int scaled = Mathf.Min(RateScaledMaxBytes, Mathf.RoundToInt(rateBytesPerSec * RateScaledSeconds));
+            return Mathf.Max(configuredMaxBytes, scaled);
+        }
+
+        /// <summary>
+        /// The round trip the window is sized for: the smoothed one, but never more than half
+        /// again the connection's best. A queue - Steam's, a router's - lengthens the measured
+        /// round trip, which would grow the window, which keeps the queue full: on a link that
+        /// queues rather than drops the two chase each other toward half a second. With no
+        /// baseline yet (the first half minute of a connection) the smoothed figure stands. Pure.
+        /// </summary>
+        internal static float WindowRttMs(float smoothedRttMs, float baselineRttMs) {
+            if (baselineRttMs <= 0f) { return smoothedRttMs; }
+            return Mathf.Min(smoothedRttMs, baselineRttMs * BaselineRttCap);
+        }
+
+        internal const float BaselineRttCap = 1.5f;
 
         /// <summary>How long this machine waits between sends to one peer: M2b's interval while it
         /// runs, otherwise vanilla's 0.05s gate (or ReturnToSender's, which is the same).</summary>

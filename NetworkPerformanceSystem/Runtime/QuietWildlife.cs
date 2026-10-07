@@ -5,7 +5,8 @@ using UnityEngine;
 namespace NetworkPerformanceSystem.Runtime {
 
     /// <summary>
-    /// M31 - fish and birds send themselves a few times a second instead of on every frame.
+    /// M31 - fish, birds and floating debris send themselves a few times a second instead of on
+    /// every frame.
     ///
     /// Fish (the game's Fish component - Fish1..Fish12 and anything a content mod builds on it) and
     /// birds (RandomFlyingBird - Seagal, Crow, AshCrow) are synced by an ordinary ZSyncTransform.
@@ -17,7 +18,7 @@ namespace NetworkPerformanceSystem.Runtime {
     /// second from one player on a lake. Neither M27 nor M28 can see them: both act on creatures,
     /// and these are not Characters.
     ///
-    /// Two halves, one setting:
+    /// Two halves, one setting (floating objects have their own; see below):
     ///
     ///   * Owner side (QuietWildlifePatches). On the machine that simulates one, OwnerSync is
     ///     skipped outright on every frame that is not due: a fish is written 5 times a second, a
@@ -38,25 +39,49 @@ namespace NetworkPerformanceSystem.Runtime {
     /// already classifies as Interactive there, and moving it would change who owns it. The
     /// classification below is its own cache and nothing else reads it.
     ///
+    /// A third kind, Floating, has a setting of its own (Quiet Floating Objects): anything synced
+    /// by a ZSyncTransform that carries the game's Floating component and is not a Character,
+    /// Ship, cart, fishing float, fish or bird - drifting ice (IceShelf_*, the sea ice ice1), tree
+    /// logs, dropped items and tombstones. Floating.CustomFixedUpdate wakes the body on every
+    /// physics step while it is in water, so it never comes to rest and its owner writes it on
+    /// every frame. The 2026-10-07 Jotun invasion recording had them at about 28% of everything
+    /// players uploaded in the fight, and sailing through sea ice, ice1 alone at 264 KB/s of
+    /// uploads and half of each player's download. Written 5 times a second like fish; relayed at
+    /// most about 6 / 2 times a second within / beyond 32 m. Unlike fish and birds, players stand
+    /// on these: anything within FloatingCloseMetres of another player, or that a player's ZDO
+    /// says they are standing on (the SyncTransform connection Character.GetRelativePosition
+    /// writes), is never held on either side. A separate setting so a field recording can switch
+    /// it on and off without touching fish and birds, and so its counts are kept apart.
+    ///
     /// The schedule is stateless - a phase picked from the ZDO id, so no per-object table to
     /// prune - and runs on a double clock, because the server can own fish too and a float
     /// Time.time only counts in 62 ms steps after a week of uptime. Everything that decides is
-    /// pure and names no game type, so the offline harness can table it; the classification and
-    /// the hook cannot run offline (Fish, RandomFlyingBird and ZSyncTransform do not load there).
+    /// pure - numbers, ZDOIDs and vectors, nothing native - so the offline harness can table it;
+    /// the classification and the hook cannot run offline (Fish, RandomFlyingBird, Floating and
+    /// ZSyncTransform do not load there).
     /// </summary>
     internal static class QuietWildlife {
 
-        internal enum Kind : byte { None, Fish, Bird }
+        internal enum Kind : byte { None, Fish, Bird, Floating }
 
         internal const float FishOwnerInterval = 0.2f;
         internal const float BirdOwnerInterval = 0.1f;
+        internal const float FloatingOwnerInterval = 0.2f;
 
         internal const float RelayNearMetres = 32f;
         internal const float FishRelayNearInterval = 0.17f;
         internal const float FishRelayFarInterval = 0.5f;
         internal const float BirdRelayNearInterval = 0.085f;
         internal const float BirdRelayFarInterval = 0.2f;
+        internal const float FloatingRelayNearInterval = 0.17f;
+        internal const float FloatingRelayFarInterval = 0.5f;
         internal const float RelayNearSq = RelayNearMetres * RelayNearMetres;
+
+        /// <summary>A floating object this close to another player is written and relayed on
+        /// every frame, as the game does: they may be about to step onto it, and a large ice
+        /// shelf's pivot can be several metres from where somebody stands on it.</summary>
+        internal const float FloatingCloseMetres = 10f;
+        internal const float FloatingCloseSq = FloatingCloseMetres * FloatingCloseMetres;
 
         private static readonly Dictionary<int, Kind> KindCache = new Dictionary<int, Kind>();
 
@@ -67,7 +92,8 @@ namespace NetworkPerformanceSystem.Runtime {
         private static readonly int[] FastPrefab = new int[FastSlots];
         private static readonly Kind[] FastKind = new Kind[FastSlots];
 
-        // Since start. Main thread only, like the game code that calls in.
+        // Since start. Main thread only, like the game code that calls in. Fish and birds here;
+        // floating objects below, so each setting's counts stand alone.
         internal static long FramesHeld;
         internal static long FramesPassed;
         internal static long RelayListed;
@@ -76,17 +102,37 @@ namespace NetworkPerformanceSystem.Runtime {
 
         internal static long RelayHeld => RelayHeldNear + RelayHeldFar;
 
-        /// <summary>Read on every call, so the setting can be switched mid-session.</summary>
+        internal static long FloatingFramesHeld;
+        internal static long FloatingFramesPassed;      // due
+        internal static long FloatingFramesClose;       // not due, but another player close or on it
+        internal static long FloatingRelayListed;
+        internal static long FloatingRelayHeldNear;
+        internal static long FloatingRelayHeldFar;
+
+        internal static long FloatingRelayHeld => FloatingRelayHeldNear + FloatingRelayHeldFar;
+
+        /// <summary>Fish and birds. Read on every call, so the setting can be switched mid-session.</summary>
         internal static bool OwnerActive =>
             PatchGuard.IsActive(Mechanism.QuietWildlife)
             && ValConfig.QuietWildlifeUpdates != null
             && ValConfig.QuietWildlifeUpdates.Value;
 
+        /// <summary>Floating objects, under their own setting and the same hook.</summary>
+        internal static bool FloatingOwnerActive =>
+            PatchGuard.IsActive(Mechanism.QuietWildlife)
+            && ValConfig.QuietFloatingObjects != null
+            && ValConfig.QuietFloatingObjects.Value;
+
+        internal static bool OwnerActiveFor(Kind kind) => kind == Kind.Floating ? FloatingOwnerActive : OwnerActive;
+
         /// <summary>The host half rides on M28's CreateSyncList postfix, so it stands down with
         /// that hook as well as with its own.</summary>
         internal static bool RelayActive => OwnerActive && PatchGuard.IsActive(Mechanism.CreaturePacing);
 
-        /// <summary>Fish, bird, or neither, from the prefab. Cached; see LookupKind.</summary>
+        internal static bool FloatingRelayActive => FloatingOwnerActive && PatchGuard.IsActive(Mechanism.CreaturePacing);
+
+        /// <summary>Fish, bird, floating object or none of them, from the prefab. Cached; see
+        /// LookupKind.</summary>
         internal static Kind KindOf(ZDO zdo) {
             int prefab = zdo.GetPrefab();
             int slot = (prefab ^ (prefab >> 16)) & (FastSlots - 1);
@@ -104,11 +150,18 @@ namespace NetworkPerformanceSystem.Runtime {
             return Remember(slot, prefab, kind);
         }
 
-        /// <summary>From the component, not the name, so a content mod's fish or birds built on
-        /// the game's own classes are covered.</summary>
+        /// <summary>From the component, not the name, so a content mod's fish, birds or floating
+        /// debris built on the game's own classes are covered. A floating object is left alone
+        /// when it is something a player drives or rides (ship, cart), a creature, or a fishing
+        /// float - somebody's catch is drawn from it.</summary>
         private static Kind LookupKind(GameObject go) {
             if (go.GetComponent<Fish>() != null) { return Kind.Fish; }
             if (go.GetComponent<RandomFlyingBird>() != null) { return Kind.Bird; }
+            if (go.GetComponent<Floating>() != null && go.GetComponent<ZSyncTransform>() != null
+                && go.GetComponent<Character>() == null && go.GetComponent<Ship>() == null
+                && go.GetComponent<Vagon>() == null && go.GetComponent<FishingFloat>() == null) {
+                return Kind.Floating;
+            }
             return Kind.None;
         }
 
@@ -124,8 +177,20 @@ namespace NetworkPerformanceSystem.Runtime {
         /// is never due and so is held - nothing moves then anyway.
         /// </summary>
         internal static bool HoldThisFrame(ZDO zdo, Kind kind, double now, float deltaTime) {
-            if (IsDue(now, deltaTime, PhaseFraction(zdo.m_uid.ID), OwnerIntervalSeconds(kind))
-                || (kind == Kind.Fish && IsHooked(zdo))) {
+            bool due = IsDue(now, deltaTime, PhaseFraction(zdo.m_uid.ID), OwnerIntervalSeconds(kind));
+            if (kind == Kind.Floating) {
+                if (due) {
+                    FloatingFramesPassed++;
+                    return false;
+                }
+                if (CloseToAnotherPlayer(zdo, now)) {
+                    FloatingFramesClose++;
+                    return false;
+                }
+                FloatingFramesHeld++;
+                return true;
+            }
+            if (due || (kind == Kind.Fish && IsHooked(zdo))) {
                 FramesPassed++;
                 return false;
             }
@@ -138,23 +203,95 @@ namespace NetworkPerformanceSystem.Runtime {
         /// simply sent at the game's rate.</summary>
         internal static bool IsHooked(ZDO zdo) => zdo.GetInt(ZDOVars.s_hooked) == 1;
 
+        // -- who else is near a floating object --------------------------------------------------
+
+        /// <summary>Every other player's character this machine has loaded: where its ZDO says it
+        /// is, and what it says it is standing on. Rebuilt on the first ask of each frame - keyed
+        /// on the frame's game time, which every OwnerSync in one frame shares - and only asked
+        /// on frames a floating object is not due, so a machine simulating none never builds it.
+        /// A paused game repeats a time; it then reuses the last list, and nothing moves anyway.</summary>
+        private static readonly List<Vector3> OtherPlayers = new List<Vector3>();
+        private static readonly List<ZDOID> StoodOn = new List<ZDOID>();
+        private static double _otherPlayersAt = double.NaN;
+
+        private static bool CloseToAnotherPlayer(ZDO zdo, double now) {
+            if (now != _otherPlayersAt) {                     // NaN, before the first: never equal
+                _otherPlayersAt = now;
+                CollectOtherPlayers();
+            }
+            return IsClose(zdo.m_uid, zdo.GetPosition(), OtherPlayers, StoodOn, FloatingCloseSq);
+        }
+
+        /// <summary>Read from each character's ZDO rather than its transform: managed reads only,
+        /// and a remote player's ZDO is exactly what this machine knows of them.</summary>
+        private static void CollectOtherPlayers() {
+            OtherPlayers.Clear();
+            StoodOn.Clear();
+            List<Player> players = Player.GetAllPlayers();
+            Player local = Player.m_localPlayer;
+            for (int i = 0; i < players.Count; i++) {
+                Player player = players[i];
+                if ((object)player == null || ReferenceEquals(player, local)) { continue; }
+                ZNetView view = player.m_nview;
+                if ((object)view == null) { continue; }
+                ZDO character = view.GetZDO();
+                if (character == null) { continue; }
+                OtherPlayers.Add(character.GetPosition());
+                ZDOID under = character.GetConnectionZDOID(ZDOExtraData.ConnectionType.SyncTransform);
+                if (!under.IsNone()) { StoodOn.Add(under); }
+            }
+        }
+
+        /// <summary>What a player's ZDO says they are standing on, for the host's relay: the
+        /// object their game positions them relative to. None when they stand on nothing with a
+        /// ZNetView, or their character is not known here.</summary>
+        internal static ZDOID StandingOn(ZDOMan.ZDOPeer peer) {
+            ZNetPeer net = peer.m_peer;
+            ZDOMan man = ZDOMan.instance;
+            if (net == null || man == null || net.m_characterID.IsNone()) { return ZDOID.None; }
+            ZDO character = man.GetZDO(net.m_characterID);
+            return character != null ? character.GetConnectionZDOID(ZDOExtraData.ConnectionType.SyncTransform) : ZDOID.None;
+        }
+
         // -- pure ------------------------------------------------------------------------------
 
         internal static float OwnerIntervalSeconds(Kind kind) {
             switch (kind) {
                 case Kind.Fish: return FishOwnerInterval;
                 case Kind.Bird: return BirdOwnerInterval;
+                case Kind.Floating: return FloatingOwnerInterval;
                 default: return 0f;
             }
         }
 
+        /// <summary>The shortest gap between two relays of one object to one player. 0 is never
+        /// held: a floating object within FloatingCloseMetres of the player.</summary>
         internal static float RelayIntervalSeconds(Kind kind, float distanceSq) {
             bool near = distanceSq < RelayNearSq;
             switch (kind) {
                 case Kind.Fish: return near ? FishRelayNearInterval : FishRelayFarInterval;
                 case Kind.Bird: return near ? BirdRelayNearInterval : BirdRelayFarInterval;
+                case Kind.Floating:
+                    if (distanceSq < FloatingCloseSq) { return 0f; }
+                    return near ? FloatingRelayNearInterval : FloatingRelayFarInterval;
                 default: return 0f;
             }
+        }
+
+        /// <summary>Whether a floating object at <paramref name="position"/> is stood on by, or
+        /// closer than the square root of <paramref name="closeSq"/> to, any of these players.</summary>
+        internal static bool IsClose(ZDOID id, Vector3 position, List<Vector3> players, List<ZDOID> stoodOn, float closeSq) {
+            for (int i = 0; i < stoodOn.Count; i++) {
+                if (stoodOn[i] == id) { return true; }
+            }
+            for (int i = 0; i < players.Count; i++) {
+                Vector3 player = players[i];
+                float dx = position.x - player.x;
+                float dy = position.y - player.y;
+                float dz = position.z - player.z;
+                if (dx * dx + dy * dy + dz * dz < closeSq) { return true; }
+            }
+            return false;
         }
 
         /// <summary>Where in its interval an object's writes fall, in [0, 1). Ids are handed out in
@@ -185,6 +322,15 @@ namespace NetworkPerformanceSystem.Runtime {
             RelayListed = 0;
             RelayHeldNear = 0;
             RelayHeldFar = 0;
+            FloatingFramesHeld = 0;
+            FloatingFramesPassed = 0;
+            FloatingFramesClose = 0;
+            FloatingRelayListed = 0;
+            FloatingRelayHeldNear = 0;
+            FloatingRelayHeldFar = 0;
+            OtherPlayers.Clear();
+            StoodOn.Clear();
+            _otherPlayersAt = double.NaN;
         }
     }
 }

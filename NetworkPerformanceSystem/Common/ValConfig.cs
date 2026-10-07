@@ -86,6 +86,7 @@ namespace NetworkPerformanceSystem {
 
         // M35 - a player whose game slows down under a fight simulates fewer creatures
         public static ConfigEntry<bool> BalanceCreaturesByFrameRate;
+        public static ConfigEntry<bool> BalanceCreaturesByUpload;
         public static ConfigEntry<float> CreatureLoadMinOwnerFps;
         public static ConfigEntry<int> CreatureLoadMinAllowance;
 
@@ -128,6 +129,8 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<bool> SendFightingCreaturesFirst;
         // M31 - fish and birds send themselves a few times a second
         public static ConfigEntry<bool> QuietWildlifeUpdates;
+        // M31 - so do floating ice, logs and dropped items, under a setting of their own
+        public static ConfigEntry<bool> QuietFloatingObjects;
 
         // M33 - buildings, trees and rocks a player already has are not re-sent for a change nobody can see
         public static ConfigEntry<bool> HoldUnchangedStructures;
@@ -144,6 +147,13 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<int> LossBackoffFloorKBps;
         public static ConfigEntry<int> LossBackoffHoldSeconds;
         public static ConfigEntry<int> LossBackoffRecoverSeconds;
+
+        // M37 - the send rate and players' upload grants found from load and congestion
+        public static ConfigEntry<bool> AutoSendRate;
+        public static ConfigEntry<int> AutoSendRateMaxKBps;
+        public static ConfigEntry<bool> AutoPlayerUploads;
+        public static ConfigEntry<int> ServerUploadLimitKBps;
+        public static ConfigEntry<int> ServerDownloadLimitKBps;
 
         // M10 - configurable player limit
         public static ConfigEntry<bool> EnablePlayerLimitOverride;
@@ -336,11 +346,13 @@ namespace NetworkPerformanceSystem {
             // Creature load
             BalanceCreaturesByFrameRate = BindServerConfig("Creature Load", "Balance Creatures By Frame Rate", true,
                 "Players with this mod tell the server how smoothly their game is running. When a player's frame rate stays under Min Owner FPS while they simulate a lot of creatures in a fight, the server gives them fewer creatures to run and moves the rest, a few at a time, to players whose games have room. Creatures only that player is near stay with them. If moving creatures does not make their game faster, they get them back and are left alone for ten minutes. Players without the mod are treated as before. Needs Arbitrate Creatures.");
+            BalanceCreaturesByUpload = BindServerConfig("Creature Load", "Balance Creatures By Upload", true,
+                "Every creature a player runs is sent from their machine, so a player running a big fight can fill their upload to the server, and then their creatures stall for everyone else. When a player's upload stays full and a higher upload rate (Auto Player Uploads) cannot fix it soon, the server gives them fewer creatures to run and moves the rest, a few at a time, to players whose uploads have room. Creatures only that player is near stay with them. If their upload is still full at Min Creature Allowance, they get their creatures back and are left alone for ten minutes. Works with Auto Send Rate off too. Players without the mod are treated as before. Needs Arbitrate Creatures.");
             CreatureLoadMinOwnerFps = BindServerConfig("Creature Load", "Min Owner FPS", 25f,
                 "Frame rate below which a player counts as struggling, held for 10 seconds. A player at or above this plus 5 counts as having room to take creatures from someone else.",
                 false, 10f, 60f);
             CreatureLoadMinAllowance = BindServerConfig("Creature Load", "Min Creature Allowance", 4,
-                "The fewest creatures a struggling player is ever held to, and the number they must own before their frame rate is looked at.",
+                "The fewest creatures a struggling player is ever held to, and the number they must own before their frame rate or upload is looked at.",
                 true, 0, 64);
 
             // Arbitration persistance
@@ -391,6 +403,8 @@ namespace NetworkPerformanceSystem {
                 "When a player's upload is full, send the creatures they are simulating that are alert or chasing someone ahead of everything else they have changed, right after players and ships. Without this they wait their turn behind every fire, smelter and dropped item that player also simulates, and freeze for everyone else for a second or more. Changes only the order, never what is sent. Runs on each player's game that has this mod, using the server's setting.");
             QuietWildlifeUpdates = BindServerConfig("Creature Updates", "Quiet Wildlife", true,
                 "Fish, seagulls and crows send themselves 5 times a second (fish) or 10 times a second (birds) instead of on every frame. They are always moving, so without this whoever simulates them re-sends each one up to 20 times a second, and on a lake or coast they can be a third of a player's upload. The server also passes them on to each player at most about 6 / 12 times a second (2 / 5 beyond 32 m), which covers players who do not have this mod. A fish on a fishing line is not affected. Runs on each player's game that has this mod and on the server, using the server's setting.");
+            QuietFloatingObjects = BindServerConfig("Creature Updates", "Quiet Floating Objects", true,
+                "Drifting ice, floating logs, dropped items and anything else bobbing in water send themselves 5 times a second instead of on every frame. The water never lets them settle, so without this whoever simulates them re-sends each one up to 30 times a second; in a fight on a coast or while sailing through sea ice they can be a quarter to half of every player's connection. Anything within 10 m of another player, or that a player is standing on, still goes out on every frame. The server also passes them on to each player at most about 6 times a second (2 beyond 32 m), which covers players who do not have this mod. Ships, carts and creatures are not affected. Runs on each player's game that has this mod and on the server, using the server's setting.");
 
             // Structure updates
             HoldUnchangedStructures = BindServerConfig("Structure Updates", "Hold Unchanged Structures", true,
@@ -403,8 +417,21 @@ namespace NetworkPerformanceSystem {
             EnableSteamTransportTuning = BindServerConfig("Steam Transport", "Enable Transport Tuning", true,
                 "Let this mod write Steam's global networking config (send rate and Nagle) and log a before/after readback of what the transport is actually doing. Send Rate KBps ships at the game's value; Nagle Micros ships at 0 rather than the game's 5000, so turning this on by itself only removes Nagle's hold-back delay. Requires the Steam backend; on crossplay-only processes it stands down quietly.");
             SteamSendRateKBps = BindServerConfig("Steam Transport", "Send Rate KBps", 0,
-                "The rate Steam sends at on every connection from the host, in kilobytes/sec. 0 leaves the game's 150. Steam has no congestion control here: this is a fixed pace, not a ceiling it adapts under, and it never slows down for a player whose connection cannot keep up - that player gets packet loss and resends instead (nps_stats flags it as LOSSY). Budget the host's upload for players x this value: 10 players at 500 is 40 Mbit/s worst case. Written to both of Steam's rate bounds, on the host only - players' own uploads stay at the game's rate. Values from 1 to 31 are raised to 32. Applies immediately, no restart needed.",
+                "A fixed rate Steam sends at on every connection from the host, in kilobytes/sec. 0 lets 'Auto Send Rate' choose it, or leaves the game's 150 when that is off; any other value switches 'Auto Send Rate' off. Steam has no congestion control here: this is a fixed pace, not a ceiling it adapts under, and it never slows down for a player whose connection cannot keep up - that player gets packet loss and resends instead (nps_stats flags it as LOSSY). Budget the host's upload for players x this value: 10 players at 500 is 40 Mbit/s worst case. Written to both of Steam's rate bounds, on the host only - players' own uploads stay at the game's rate. Values from 1 to 31 are raised to 32. Applies immediately, no restart needed.",
                 false, 0, 4096);
+            AutoSendRate = BindServerConfig("Steam Transport", "Auto Send Rate", true,
+                "Let the server find the rate it sends to players at by itself, between the game's 150 KB/s and 'Auto Send Rate Max KBps', instead of a fixed one. It only goes up while a player's connection is full, a step at a time, and only as far as the server's line has shown it can carry. It comes back down when several players lose packets or their ping rises together, remembers where that happened, and shares that among however many players there are, so more players means less each. A player whose own connection cannot take a higher rate is held lower by 'Enable Loss Backoff', which this needs. Off, or 'Send Rate KBps' set, means a fixed rate as before.");
+            AutoSendRateMaxKBps = BindServerConfig("Steam Transport", "Auto Send Rate Max KBps", 500,
+                "The most 'Auto Send Rate' will send any one player, and grant any one player for their own upload, in kilobytes/sec.",
+                false, 150, 1000);
+            AutoPlayerUploads = BindServerConfig("Steam Transport", "Auto Player Uploads", true,
+                "Let each player's own game upload to the server faster than the game's 150 KB/s when their upload is full and arriving cleanly - usually the player running the creatures in a big fight. The server decides each player's rate the same way as its own and tells their game; it comes back down for a player whose connection starts losing packets. Players need this mod; everyone else uploads at the game's rate.");
+            ServerUploadLimitKBps = BindServerConfig("Steam Transport", "Server Upload Limit KBps", 0,
+                "What the server's line can send in total, in kilobytes/sec, if you know it (1 Mbit/s is about 122 KB/s). 'Auto Send Rate' then never plans for more than nine tenths of it across all players. 0 lets it find out, by backing off when the line starts losing packets.",
+                false, 0, 1000000);
+            ServerDownloadLimitKBps = BindServerConfig("Steam Transport", "Server Download Limit KBps", 0,
+                "The same for what the server's line can receive, which 'Auto Player Uploads' shares among players. 0 lets it find out.",
+                false, 0, 1000000);
             SteamNagleMicros = BindServerConfig("Steam Transport", "Nagle Micros", 0,
                 "Microseconds Steam may hold a small reliable message back to coalesce it with the next one. Vanilla and Steam both default to 5000 (5ms), which is up to 5ms added in each direction on every update for a saving that mattered on a modem. 0 sends immediately. This mod already batches at the ZDO layer, so there is very little left for Nagle to coalesce - which is why 0 is the default here rather than vanilla's 5000.",
                 false, 0, 100000);
@@ -510,6 +537,7 @@ namespace NetworkPerformanceSystem {
             DamageNumbers.SettingChanged += OnDamageNumbersSettingChanged;
 
             BalanceCreaturesByFrameRate.SettingChanged += OnCreatureLoadSettingChanged;
+            BalanceCreaturesByUpload.SettingChanged += OnCreatureLoadSettingChanged;
             CreatureLoadMinOwnerFps.SettingChanged += OnCreatureLoadSettingChanged;
             CreatureLoadMinAllowance.SettingChanged += OnCreatureLoadSettingChanged;
 

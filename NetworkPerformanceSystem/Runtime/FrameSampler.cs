@@ -89,6 +89,18 @@ namespace NetworkPerformanceSystem.Runtime {
             if (_ticking) { Window.AddSim(milliseconds); }
         }
 
+        /// <summary>
+        /// M37: one reading of this client's connection to the host, from the ping postfix. The
+        /// host can see what arrives from a player but not what is still waiting to leave their
+        /// machine, and a full upload is the one thing that says a higher grant would be used.
+        /// </summary>
+        internal static void NoteUpload(RttProbe.LinkStatus link) {
+            if (!_ticking || NpsEnv.IsHost()) { return; }
+            float delivered = link.OutBytesPerSec * (link.QualityRemote >= 0f ? link.QualityRemote : 1f);
+            Window.AddUpload(link.PendingBytes, link.QualityRemote,
+                             ThroughputRules.IsFullSample(delivered, link.PendingBytes, link.SendRateBytesPerSec));
+        }
+
         private static void Deliver(FrameReport report) {
             if (NpsEnv.IsHost()) {
                 PeerCapacity.OnReport(NpsEnv.LocalSessionId(), report, Time.realtimeSinceStartup);

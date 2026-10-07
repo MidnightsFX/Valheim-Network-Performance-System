@@ -211,6 +211,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendSendTruncation(sb);
             AppendTransport(sb);
             AppendLossBackoff(sb);
+            AppendAutoSendRate(sb);
             AppendTimeouts(sb);
             AppendPeerLiveness(sb);
             AppendEarlyZdoData(sb);
@@ -221,6 +222,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendFightingCreaturesFirst(sb);
             AppendCreaturePacing(sb);
             AppendQuietWildlife(sb);
+            AppendQuietFloating(sb);
             AppendStructureUpdates(sb);
             AppendStatusEffectRepeats(sb);
             AppendPlayerHistoryRepeats(sb);
@@ -287,15 +289,17 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.QuietCreatures: return ValConfig.QuietIdleCreatures.Value;
                 case Mechanism.CreaturePacing: return ValConfig.PaceCreatureSends.Value;
                 case Mechanism.StatusEffectRepeats: return ValConfig.LimitRepeatedStatusEffects.Value;
-                case Mechanism.QuietWildlife: return ValConfig.QuietWildlifeUpdates.Value;
+                case Mechanism.QuietWildlife: return ValConfig.QuietWildlifeUpdates.Value || ValConfig.QuietFloatingObjects.Value;
                 case Mechanism.PlayerHistoryRepeats: return ValConfig.SendPlayerHistoryOnlyWhenChanged.Value;
                 case Mechanism.StructureUpdates: return ValConfig.HoldUnchangedStructures.Value;
                 // The measurement, like RttSampling: what M35 does with it is what the config controls.
                 case Mechanism.FrameReport: return true;
-                case Mechanism.CreatureAllowance: return ValConfig.BalanceCreaturesByFrameRate.Value && ValConfig.OwnershipArbitrateCreatures.Value;
+                case Mechanism.CreatureAllowance: return (ValConfig.BalanceCreaturesByFrameRate.Value || ValConfig.BalanceCreaturesByUpload.Value)
+                                                         && ValConfig.OwnershipArbitrateCreatures.Value;
                 // Everyone Nearby is the game's behaviour, and needs nothing from this mechanism
                 // beyond the relay distance M7 applies.
                 case Mechanism.DamageNumbers: return DamageNumbers.Current != DamageNumbers.Mode.EveryoneNearby;
+                case Mechanism.AutoSendRate: return ValConfig.EnableSteamTransportTuning.Value && ValConfig.AutoSendRate.Value && ValConfig.SteamSendRateKBps.Value <= 0;
                 default: return true;
             }
         }
@@ -519,7 +523,9 @@ namespace NetworkPerformanceSystem.Runtime {
 
             int pinned = SteamTransport.PinnedSendRateBytesPerSec;
             int configured = ValConfig.SteamSendRateKBps.Value;
-            string setting = configured > 0 ? $"{configured} KB/s set" : "game default";
+            string setting = configured > 0 ? $"{configured} KB/s set"
+                           : AutoSendRate.Wanted ? "chosen by Auto Send Rate, see below"
+                           : "game default";
             if (!NpsEnv.IsHost()) { setting += ", not applied on a client"; }
             string backedOff = LossBackoff.BackedOffNow > 0 ? $" except {LossBackoff.BackedOffNow} backed off (see Loss backoff)" : "";
             sb.AppendLine(pinned > 0
@@ -573,8 +579,9 @@ namespace NetworkPerformanceSystem.Runtime {
 
             int floor = LossBackoff.FloorBytesPerSec;
             sb.AppendLine($"  rule             under {ValConfig.LossBackoffThreshold.Value * 100f:F0}% delivered for {ValConfig.LossBackoffHoldSeconds.Value}s: a quarter off that player's rate, never below {floor / 1024} KB/s;");
-            sb.AppendLine($"                   clean for {ValConfig.LossBackoffRecoverSeconds.Value}s: one step back up, until it follows Send Rate KBps again;");
-            sb.AppendLine($"                   still losing at the floor and no better than when it started: straight back to Send Rate KBps, and never stepped down again this session");
+            sb.AppendLine($"                   clean for {ValConfig.LossBackoffRecoverSeconds.Value}s: one step back up, until it follows the send rate again;");
+            sb.AppendLine($"                   still losing at the floor and no better than when it started: straight back to the send rate (at most the game's), and never stepped down again this session;");
+            sb.AppendLine($"                   losing packets above the game's rate: that rate is the player's ceiling for 10 minutes or more");
             if (floor >= pinned) {
                 sb.AppendLine($"  floor {floor / 1024} KB/s is not below the send rate {pinned / 1024} KB/s: nothing to step down to");
             }
@@ -584,17 +591,20 @@ namespace NetworkPerformanceSystem.Runtime {
             bool any = false;
             for (int i = 0; i < peers.Count; i++) {
                 if (!LossBackoff.TryGetView(peers[i].m_uid, out LossBackoff.View view)) { continue; }
-                if (view.Steps == 0 && !view.Lossy && !view.Exempt) { continue; }
+                if (view.Steps == 0 && !view.Lossy && !view.Exempt && view.CeilingBytesPerSec == 0) { continue; }
                 if (!any) {
                     sb.AppendLine("  name                 delivered  rate now   global    steps  backed off for");
                     any = true;
                 }
                 string name = string.IsNullOrEmpty(peers[i].m_playerName) ? "(connecting)" : peers[i].m_playerName;
                 string delivered = view.HasSample ? $"{view.Delivered * 100f:F1}%" : "-";
-                string rateNow = view.Steps > 0 ? $"{view.OverrideBytesPerSec / 1024}KB/s" : $"{pinned / 1024}KB/s";
+                string rateNow = view.OverrideBytesPerSec > 0 ? $"{view.OverrideBytesPerSec / 1024}KB/s" : $"{pinned / 1024}KB/s";
                 string since = view.Exempt ? $"exempt {Elapsed(now - view.ExemptSince)} - loss not caused by the rate"
                              : view.Steps > 0 ? Elapsed(now - view.BackedOffSince)
                              : "(hold running)";
+                if (view.CeilingBytesPerSec > 0) {
+                    since += $", lost packets at {view.CeilingBytesPerSec / 1024}KB/s (ceiling for {Elapsed(view.CeilingUntil - now)} more)";
+                }
                 string steps = view.Exempt ? "-" : view.Steps.ToString();
                 sb.AppendLine($"  {Pad(name, 20)} {Pad(delivered, 10)} {Pad(rateNow, 10)} {Pad($"{pinned / 1024}KB/s", 9)} {Pad(steps, 6)} {since}");
             }
@@ -606,13 +616,94 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
+        /// M37 - the send rate the host chose, why it is there, what the line has shown it carries,
+        /// and each player's link and upload grant. Host only: a client's side is one line, the
+        /// grant it holds.
+        /// </summary>
+        private static void AppendAutoSendRate(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Auto send rate:");
+            if (!NpsEnv.IsHost()) {
+                sb.AppendLine(UploadGrant.GrantBytesPerSec > 0
+                    ? $"  upload           {UploadGrant.GrantBytesPerSec / 1024} KB/s, granted by the host"
+                    : $"  upload           the game's {SteamTransport.VanillaSendRateBytesPerSec / 1024} KB/s (no grant from the host)");
+                return;
+            }
+
+            string standDown = PatchGuard.GetDisableReason(Mechanism.AutoSendRate);
+            if (standDown != null) {
+                sb.AppendLine($"  stood down: {standDown}");
+                return;
+            }
+            if (!ValConfig.EnableSteamTransportTuning.Value) {
+                sb.AppendLine("  off (Enable Transport Tuning is off, and this needs it)");
+                return;
+            }
+            if (!ValConfig.AutoSendRate.Value) {
+                sb.AppendLine("  off (Auto Send Rate is off)");
+                return;
+            }
+            if (ValConfig.SteamSendRateKBps.Value > 0) {
+                sb.AppendLine($"  off (Send Rate KBps is set to {ValConfig.SteamSendRateKBps.Value}, a fixed rate)");
+                return;
+            }
+
+            OutState state = AutoSendRate.OutSnapshot;
+            RateLimits l = state.Limits;
+            RateDecision d = AutoSendRate.LastOut;
+            float now = UnityEngine.Time.realtimeSinceStartup;
+            sb.AppendLine($"  send rate        {state.Rate / 1024} KB/s per player (game's {ThroughputRules.BaseRate / 1024}, most {AutoSendRate.MaxBytesPerSec / 1024})" +
+                          (state.LastChangeAt > float.NegativeInfinity ? $", last moved {Elapsed(now - state.LastChangeAt)} ago" : ""));
+            if (!AutoSendRate.RaiseWanted) {
+                sb.AppendLine("                   held at the game's rate: Enable Loss Backoff is off, and a raised rate needs it");
+            }
+            sb.AppendLine($"  line             delivering {AutoSendRate.Kb(d.Total)} now; carried {AutoSendRate.Kb(l.CommittedPeak)} cleanly at most" +
+                          (l.Ceiling > 0f ? $"; congested near {AutoSendRate.Kb(l.Ceiling / ThroughputRules.CeilingShare)}, so planned under {AutoSendRate.Kb(l.Ceiling)}" +
+                                            (now < l.CeilingUntil ? $" for {Elapsed(l.CeilingUntil - now)} more" : "") : ""));
+            if (ValConfig.ServerUploadLimitKBps.Value > 0) {
+                sb.AppendLine($"                   Server Upload Limit KBps {ValConfig.ServerUploadLimitKBps.Value}: planned under {ValConfig.ServerUploadLimitKBps.Value * ThroughputRules.AdminShare:F0} KB/s");
+            }
+            sb.AppendLine($"  host             frames average {AutoSendRate.MeanFrameMs:F0}ms" +
+                          (AutoSendRate.LastHealthy ? "" : " - too slow to raise the rate") +
+                          (AutoSendRate.LastUsable ? "" : "; figures paused (a hitch, a save, or an outage at this end)"));
+            if (now < state.NoGainUntil) {
+                sb.AppendLine($"                   the last step up did not raise what full players receive; not trying again for {Elapsed(state.NoGainUntil - now)}");
+            }
+            if (d.Vote.Eligible > 0) {
+                sb.AppendLine($"  congestion vote  {d.Vote.Voters} of {d.Vote.Eligible} players losing packets or queueing (needs {d.Vote.Quorum}" +
+                              $"{(d.Busy ? "" : ", and the line busy")})");
+            }
+
+            List<ZNetPeer> peers = ZNet.instance.GetPeers();
+            bool any = false;
+            for (int i = 0; i < peers.Count; i++) {
+                if (!AutoSendRate.TryGetView(peers[i].m_uid, out AutoSendRate.View v)) { continue; }
+                if (!any) {
+                    sb.AppendLine("  name                 full  delivered  ping/best    upload    up full  up delivered");
+                    any = true;
+                }
+                string name = string.IsNullOrEmpty(peers[i].m_playerName) ? "(connecting)" : peers[i].m_playerName;
+                string delivered = v.Quality >= 0f ? $"{v.Quality * 100f:F1}%" : "-";
+                string ping = v.PingMs > 0f ? (v.BaselineMs > 0f ? $"{v.PingMs:F0}/{v.BaselineMs:F0}ms" : $"{v.PingMs:F0}/-ms") : "-";
+                string upload = !v.GrantCapable ? "game's" : $"{v.GrantBytesPerSec / 1024}KB/s";
+                string upFull = v.GrantCapable ? (v.UploadFull ? "yes" : "no") : "-";
+                string upDelivered = v.UploadQuality >= 0f ? $"{v.UploadQuality * 100f:F1}%" : "-";
+                if (v.GrantCeilingBytesPerSec > 0) { upDelivered += $" (ceiling {v.GrantCeilingBytesPerSec / 1024}KB/s)"; }
+                sb.AppendLine($"  {Pad(name, 20)} {Pad(v.Full ? "yes" : "no", 5)} {Pad(delivered, 10)} {Pad(ping, 12)} {Pad(upload, 9)} {Pad(upFull, 8)} {upDelivered}");
+            }
+            if (!any) { sb.AppendLine("  (no players measured yet)"); }
+            sb.AppendLine($"  session totals   {AutoSendRate.TotalUps} steps up, {AutoSendRate.TotalDowns} down; {AutoSendRate.TotalGrantChanges} upload grant changes" +
+                          (ValConfig.AutoPlayerUploads.Value ? "" : " (Auto Player Uploads is off)"));
+        }
+
+        /// <summary>
         /// M34/M35 - how smoothly each player's game runs, and the creature allowance that keeps a
         /// struggling one lightly loaded. On a client: this game's own report and whether it is
         /// being sent.
         /// </summary>
         private static void AppendCreatureLoad(StringBuilder sb) {
             sb.AppendLine();
-            sb.AppendLine("Creature load (players' frame rate):");
+            sb.AppendLine("Creature load (players' frame rate and upload):");
 
             if (!NpsEnv.IsHost()) {
                 if (!FrameSampler.Active) {
@@ -635,16 +726,28 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine("  allowance off (needs Arbitrate Creatures); frame rates are still shown below");
             } else if (PatchGuard.GetDisableReason(Mechanism.CreatureAllowance) is string standDown) {
                 sb.AppendLine($"  allowance stood down: {standDown}");
-            } else if (!ValConfig.BalanceCreaturesByFrameRate.Value) {
-                sb.AppendLine("  allowance off (Balance Creatures By Frame Rate is off); frame rates are still shown below");
             } else {
                 float min = ValConfig.CreatureLoadMinOwnerFps.Value;
                 int minAllowance = ValConfig.CreatureLoadMinAllowance.Value;
-                sb.AppendLine($"  rule             under {min:F0} fps for {PeerCapacity.HoldSeconds:F0}s while running more than {minAllowance} creatures, some where somebody else could:");
-                sb.AppendLine($"                   no new creatures above three quarters of what they run while somebody else can take them, and the rest move,");
-                sb.AppendLine($"                   {CreatureLoadRules.MaxShedsPerOwnerPerPass} a pass, to players at {min + PeerCapacity.HealthyMarginFps:F0}+ fps (not ones only they are near);");
-                sb.AppendLine($"                   still slow a hold after reaching it: another quarter; at {minAllowance}, or half of where it started, and no faster: dropped,");
-                sb.AppendLine($"                   left alone {PeerCapacity.ExemptSeconds / 60f:F0} minutes; at {min + PeerCapacity.HealthyMarginFps:F0}+ fps for {PeerCapacity.RecoverSeconds:F0}s: one step back up");
+                if (!ValConfig.BalanceCreaturesByFrameRate.Value) {
+                    sb.AppendLine("  frame rate       off (Balance Creatures By Frame Rate is off); frame rates are still shown below");
+                } else {
+                    sb.AppendLine($"  rule             under {min:F0} fps for {PeerCapacity.HoldSeconds:F0}s while running more than {minAllowance} creatures, some where somebody else could:");
+                    sb.AppendLine($"                   no new creatures above three quarters of what they run while somebody else can take them, and the rest move,");
+                    sb.AppendLine($"                   {CreatureLoadRules.MaxShedsPerOwnerPerPass} a pass, to players at {min + PeerCapacity.HealthyMarginFps:F0}+ fps with upload room (not ones only they are near);");
+                    sb.AppendLine($"                   still slow a hold after reaching it: another quarter; at {minAllowance}, or half of where it started, and no faster: dropped,");
+                    sb.AppendLine($"                   left alone {PeerCapacity.ExemptSeconds / 60f:F0} minutes; at {min + PeerCapacity.HealthyMarginFps:F0}+ fps for {PeerCapacity.RecoverSeconds:F0}s: one step back up");
+                }
+                if (!ValConfig.BalanceCreaturesByUpload.Value) {
+                    sb.AppendLine("  upload           off (Balance Creatures By Upload is off)");
+                } else if (PatchGuard.GetDisableReason(Mechanism.AutoSendRate) is string notRead) {
+                    sb.AppendLine($"  upload           uploads are not read (Auto Send Rate stood down: {notRead})");
+                } else {
+                    sb.AppendLine($"  upload rule      upload full for {PeerCapacity.HoldSeconds:F0}s with no higher upload rate coming (or still full {CreatureLoadRules.UploadWaitSeconds:F0}s after it last rose):");
+                    sb.AppendLine($"                   the same steps; creatures moved off go to the players with the most upload room");
+                    sb.AppendLine($"                   (room = under {CreatureLoadRules.UploadRoomShare * 100f:F0}% of their rate, delivering {CreatureLoadRules.UploadRoomQuality * 100f:F0}%+);");
+                    sb.AppendLine($"                   still full at {minAllowance}: dropped, left alone {PeerCapacity.ExemptSeconds / 60f:F0} minutes; room for {PeerCapacity.RecoverSeconds:F0}s: one step back up");
+                }
             }
 
             List<long> reporting = new List<long>();
@@ -652,13 +755,18 @@ namespace NetworkPerformanceSystem.Runtime {
             if (reporting.Count == 0) {
                 sb.AppendLine("  (no player has reported - players need this mod)");
             } else {
-                sb.AppendLine("  name                 fps   worst   slow   sim ms/s  AIs   creatures  allowance  state");
+                sb.AppendLine("  name                 fps   worst   slow   sim ms/s  AIs   creatures  upload KB/s    allowance        state");
                 for (int i = 0; i < reporting.Count; i++) {
                     if (!PeerCapacity.TryGetView(reporting[i], out PeerCapacity.View view)) { continue; }
                     FrameReport last = view.Last;
                     string fps = view.HasFps ? $"{view.Fps:F0}" : "-";
                     string sim = last.SimMsPerSecond >= 0f ? $"{last.SimMsPerSecond:F0}" : "-";
-                    string allowance = view.Steps > 0 ? $"{view.Allowance} (step {view.Steps})" : "-";
+                    UploadReading up = view.Upload;
+                    string upload = up.Known ? $"{up.Delivered / 1024f:F0}/{up.Rate / 1024}" + (up.Full ? " full" : "") : "-";
+                    string allowance = view.Steps > 0 && view.UploadSteps > 0 ? $"{Mathf.Min(view.Allowance, view.UploadAllowance)} (fps {view.Steps}, up {view.UploadSteps})"
+                                     : view.Steps > 0 ? $"{view.Allowance} (fps step {view.Steps})"
+                                     : view.UploadSteps > 0 ? $"{view.UploadAllowance} (up step {view.UploadSteps})"
+                                     : "-";
                     // Shared: how many of their creatures somebody else could run. None means the
                     // allowance has nothing to act on, so it is not set, and one already set does
                     // not stop them getting creatures nobody else can take.
@@ -666,18 +774,25 @@ namespace NetworkPerformanceSystem.Runtime {
                     string state = view.Exempt ? $"exempt {Elapsed(view.ExemptLeftSeconds)} more - creatures were not the cause"
                                  : view.Steps > 0 ? $"held (was {view.OwnedAtStart} at {view.FpsAtStart:F0} fps)" + (alone ? "; nobody near to take any" : "")
                                  : view.Low ? (alone ? "slow, but nobody near to take creatures" : "slow (hold running)")
-                                 : view.Receiver ? "has room"
-                                 : "ok";
+                                 : null;
+                    string upState = view.UploadExempt ? $"upload exempt {Elapsed(view.UploadExemptLeftSeconds)} more - creatures were not what filled it"
+                                   : view.UploadSteps > 0 ? $"upload held (was {view.UploadOwnedAtStart} at {view.UploadAtStart / 1024f:F0} KB/s)" + (alone ? "; nobody near to take any" : "")
+                                   : view.UploadStuck ? (alone ? "upload full, but nobody near to take creatures" : "upload full (hold running)")
+                                   : null;
+                    state = state != null && upState != null ? state + "; " + upState
+                          : state ?? upState ?? (view.Receiver ? "has room" : "ok");
                     if (view.AgeSeconds > 10f) { state += $"; last report {view.AgeSeconds:F0}s ago"; }
                     if (last.Unrepresentative) { state += "; " + DescribeFlags(last).TrimStart(',', ' '); }
-                    sb.AppendLine($"  {Pad(PeerCapacity.Name(reporting[i]), 20)} {Pad(fps, 5)} {Pad($"{last.WorstFrameMs:F0}ms", 7)} {Pad($"{last.SlowShare * 100f:F0}%", 6)} {Pad(sim, 9)} {Pad(last.OwnedAi.ToString(), 5)} {Pad(view.Owned.ToString(), 10)} {Pad(allowance, 10)} {state}");
+                    sb.AppendLine($"  {Pad(PeerCapacity.Name(reporting[i]), 20)} {Pad(fps, 5)} {Pad($"{last.WorstFrameMs:F0}ms", 7)} {Pad($"{last.SlowShare * 100f:F0}%", 6)} {Pad(sim, 9)} {Pad(last.OwnedAi.ToString(), 5)} {Pad(view.Owned.ToString(), 10)} {Pad(upload, 14)} {Pad(allowance, 16)} {state}");
                 }
             }
 
             sb.AppendLine($"  this pass        {OwnershipArbiter.LastPassSteered} creatures placed around a full player, {OwnershipArbiter.LastPassShed} moved off one, {OwnershipArbiter.LastPassShedBlocked} with nobody to take them");
             sb.AppendLine($"  session totals   {PeerCapacity.ReportsAccepted} reports ({PeerCapacity.ReportsRejected} rejected); {PeerCapacity.TotalStepsDown} steps down, {PeerCapacity.TotalStepsUp} up, " +
                           $"{PeerCapacity.TotalCleared} cleared, {PeerCapacity.TotalExempted} exempted; {OwnershipArbiter.TotalSteered} placed around, {OwnershipArbiter.TotalShed} moved off, {OwnershipArbiter.TotalShedBlocked} blocked");
-            sb.AppendLine("  fps is smoothed over a few reports. AIs = creatures the player's game says it runs; creatures = the server's count.");
+            sb.AppendLine($"  upload totals    {PeerCapacity.TotalUploadStepsDown} steps down, {PeerCapacity.TotalUploadStepsUp} up, {PeerCapacity.TotalUploadCleared} cleared, {PeerCapacity.TotalUploadExempted} exempted");
+            sb.AppendLine("  fps is smoothed over a few reports. AIs = creatures the player's game says it runs; creatures = the server's count;");
+            sb.AppendLine("  upload = what arrives from them / the rate they may send at (the game's, or their Auto Send Rate grant).");
         }
 
         private static string DescribeSim(FrameReport report) {
@@ -833,7 +948,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             if (JotunnSendQueue.Active) {
                 string derivation = ValConfig.EnableSendWindowSizing.Value
-                    ? $"Max Window Bytes {ValConfig.SendWindowMaxBytes.Value} + {JotunnSendQueue.HeadroomBytes} headroom"
+                    ? $"largest send window {JotunnSendQueue.LargestWindowBytes(ValConfig.SendWindowMaxBytes.Value)} + {JotunnSendQueue.HeadroomBytes} headroom"
                     : "send window sizing is off; Jotunn's own value";
                 sb.AppendLine($"  Jotunn CustomRPC   {JotunnSendQueue.EffectiveLimit} bytes (Jotunn default {JotunnSendQueue.JotunnDefault}; {derivation})");
             } else {
@@ -1060,6 +1175,42 @@ namespace NetworkPerformanceSystem.Runtime {
             sb.AppendLine($"  relay held back  {held} of {listed} fish and bird sends{relayShare}");
             sb.AppendLine($"    <={QuietWildlife.RelayNearMetres:F0}m          {QuietWildlife.RelayHeldNear} (at most {1f / QuietWildlife.FishRelayNearInterval:F0}/s fish, {1f / QuietWildlife.BirdRelayNearInterval:F0}/s birds)");
             sb.AppendLine($"    >{QuietWildlife.RelayNearMetres:F0}m           {QuietWildlife.RelayHeldFar} (at most {1f / QuietWildlife.FishRelayFarInterval:F0}/s fish, {1f / QuietWildlife.BirdRelayFarInterval:F0}/s birds)");
+        }
+
+        /// <summary>M31's floating objects, under their own setting: the owner half on every role,
+        /// the relay half on the host.</summary>
+        private static void AppendQuietFloating(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Floating object updates - ice, logs, dropped items (since start):");
+            string reason = PatchGuard.GetDisableReason(Mechanism.QuietWildlife);
+            if (reason != null) {
+                sb.AppendLine($"  stood down: {reason}");
+                return;
+            }
+            if (!ValConfig.QuietFloatingObjects.Value) {
+                sb.AppendLine("  off (floating objects are written and sent on every frame they move)");
+                return;
+            }
+
+            long held = QuietWildlife.FloatingFramesHeld;
+            long frames = held + QuietWildlife.FloatingFramesPassed + QuietWildlife.FloatingFramesClose;
+            string heldShare = frames > 0 ? $" ({100f * held / frames:F0}%)" : "";
+            sb.AppendLine($"  frames held      {held} of {frames} on floating objects simulated here{heldShare}" +
+                          $" - written at most {1f / QuietWildlife.FloatingOwnerInterval:F0}/s");
+            sb.AppendLine($"  close to someone {QuietWildlife.FloatingFramesClose} frames written anyway: another player within {QuietWildlife.FloatingCloseMetres:F0}m or standing on it");
+
+            if (!NpsEnv.IsHost()) { return; }
+            string relayReason = PatchGuard.GetDisableReason(Mechanism.CreaturePacing);
+            if (relayReason != null) {
+                sb.AppendLine($"  relay stood down with Pace Creature Sends' hook: {relayReason}");
+                return;
+            }
+            long listed = QuietWildlife.FloatingRelayListed;
+            long relayHeld = QuietWildlife.FloatingRelayHeld;
+            string relayShare = listed > 0 ? $" ({100f * relayHeld / listed:F0}%)" : "";
+            sb.AppendLine($"  relay held back  {relayHeld} of {listed} floating object sends{relayShare}; never within {QuietWildlife.FloatingCloseMetres:F0}m of the player or under them");
+            sb.AppendLine($"    <={QuietWildlife.RelayNearMetres:F0}m          {QuietWildlife.FloatingRelayHeldNear} (at most {1f / QuietWildlife.FloatingRelayNearInterval:F0}/s)");
+            sb.AppendLine($"    >{QuietWildlife.RelayNearMetres:F0}m           {QuietWildlife.FloatingRelayHeldFar} (at most {1f / QuietWildlife.FloatingRelayFarInterval:F0}/s)");
         }
 
         /// <summary>What M33 is holding back: building, tree and rock updates players already

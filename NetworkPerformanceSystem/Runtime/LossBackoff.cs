@@ -57,11 +57,27 @@ namespace NetworkPerformanceSystem.Runtime {
     /// step down players whose links were fine. So samples are ignored, and any run in progress
     /// dropped, during such a fault and for LocalFaultGraceSeconds after it.
     ///
-    /// An override is a fraction of the global rate at the moment it was written, and a
-    /// connection-scope value stops following Global writes - so SteamTransport.Apply calls
-    /// Reconcile after any global change and every live override is rewritten from the new rate,
-    /// or removed when the mechanism is switched off. The window sizer needs nothing: it already
-    /// sizes from the rate each connection reports (SendWindow.PickRate), which is the override.
+    /// An override is a rate that player's connection was shown to need, not a fraction of the
+    /// global rate. M37 moves the global rate by itself, and an override that followed it would
+    /// hand a player stepped down to 84 KB/s 281 KB/s the moment the global rate reached 500. So a
+    /// global rise leaves overrides where they are, and a global fall to or under one clears it
+    /// (the player simply inherits the lower rate). A step up from an override is a third more,
+    /// never past the global rate. A connection-scope value stops following Global writes, so
+    /// SteamTransport.Apply calls Reconcile after any global change. The window sizer needs
+    /// nothing: it already sizes from the rate each connection reports (SendWindow.PickRate),
+    /// which is the override.
+    ///
+    /// Rates above the game's 150 KB/s are M37's doing, so losing packets there teaches more than
+    /// a step: the rate the player lost packets at becomes their ceiling, by platform address, for
+    /// ten minutes - doubled each time they fail at it again - and stepping back up stops short of
+    /// it. Without it a player whose connection carries 200 KB/s would be walked up to 234 and
+    /// down again every minute and a half. An exempt player - loss the floor did not help - is
+    /// held at the game's rate while the global one is raised: their loss is not the rate's, and
+    /// a higher rate only means more of it.
+    ///
+    /// While M37 sees the server's own line congested it pauses this (PauseFor): every player
+    /// loses packets then, and stepping each of them down - or exempting them, since slowing one
+    /// player does not fix a shared bottleneck - would answer the wrong question.
     ///
     /// Host only, Steam peers only (crossplay reports no status), and only while Enable Transport
     /// Tuning is on - that setting promises vanilla transport when off, overrides included. The
@@ -110,7 +126,11 @@ namespace NetworkPerformanceSystem.Runtime {
             internal Run RunKind;
             internal float RunSince;
             internal int RunSamples;
-            internal float LastChangeAt = float.NegativeInfinity;    // any write: down, up, clear, rewrite
+            internal float LastChangeAt = float.NegativeInfinity;    // a step: down, up, clear
+            internal float LastWriteAt = float.NegativeInfinity;     // any Steam write, a reconcile's included
+            internal bool HeldAtBase;                                // exempt, held at the game's rate under a raised global one
+            internal int CeilingBytesPerSec;                         // copy of the player's ceiling, for nps_stats
+            internal float CeilingUntil;
             internal float BackedOffSince;
             internal float DeliveredAtStart;                         // Delivered when the first step was taken
             internal float Carried;                                  // EWMA of bytes/sec sent x share delivered
@@ -133,9 +153,26 @@ namespace NetworkPerformanceSystem.Runtime {
             internal float BackedOffSince;
             internal bool Exempt;
             internal float ExemptSince;
+            internal bool HeldAtBase;
+            internal int CeilingBytesPerSec;                         // 0 = none
+            internal float CeilingUntil;
+        }
+
+        /// <summary>A rate above the game's that a player lost packets at, by platform address.</summary>
+        private sealed class Ceiling {
+            internal int BytesPerSec;
+            internal float Until;
+            internal float Hold;
         }
 
         private static readonly Dictionary<long, Entry> Peers = new Dictionary<long, Entry>();
+
+        /// <summary>Kept for the server's session, like ExemptPlayers, and for the same reason:
+        /// a reconnect is a new peer id. Memory only; never logged or recorded.</summary>
+        private static readonly Dictionary<string, Ceiling> Ceilings = new Dictionary<string, Ceiling>();
+
+        /// <summary>Samples are ignored until then, as during a local fault. Set by M37.</summary>
+        private static float _pausedUntil = float.NegativeInfinity;
 
         /// <summary>Platform addresses of players whose loss the floor did not help. Held for the
         /// server's session - through reconnects, which give a player a new peer id, and through the
@@ -164,15 +201,19 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static int FloorBytesPerSec =>
             Mathf.Max(ValConfig.LossBackoffFloorKBps.Value, SteamTransport.MinSendRateKBps) * BytesPerKB;
 
-        /// <summary>The rate after this many steps down from the global one: global x 0.75^steps,
-        /// never below the floor - and never above the global rate, so a floor set at or over it
-        /// leaves nothing to step to. Pure.</summary>
-        internal static int RateFor(int pinnedBytesPerSec, int steps, int floorBytesPerSec) {
-            if (pinnedBytesPerSec <= 0) { return 0; }
-            float rate = pinnedBytesPerSec;
-            for (int i = 0; i < steps; i++) { rate *= StepFactor; }
-            int floor = Mathf.Min(floorBytesPerSec, pinnedBytesPerSec);
-            return Mathf.Max(floor, Mathf.RoundToInt(rate));
+        /// <summary>One step down from the rate in force: three quarters of it, never below the
+        /// floor - and never above the rate in force, so a floor set at or over it leaves nothing
+        /// to step to. Pure.</summary>
+        internal static int NextDown(int currentBytesPerSec, int floorBytesPerSec) {
+            if (currentBytesPerSec <= 0) { return 0; }
+            int floor = Mathf.Min(floorBytesPerSec, currentBytesPerSec);
+            return Mathf.Max(floor, Mathf.RoundToInt(currentBytesPerSec * StepFactor));
+        }
+
+        /// <summary>M37 sees the server's own line congested: ignore samples for this long.</summary>
+        internal static void PauseFor(float seconds) {
+            float until = Time.realtimeSinceStartup + seconds;
+            if (until > _pausedUntil) { _pausedUntil = until; }
         }
 
         /// <summary>Whether a player at the floor is delivering meaningfully more than when the
@@ -216,8 +257,9 @@ namespace NetworkPerformanceSystem.Runtime {
             if (e.Handle != 0 && e.Handle != handle) { Drop(e); }
 
             // An outage at this end, or its tail: the figure measures the outage. Not smoothed in,
-            // and whatever run was building starts over once the grace is past.
-            if (PeerLiveness.LocalFaultWithin(LocalFaultGraceSeconds)) {
+            // and whatever run was building starts over once the grace is past. The same while
+            // M37 sees the server's whole line congested: that loss is everybody's.
+            if (PeerLiveness.LocalFaultWithin(LocalFaultGraceSeconds) || now < _pausedUntil) {
                 e.RunKind = Run.None;
                 e.RunSince = now;
                 e.RunSamples = 0;
@@ -246,14 +288,27 @@ namespace NetworkPerformanceSystem.Runtime {
             e.RunSamples++;
             if (kind == Run.Lossy && e.Carried > e.RunCarriedPeak) { e.RunCarriedPeak = e.Carried; }
 
-            // Still measured, so nps_stats can show what they get at full rate; never acted on.
-            if (e.Exempt) { return; }
+            int pinned = SteamTransport.PinnedSendRateBytesPerSec;
+
+            // Still measured, so nps_stats can show what they get; never stepped. Held at the
+            // game's rate while the global one is raised.
+            if (e.Exempt) {
+                HoldExempt(e, peer, handle, pinned);
+                return;
+            }
+
+            // A player back on a new connection under a ceiling the global rate is over: start them
+            // under it rather than finding it again.
+            if (e.OverrideBytes == 0) {
+                int ceiling = ActiveCeiling(peer, now);
+                if (ceiling > 0 && pinned >= ceiling) { HoldUnderCeiling(e, peer, handle, ceiling, now); }
+            }
+
             if (kind == Run.None || e.RunSamples < MinRunSamples) { return; }
 
             float wait = kind == Run.Lossy ? ValConfig.LossBackoffHoldSeconds.Value : ValConfig.LossBackoffRecoverSeconds.Value;
             if (now - Mathf.Max(e.RunSince, e.LastChangeAt) < wait) { return; }
 
-            int pinned = SteamTransport.PinnedSendRateBytesPerSec;
             int floor = FloorBytesPerSec;
             if (kind == Run.Lossy) {
                 StepDown(e, peer, handle, pinned, floor, threshold, wait, now);
@@ -263,8 +318,8 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         private static void StepDown(Entry e, ZNetPeer peer, uint handle, int pinned, int floor, float threshold, float hold, float now) {
-            int current = e.Steps == 0 ? pinned : e.OverrideBytes;
-            int next = RateFor(pinned, e.Steps + 1, floor);
+            int current = e.OverrideBytes > 0 ? e.OverrideBytes : pinned;
+            int next = NextDown(current, floor);
 
             // Still lossy a full Hold after the last step. Asked on every sample from here on, so
             // a player a step helped at first and then stopped helping is let go as soon as their
@@ -284,17 +339,52 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             if (!Write(e, peer, handle, next)) { return; }
+            NoteCeiling(peer, current, now);
+            Stepped(e, now, e.RunCarriedPeak);
+            Logger.LogInfo($"Loss backoff: {Name(peer)} delivering {Pct(e.Delivered)} (under {Pct(threshold)} for {hold:F0}s); " +
+                           $"send rate {Kb(current)} -> {Kb(next)} (step {e.Steps}, floor {Kb(floor)}).");
+            Record(peer, "down", e, next);
+        }
+
+        private static void Stepped(Entry e, float now, float carriedAtStart) {
             e.Steps++;
             e.LastChangeAt = now;
             TotalStepsDown++;
             if (e.Steps == 1) {
                 e.BackedOffSince = now;
                 e.DeliveredAtStart = e.Delivered;
-                e.CarriedAtStart = e.RunCarriedPeak;
+                e.CarriedAtStart = carriedAtStart;
                 BackedOffNow++;
             }
-            Logger.LogInfo($"Loss backoff: {Name(peer)} delivering {Pct(e.Delivered)} (under {Pct(threshold)} for {hold:F0}s); " +
-                           $"send rate {Kb(current)} -> {Kb(next)} (step {e.Steps}, floor {Kb(floor)}).");
+        }
+
+        /// <summary>
+        /// M37 saw this player's ping rise well over its own best while their link was full at a
+        /// rate above the game's: a queue somewhere on their path, which loses nothing and so is
+        /// never seen above. One step down, and that rate becomes their ceiling - the same as a
+        /// loss there. Rates at or under the game's are left alone: those were not raised by
+        /// anybody.
+        /// </summary>
+        internal static void StepDownForQueue(ZNetPeer peer, float pingMs, float baselineMs) {
+            if (peer == null || peer.m_uid == 0L || !Wanted) { return; }
+            if (!RttProbe.TryGetConnectionHandle(peer.m_socket, out uint handle)) { return; }
+            float now = Time.realtimeSinceStartup;
+            Entry e = EntryFor(peer, now);
+            if (e.Exempt) { return; }
+            if (e.Handle != 0 && e.Handle != handle) { Drop(e); }
+
+            int pinned = SteamTransport.PinnedSendRateBytesPerSec;
+            int current = e.OverrideBytes > 0 ? e.OverrideBytes : pinned;
+            int vanilla = SteamTransport.VanillaSendRateBytesPerSec;
+            if (current <= vanilla) { return; }
+            if (now - e.LastChangeAt < ValConfig.LossBackoffHoldSeconds.Value) { return; }
+
+            int next = Mathf.Max(vanilla, NextDown(current, FloorBytesPerSec));
+            if (next >= current || !Write(e, peer, handle, next)) { return; }
+            NoteCeiling(peer, current, now);
+            Stepped(e, now, e.Carried);
+            Logger.LogInfo($"Loss backoff: {Name(peer)} ping {pingMs:F0}ms against a best of {baselineMs:F0}ms while full; " +
+                           $"send rate {Kb(current)} -> {Kb(next)} (step {e.Steps}).");
             Record(peer, "down", e, next);
         }
 
@@ -323,15 +413,20 @@ namespace NetworkPerformanceSystem.Runtime {
             string where = atFloor
                 ? $"at the {Kb(rateInForce)} floor"
                 : $"at {Kb(rateInForce)}, below the {Kb((int)e.CarriedAtStart)} their connection was already carrying,";
+            int rate = Mathf.Min(pinned, SteamTransport.VanillaSendRateBytesPerSec);
             Logger.LogWarning($"Loss backoff: {Name(peer)} has packet loss that slowing down did not improve - delivering {Pct(e.Delivered)} " +
                               $"{where} after {steps} steps over {backedOffFor:F0}s, against {Pct(e.DeliveredAtStart)} when the back-off started. " +
-                              $"Back at the global {Kb(pinned)}, and their rate will not be lowered again this session.");
-            Record(peer, "exempt", e, pinned);
+                              $"Back at {Kb(rate)}, and their rate will not be lowered again this session.");
+            Record(peer, "exempt", e, rate);
+            HoldExempt(e, peer, handle, pinned);
         }
 
         private static void StepUp(Entry e, ZNetPeer peer, uint handle, int pinned, int floor, float recover, float now) {
             int before = e.OverrideBytes;
-            if (e.Steps == 1) {
+            int next = ThroughputRules.StepUpOverride(before, pinned, ActiveCeiling(peer, now));
+            if (next == before) { return; }                          // their ceiling holds them here
+
+            if (next >= pinned) {
                 if (!Clear(e, peer, handle)) { return; }
                 e.Steps = 0;
                 e.LastChangeAt = now;
@@ -343,17 +438,66 @@ namespace NetworkPerformanceSystem.Runtime {
                 return;
             }
 
-            // Several steps can sit on the floor together; climbing through them changes nothing
-            // in Steam until the rate actually rises.
-            int next = RateFor(pinned, e.Steps - 1, floor);
-            if (next != before && !Write(e, peer, handle, next)) { return; }
-            e.Steps--;
+            if (!Write(e, peer, handle, next)) { return; }
+            e.Steps = Mathf.Max(1, e.Steps - 1);
             e.LastChangeAt = now;
             e.FloorLogged = false;
             TotalStepsUp++;
             Logger.LogInfo($"Loss backoff: {Name(peer)} delivering {Pct(e.Delivered)}, clean for {recover:F0}s; " +
                            $"send rate {Kb(before)} -> {Kb(next)} (step {e.Steps}).");
             Record(peer, "up", e, next);
+        }
+
+        /// <summary>An exempt player under a global rate above the game's is held at the game's;
+        /// under one at or below it, they inherit it like anybody else.</summary>
+        private static void HoldExempt(Entry e, ZNetPeer peer, uint handle, int pinned) {
+            int vanilla = SteamTransport.VanillaSendRateBytesPerSec;
+            if (pinned > vanilla) {
+                if (e.HeldAtBase && e.OverrideBytes == vanilla) { return; }
+                if (!Write(e, peer, handle, vanilla)) { return; }
+                e.HeldAtBase = true;
+                Logger.LogInfo($"Loss backoff: {Name(peer)} (exempt) held at {Kb(vanilla)} while the send rate is {Kb(pinned)}.");
+            } else if (e.HeldAtBase) {
+                if (!Clear(e, peer, handle)) { return; }
+            }
+        }
+
+        /// <summary>A player with no override, back under a ceiling the global rate is over: one
+        /// step under it at once.</summary>
+        private static void HoldUnderCeiling(Entry e, ZNetPeer peer, uint handle, int ceiling, float now) {
+            int next = Mathf.Max(SteamTransport.VanillaSendRateBytesPerSec, NextDown(ceiling, FloorBytesPerSec));
+            if (!Write(e, peer, handle, next)) { return; }
+            Stepped(e, now, e.Carried);
+            Logger.LogInfo($"Loss backoff: {Name(peer)} lost packets at {Kb(ceiling)} recently; starting them at {Kb(next)}.");
+            Record(peer, "down", e, next);
+        }
+
+        // -- ceilings ----------------------------------------------------------------------
+
+        /// <summary>Remember a rate above the game's that this player lost packets at. Held
+        /// ThroughputRules.PlayerCeilingSeconds, doubled each time they fail again at or under it.</summary>
+        private static void NoteCeiling(ZNetPeer peer, int lossyAtBytesPerSec, float now) {
+            if (lossyAtBytesPerSec <= SteamTransport.VanillaSendRateBytesPerSec) { return; }
+            string key = PlayerKey(peer);
+            if (!Ceilings.TryGetValue(key, out Ceiling c)) {
+                c = new Ceiling { Hold = ThroughputRules.PlayerCeilingSeconds };
+                Ceilings[key] = c;
+            } else {
+                c.Hold = lossyAtBytesPerSec <= c.BytesPerSec
+                    ? Mathf.Min(ThroughputRules.MaxCeilingHoldSeconds, c.Hold * 2f)
+                    : ThroughputRules.PlayerCeilingSeconds;
+            }
+            c.BytesPerSec = lossyAtBytesPerSec;
+            c.Until = now + c.Hold;
+            if (Peers.TryGetValue(peer.m_uid, out Entry e)) {
+                e.CeilingBytesPerSec = c.BytesPerSec;
+                e.CeilingUntil = c.Until;
+            }
+        }
+
+        private static int ActiveCeiling(ZNetPeer peer, float now) {
+            if (Ceilings.Count == 0) { return 0; }
+            return Ceilings.TryGetValue(PlayerKey(peer), out Ceiling c) && now < c.Until ? c.BytesPerSec : 0;
         }
 
         /// <summary>One line in network monitoring per change this makes, so a recording shows
@@ -381,32 +525,38 @@ namespace NetworkPerformanceSystem.Runtime {
 
             int pinned = SteamTransport.PinnedSendRateBytesPerSec;
             int floor = FloorBytesPerSec;
-            float now = Time.realtimeSinceStartup;
 
             List<ZNetPeer> peers = net.GetPeers();
             for (int i = 0; i < peers.Count; i++) {
                 ZNetPeer peer = peers[i];
-                if (peer == null || !Peers.TryGetValue(peer.m_uid, out Entry e) || e.Steps == 0) { continue; }
+                if (peer == null || !Peers.TryGetValue(peer.m_uid, out Entry e)) { continue; }
+                if (e.OverrideBytes == 0 && !e.Exempt) { continue; }
 
-                if (!RttProbe.TryGetConnectionHandle(peer.m_socket, out uint handle) || handle != e.Handle) {
+                if (!RttProbe.TryGetConnectionHandle(peer.m_socket, out uint handle) || (e.Handle != 0 && handle != e.Handle)) {
                     Drop(e);                                                 // the override went with its connection
                     continue;
                 }
 
-                int next = RateFor(pinned, e.Steps, floor);
-                if (next >= pinned) {
+                if (e.Exempt) {
+                    HoldExempt(e, peer, handle, pinned);
+                    continue;
+                }
+
+                // A rate the player was shown to need stays put while the global one rises; one the
+                // global rate has fallen to leaves nothing to hold. The floor is re-applied in case
+                // it was raised.
+                int keep = ThroughputRules.OverrideAfterGlobalChange(Mathf.Max(e.OverrideBytes, Mathf.Min(floor, pinned)), pinned);
+                if (keep == 0) {
                     if (!Clear(e, peer, handle)) { return; }
                     e.Steps = 0;
-                    e.LastChangeAt = now;
                     e.FloorLogged = false;
                     BackedOffNow--;
                     TotalCleared++;
-                    Logger.LogInfo($"Loss backoff: {Name(peer)} back at the global {Kb(pinned)} - nothing below it to step to ({reason}).");
-                } else if (next != e.OverrideBytes) {
+                    Logger.LogInfo($"Loss backoff: {Name(peer)} back at the global {Kb(pinned)} - nothing below it to hold them at ({reason}).");
+                } else if (keep != e.OverrideBytes) {
                     int before = e.OverrideBytes;
-                    if (!Write(e, peer, handle, next)) { return; }
-                    e.LastChangeAt = now;
-                    Logger.LogInfo($"Loss backoff: {Name(peer)} send rate {Kb(before)} -> {Kb(next)} (step {e.Steps}, {reason}).");
+                    if (!Write(e, peer, handle, keep)) { return; }
+                    Logger.LogInfo($"Loss backoff: {Name(peer)} send rate {Kb(before)} -> {Kb(keep)} (step {e.Steps}, {reason}).");
                 }
             }
         }
@@ -425,7 +575,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 List<ZNetPeer> peers = net.GetPeers();
                 for (int i = 0; i < peers.Count; i++) {
                     ZNetPeer peer = peers[i];
-                    if (peer == null || !Peers.TryGetValue(peer.m_uid, out Entry e) || e.Steps == 0) { continue; }
+                    if (peer == null || !Peers.TryGetValue(peer.m_uid, out Entry e) || e.OverrideBytes == 0) { continue; }
                     if (RttProbe.TryGetConnectionHandle(peer.m_socket, out uint handle) && handle == e.Handle) {
                         SteamNetConfig.TryClearConnectionRate(handle);
                         cleared++;
@@ -445,6 +595,7 @@ namespace NetworkPerformanceSystem.Runtime {
             if (result == SteamNetConfig.ConnectionResult.Ok) {
                 e.Handle = handle;
                 e.OverrideBytes = bytesPerSec;
+                e.LastWriteAt = Time.realtimeSinceStartup;
                 return true;
             }
             Refused(e, peer, handle, result, "write");
@@ -456,6 +607,8 @@ namespace NetworkPerformanceSystem.Runtime {
             if (result == SteamNetConfig.ConnectionResult.Ok) {
                 e.Handle = 0;
                 e.OverrideBytes = 0;
+                e.HeldAtBase = false;
+                e.LastWriteAt = Time.realtimeSinceStartup;
                 return true;
             }
             Refused(e, peer, handle, result, "clear");
@@ -487,26 +640,28 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static int ExpectedRate(long uid, int pinnedBytesPerSec, out float secondsSinceChange) {
             secondsSinceChange = float.PositiveInfinity;
             if (!Peers.TryGetValue(uid, out Entry e)) { return pinnedBytesPerSec; }
-            secondsSinceChange = Time.realtimeSinceStartup - e.LastChangeAt;
-            return e.Steps > 0 ? e.OverrideBytes : pinnedBytesPerSec;
+            secondsSinceChange = Time.realtimeSinceStartup - e.LastWriteAt;
+            return e.OverrideBytes > 0 ? e.OverrideBytes : pinnedBytesPerSec;
         }
 
         internal static bool TryGetView(long uid, out View view) {
             view = default;
             if (!Peers.TryGetValue(uid, out Entry e)) { return false; }
 
-            int pinned = SteamTransport.PinnedSendRateBytesPerSec;
-            int floor = FloorBytesPerSec;
+            float now = Time.realtimeSinceStartup;
             view = new View {
                 Delivered = e.Delivered,
                 HasSample = e.HasSample,
                 Lossy = e.RunKind == Run.Lossy,
                 Steps = e.Steps,
                 OverrideBytesPerSec = e.OverrideBytes,
-                AtFloor = e.Steps > 0 && RateFor(pinned, e.Steps + 1, floor) >= e.OverrideBytes,
+                AtFloor = e.Steps > 0 && NextDown(e.OverrideBytes, FloorBytesPerSec) >= e.OverrideBytes,
                 BackedOffSince = e.BackedOffSince,
                 Exempt = e.Exempt,
                 ExemptSince = e.ExemptSince,
+                HeldAtBase = e.HeldAtBase,
+                CeilingBytesPerSec = now < e.CeilingUntil ? e.CeilingBytesPerSec : 0,
+                CeilingUntil = e.CeilingUntil,
             };
             return true;
         }
@@ -526,6 +681,8 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static void Reset() {
             ClearPeers();
             ExemptPlayers.Clear();
+            Ceilings.Clear();
+            _pausedUntil = float.NegativeInfinity;
         }
 
         private static void ClearPeers() {
@@ -541,6 +698,10 @@ namespace NetworkPerformanceSystem.Runtime {
                 if (ExemptPlayers.Count > 0 && ExemptPlayers.Contains(PlayerKey(peer))) {
                     e.Exempt = true;
                     e.ExemptSince = now;
+                }
+                if (Ceilings.Count > 0 && Ceilings.TryGetValue(PlayerKey(peer), out Ceiling c)) {
+                    e.CeilingBytesPerSec = c.BytesPerSec;
+                    e.CeilingUntil = c.Until;
                 }
                 Peers[peer.m_uid] = e;
             }
@@ -564,6 +725,7 @@ namespace NetworkPerformanceSystem.Runtime {
             if (e.Steps > 0) { BackedOffNow--; }
             e.Steps = 0;
             e.OverrideBytes = 0;
+            e.HeldAtBase = false;
             e.Handle = 0;
             e.RunKind = Run.None;
             e.RunSamples = 0;

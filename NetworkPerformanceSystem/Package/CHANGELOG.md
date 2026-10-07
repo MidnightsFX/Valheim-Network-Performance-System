@@ -1,5 +1,10 @@
 # Changelog
 
+**1.16.0**
+- Drifting ice, floating logs and dropped items in water send far fewer updates, freeing room on everyone's connection in fights by the sea and when sailing through ice.
+- The server now raises how fast it sends to players, and how fast players with the mod may upload, while their connections are full, and backs off on its own when the server's line or a player's connection cannot keep up.
+- A player whose upload fills up in a big fight, so their creatures stall for everyone else, is given fewer creatures to run, and the rest move to players whose uploads have room.
+
 **1.15.1**
 - A struggling player who is the only one near creatures keeps running them.
 - Players who alt-tab have their own idle timeout rate (objects are still moved away from an idle player within 10s)

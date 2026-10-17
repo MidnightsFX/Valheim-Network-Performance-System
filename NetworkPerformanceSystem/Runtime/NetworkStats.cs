@@ -207,6 +207,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             AppendPlayerLimit(sb);
             AppendPeerTable(sb);
+            AppendGamePing(sb);
             AppendLinkPressure(sb);
             AppendSendTruncation(sb);
             AppendTransport(sb);
@@ -214,6 +215,7 @@ namespace NetworkPerformanceSystem.Runtime {
             AppendAutoSendRate(sb);
             AppendTimeouts(sb);
             AppendPeerLiveness(sb);
+            AppendCrossplay(sb);
             AppendEarlyZdoData(sb);
             AppendThirdPartyThresholds(sb);
             AppendScheduler(sb);
@@ -270,7 +272,8 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.SteamTransport: return ValConfig.EnableSteamTransportTuning.Value;
                 case Mechanism.SyncListCache: return ValConfig.EnableSyncListCache.Value;
                 case Mechanism.ConnectionTimeout: return ValConfig.EnableConnectionTimeoutTuning.Value;
-                case Mechanism.RpcOwnerRouting: return ValConfig.EnableStationRpcRouting.Value || ValConfig.EnableCreatureHitRouting.Value || ValConfig.EnableStructureHitRouting.Value || ValConfig.EnableTerrainEditRouting.Value;
+                case Mechanism.RpcOwnerRouting: return ValConfig.EnableStationRpcRouting.Value || ValConfig.EnableCreatureHitRouting.Value || ValConfig.EnableStructureHitRouting.Value || ValConfig.EnableTerrainEditRouting.Value
+                                                       || ValConfig.EnableItemPickupRouting.Value || ValConfig.EnableInteractionRouting.Value;
                 case Mechanism.JotunnQueueLimit: return ValConfig.EnableSendWindowSizing.Value;
                 case Mechanism.QueueSizeView: return ValConfig.EnableSendWindowSizing.Value && ValConfig.ReportVanillaQueueSize.Value;
                 case Mechanism.DeserializeAlloc: return AllocationRelief.DeserializeWanted;
@@ -303,6 +306,9 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Mechanism.AutoSendRate: return ValConfig.EnableSteamTransportTuning.Value && ValConfig.AutoSendRate.Value && ValConfig.SteamSendRateKBps.Value <= 0;
                 case Mechanism.MapPins: return ValConfig.MapPinsFollowPlayers.Value;
                 case Mechanism.MapPositions: return ValConfig.SendMapPositionsRightAway.Value;
+                case Mechanism.GamePing: return ValConfig.UseInGamePing.Value;
+                case Mechanism.CrossplayDropNotice: return ValConfig.TellDroppedCrossplayPlayers.Value;
+                case Mechanism.CrossplayResume: return ValConfig.ResumeAfterCrossplayReset.Value;
                 default: return true;
             }
         }
@@ -330,18 +336,33 @@ namespace NetworkPerformanceSystem.Runtime {
                 return;
             }
 
-            sb.AppendLine("  name                 rtt     jitter  fps    sim     window    for rate   queue   skipped");
+            // On the host, M41's in-game ping leads ("ping"), then the figure ownership prices the
+            // player at ("own", * when it is the unmeasured stand-in), then Steam's own ("steam").
+            // A client has only Steam's figure for its link to the host.
+            bool host = NpsEnv.IsHost();
+            float unmeasuredMs = ValConfig.OwnershipUnmeasuredRttMs.Value;
+            sb.AppendLine(host
+                ? "  name                 ping    own     steam   jitter  fps    sim     window    for rate   queue   skipped"
+                : "  name                 rtt     jitter  fps    sim     window    for rate   queue   skipped");
             for (int i = 0; i < peers.Count; i++) {
                 ZNetPeer peer = peers[i];
                 long uid = peer.m_uid;
 
                 string name = string.IsNullOrEmpty(peer.m_playerName) ? "(connecting)" : peer.m_playerName;
-                string rtt = LatencyRegistry.HasMeasurement(uid)
-                    ? $"{LatencyRegistry.MeasuredRttMs(uid):F0}ms"
+                string steam = LatencyRegistry.HasTransport(uid)
+                    ? $"{LatencyRegistry.TransportRttMs(uid):F0}ms"
                     : "-";
-                string jitter = LatencyRegistry.HasMeasurement(uid)
-                    ? $"{LatencyRegistry.MeasuredJitterMs(uid):F0}ms"
-                    : "-";
+                bool hasGame = LatencyRegistry.TryGetGame(uid, out PingRules.PingEstimate game);
+                string jitter = hasGame
+                    ? $"{game.JitterMs:F0}ms"
+                    : LatencyRegistry.HasTransport(uid) ? $"{LatencyRegistry.TransportJitterMs(uid):F0}ms" : "-";
+                string rtt = steam;
+                if (host) {
+                    string ping = hasGame ? $"{game.EwmaMs:F0}ms" : "-";
+                    float own = LatencyRegistry.OwnershipRttMs(uid, unmeasuredMs);
+                    bool standIn = LatencyRegistry.OwnershipRttMs(uid, -1f) < 0f;
+                    rtt = $"{Pad(ping, 7)} {Pad(standIn ? $"{own:F0}*" : $"{own:F0}ms", 7)} {steam}";
+                }
                 // M34: the frame rate the player's game reports - "-" for a player without the mod.
                 string fps = PeerCapacity.TryGetView(uid, out PeerCapacity.View load) && load.HasFps
                     ? $"{load.Fps:F0}"
@@ -358,14 +379,14 @@ namespace NetworkPerformanceSystem.Runtime {
                     skipped = $"{pct:F1}% ({entry.SendsSkippedByBackpressure}/{entry.SendAttempts})";
                 }
 
-                sb.AppendLine($"  {Pad(name, 20)} {Pad(rtt, 7)} {Pad(jitter, 7)} {Pad(fps, 6)} {Pad(DescribeSimulationDistance(peer), 7)} {Pad(window, 9)} {Pad(rate, 10)} {Pad(queue, 7)} {skipped}");
+                sb.AppendLine($"  {Pad(name, 20)} {Pad(rtt, host ? 23 : 7)} {Pad(jitter, 7)} {Pad(fps, 6)} {Pad(DescribeSimulationDistance(peer), 7)} {Pad(window, 9)} {Pad(rate, 10)} {Pad(queue, 7)} {skipped}");
             }
 
             string connections = RttProbe.DescribeSocketPaths(peers);
             if (connections != null) {
                 sb.AppendLine($"  {connections}");
                 sb.AppendLine("  (another mod wraps some players' connections. Found by Steam ID = read from their Steam connection");
-                sb.AppendLine("  instead; unreadable = not even that, so they count as Unmeasured Peer RTT Ms. The log names the wrapper.)");
+                sb.AppendLine("  instead; unreadable = not even that, so they have no steam figure - only the in-game ping. The log names the wrapper.)");
             }
 
             if (Collecting) {
@@ -925,6 +946,43 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
+        /// M42 on the host - which dropped crossplay players were told, and why the rest were not.
+        /// M43 on a player's game - reconnects after a Party reset. Counted with the settings off
+        /// too, so the numbers say whether switching them on would do anything.
+        /// </summary>
+        private static void AppendCrossplay(StringBuilder sb) {
+            sb.AppendLine();
+            sb.AppendLine("Crossplay connections (since start):");
+
+            if (NpsEnv.IsHost()) {
+                string reason = PatchGuard.GetDisableReason(Mechanism.CrossplayDropNotice);
+                if (reason != null) {
+                    sb.AppendLine($"  stood down: {reason}");
+                    return;
+                }
+                sb.AppendLine(ValConfig.TellDroppedCrossplayPlayers.Value
+                    ? $"  dropped, told    {CrossplayDisconnects.Told}{(CrossplayDisconnects.LastTold != null ? $" (last: {CrossplayDisconnects.LastTold})" : "")}, {CrossplayDisconnects.Messages} messages handed to PlayFab with the notices"
+                    : $"  dropped, untold  {CrossplayDisconnects.WouldTell} (Tell Dropped Players is off)");
+                if (CrossplayDisconnects.Refused > 0) {
+                    sb.AppendLine($"  refused          {CrossplayDisconnects.Refused} notices PlayFab would not take (the link was going down)");
+                }
+                sb.AppendLine($"  not told         {CrossplayDisconnects.SkippedClosed} timed out, {CrossplayDisconnects.SkippedGoodbye} left by themselves, " +
+                              $"{CrossplayDisconnects.SkippedKicked} kicked by the game, {CrossplayDisconnects.SkippedLinkDown} during a connection reset");
+                return;
+            }
+
+            string standDown = PatchGuard.GetDisableReason(Mechanism.CrossplayResume);
+            if (standDown != null) {
+                sb.AppendLine($"  stood down: {standDown}");
+                return;
+            }
+            string last = CrossplayDisconnects.LastResumeSilence >= 0d ? $" (last after {CrossplayDisconnects.LastResumeSilence:F0}s without data)" : "";
+            sb.AppendLine(ValConfig.ResumeAfterCrossplayReset.Value
+                ? $"  reconnects       {CrossplayDisconnects.Resumes} given {CrossplayDisconnects.ResetAfterSeconds:F0}s to resume{last}"
+                : $"  reconnects       {CrossplayDisconnects.StaleResumes} reset again at once (Resume After Connection Reset is off){last}");
+        }
+
+        /// <summary>
         /// M24 - client only. Whether world updates ever arrived before this game could accept
         /// them. On a healthy install the answer is "never"; anything else names a mod that holds
         /// the handshake back, and says whether anything was lost to it.
@@ -1086,7 +1144,10 @@ namespace NetworkPerformanceSystem.Runtime {
                 return;
             }
             sb.AppendLine($"  scans avoided    {SyncListCache.Hits}/{total} sends ({100f * SyncListCache.Hits / total:F0}%)");
-            sb.AppendLine($"  cache window     {ValConfig.SyncListCacheMs.Value:F0}ms (invalidated early on zone change or any destroy)");
+            if (SyncListCache.Checks > 0) {
+                sb.AppendLine($"  checks skipped   {SyncListCache.ChecksSkipped}/{SyncListCache.Checks} objects ({100f * SyncListCache.ChecksSkipped / SyncListCache.Checks:F0}%, unchanged since the peer was last found up to date)");
+            }
+            sb.AppendLine($"  cache window     {ValConfig.SyncListCacheMs.Value:F0}ms (rescanned early on a zone change)");
         }
 
         /// <summary>What the owner-side dead band is saving, on whatever this machine simulates -
@@ -1382,16 +1443,27 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             int peers = ZDOMan.s_instance != null ? ZDOMan.s_instance.m_peers.Count : 0;
-            float targetHz = 1f / Mathf.Max(0.01f, ValConfig.SendIntervalSeconds.Value);
+            float configured = Mathf.Max(0.01f, ValConfig.SendIntervalSeconds.Value);
+            float targetHz = 1f / configured;
+            float interval = SendSchedulerPatches.CurrentIntervalSeconds;
+            bool ceilingHolds = interval > configured * 1.001f;
             float effectiveHz = peers > 0 ? (float)SendSchedulerPatches.ServicedLastSecond / peers : 0f;
+            int cpuMax = ValConfig.SendSchedulerMaxCpuPercent.Value;
 
             sb.AppendLine($"  sends/s          {SendSchedulerPatches.ServicedLastSecond} across {peers} peers");
-            sb.AppendLine($"  per-peer rate    {effectiveHz:F1} Hz (target {targetHz:F0} Hz)");
+            sb.AppendLine($"  per-peer rate    {effectiveHz:F1} Hz (target {targetHz:F0} Hz" +
+                          (ceilingHolds ? $", CPU limit {1f / interval:F1} Hz)" : ")"));
             sb.AppendLine($"  last frame       {SendSchedulerPatches.LastFrameServiced} peers");
             sb.AppendLine($"  send cost        {SendSchedulerPatches.SendCostMsLastSecond:F2}ms per peer");
+            sb.AppendLine(cpuMax > 0
+                ? $"  cpu              {SendSchedulerPatches.CpuPercentLastSecond:F1}% of the main thread (limit {cpuMax}%: each peer every {interval * 1000f:F0}ms at {SendSchedulerPatches.CeilingCostMs:F2}ms a send)"
+                : $"  cpu              {SendSchedulerPatches.CpuPercentLastSecond:F1}% of the main thread (no limit)");
             sb.AppendLine($"  budget breaks/s  {SendSchedulerPatches.BudgetBreaksLastSecond} (frame budget {ValConfig.SendSchedulerFrameBudgetMs.Value:F1}ms)");
             sb.AppendLine($"  past budget/s    {SendSchedulerPatches.PastBudgetLastSecond} sends (min {SendSchedulerPatches.MinPeersPerFrame(peers)} peers per frame, {ValConfig.SendSchedulerMinPeersPercent.Value}%)");
-            if (peers > 0 && SendSchedulerPatches.BudgetBreaksLastSecond > 0 && effectiveHz < targetHz * 0.75f) {
+            if (peers > 0 && ceilingHolds) {
+                sb.AppendLine("  NOTE: the CPU limit is setting the send rate. Raise Max Send CPU Percent to trade server CPU");
+                sb.AppendLine("  for send rate, or accept the lower rate.");
+            } else if (peers > 0 && SendSchedulerPatches.BudgetBreaksLastSecond > 0 && effectiveHz < targetHz * 0.75f) {
                 sb.AppendLine("  NOTE: send rate is CPU-bound - the frame budget is cutting rounds short. Raise Frame Budget Ms or");
                 sb.AppendLine("  Min Players Per Frame Percent to trade server frame time for send rate, or accept the lower rate.");
             }
@@ -1515,9 +1587,113 @@ namespace NetworkPerformanceSystem.Runtime {
                 AppendHoldLines(sb, g, items: false);
             }
 
-            if (RpcOwnerRouter.Waiting > 0) {
-                sb.AppendLine($"  {Pad("waiting", 13)} {RpcOwnerRouter.Waiting} (all kinds)");
+            // Pick-ups: "already theirs", "claimed", "from server" and "pushed" are the waits
+            // that were cut short; the wait line is what players actually saw, from their first
+            // request the server saw to the item being theirs.
+            sb.AppendLine();
+            sb.AppendLine("Item pick-ups (since start):");
+            if (!hooks || !ValConfig.EnableItemPickupRouting.Value) {
+                sb.AppendLine("  vanilla (a request to pick up an item goes to whoever the player's copy names as its owner)");
+            } else {
+                RpcOwnerRouter.Counters p = RpcOwnerRouter.Pickups;
+                sb.AppendLine($"  {Pad("seen", 13)} {p.Seen} requests to pick up an item");
+                sb.AppendLine($"  {Pad("re-targeted", 13)} {p.Retargeted} (player's copy named a stale owner - delivered to the current one)");
+                sb.AppendLine($"  {Pad("already theirs", 13)} {p.AlreadyTheirs} (the item was already theirs - sent to them instead)");
+                sb.AppendLine($"  {Pad("claimed", 13)} {p.Claimed} (nobody owned it - given to the player)");
+                sb.AppendLine($"  {Pad("from server", 13)} {p.Granted} (the server owned it - given to the player)");
+                sb.AppendLine($"  {Pad("pushed", 13)} {p.Pushed} (became theirs - sent to them ahead of their turn)");
+                AppendWaitLine(sb, p);
+                AppendNewFamilyHoldLines(sb, p);
             }
+
+            sb.AppendLine();
+            sb.AppendLine("Other interactions (since start):");
+            if (!hooks || !ValConfig.EnableInteractionRouting.Value) {
+                sb.AppendLine("  vanilla (chests, doors, pickables, stands, beds, wards, portals, map tables, beehives and tame commands go to whoever the sender's copy names as owner)");
+            } else {
+                RpcOwnerRouter.Counters n = RpcOwnerRouter.Interactions;
+                sb.AppendLine($"  {Pad("seen", 13)} {n.Seen} chest, door, pickable, stand, bed, ward, portal, map table, beehive, incinerator and tame requests");
+                sb.AppendLine($"  {Pad("re-targeted", 13)} {n.Retargeted} (sender's copy named a stale owner, or nobody - delivered to the current one)");
+                sb.AppendLine($"  {Pad("claimed", 13)} {n.Claimed} (no present owner - handed to the sender first)");
+                sb.AppendLine($"  {Pad("handed over", 13)} {n.HandedOver} (a pickable the dedicated server owned, which cannot be picked there - handed to the picker)");
+                sb.AppendLine($"  {Pad("already theirs", 13)} {n.AlreadyTheirs} (an item stand was already theirs - sent to them instead)");
+                sb.AppendLine($"  {Pad("pushed", 13)} {n.Pushed} (a chest or stand became theirs - sent to them ahead of their turn)");
+                AppendNewFamilyHoldLines(sb, n);
+            }
+
+            if (RpcOwnerRouter.Waiting > 0 || RpcOwnerRouter.PendingCount > 0) {
+                sb.AppendLine($"  {Pad("waiting", 13)} {RpcOwnerRouter.Waiting} held, {RpcOwnerRouter.PendingCount} asked for and not theirs yet (all kinds)");
+            }
+            if (RpcOwnerRouter.PendingSkipped > 0) {
+                sb.AppendLine($"  {Pad("not followed", 13)} {RpcOwnerRouter.PendingSkipped} (too many requests in flight at once to follow them all)");
+            }
+        }
+
+        /// <summary>M41: where players' pings come from on this host, and which answers the in-game
+        /// timing threw away and why. In-game pings are timed even with the setting off, so the two
+        /// figures can be compared in the peer table before switching.</summary>
+        private static void AppendGamePing(StringBuilder sb) {
+            if (!NpsEnv.IsHost()) { return; }
+
+            sb.AppendLine();
+            sb.AppendLine("Ping (since start):");
+            string source;
+            if (!PatchGuard.IsActive(Mechanism.GamePing)) {
+                source = "Steam's figure (in-game timing stood down - see the log)";
+            } else if (!ValConfig.UseInGamePing.Value) {
+                source = "Steam's figure (Use In-Game Ping is off; in-game pings are still timed, for comparison)";
+            } else {
+                source = "in-game (ownership: each player's best of the last few minutes; compensation: their current ping)";
+            }
+            sb.AppendLine($"  {Pad("source", 13)} {source}");
+            if (!PatchGuard.IsActive(Mechanism.GamePing)) { return; }
+
+            long[] verdicts = GamePing.Verdicts;
+            sb.AppendLine($"  {Pad("timed", 13)} {GamePing.Samples} answers of {GamePing.PingsSent} pings sent");
+
+            List<string> reasons = new List<string>();
+            AddReason(reasons, verdicts, PingRules.PingVerdict.NotValid, "joining");
+            AddReason(reasons, verdicts, PingRules.PingVerdict.InBackground, "game in background");
+            AddReason(reasons, verdicts, PingRules.PingVerdict.SpansStall, "server stall");
+            AddReason(reasons, verdicts, PingRules.PingVerdict.SocketChanged, "connection replaced");
+            AddReason(reasons, verdicts, PingRules.PingVerdict.Unmatched, "no ping waiting");
+            AddReason(reasons, verdicts, PingRules.PingVerdict.Skipped, "ping queue overflowed");
+            AddReason(reasons, verdicts, PingRules.PingVerdict.BelowTransport, "below Steam's figure");
+            AddReason(reasons, verdicts, PingRules.PingVerdict.Implausible, "impossible");
+            if (reasons.Count > 0) {
+                sb.AppendLine($"  {Pad("not used", 13)} {string.Join(", ", reasons.ToArray())}");
+            }
+            if (GamePing.Stalls > 0) {
+                sb.AppendLine($"  {Pad("stalls", 13)} {GamePing.Stalls} server frames of {PingRules.StallMs:F0}ms or more; longest {GamePing.LongestStallMs:F0}ms");
+            }
+        }
+
+        private static void AddReason(List<string> reasons, long[] verdicts, PingRules.PingVerdict verdict, string label) {
+            long count = verdicts[(int)verdict];
+            if (count > 0) { reasons.Add($"{label} {count}"); }
+        }
+
+        private static void AppendWaitLine(StringBuilder sb, RpcOwnerRouter.Counters counters) {
+            RouterRules.WaitHistogram waits = counters.Waits;
+            if (waits.Total == 0) { return; }
+            sb.AppendLine($"  {Pad("wait", 13)} {waits.Total} became theirs: half within {FormatBound(waits.Percentile(0.5))}, 90% within {FormatBound(waits.Percentile(0.9))}, longest {waits.MaxMs:F0}ms");
+        }
+
+        private static string FormatBound(double ms) {
+            return double.IsInfinity(ms) ? $"over {RouterRules.WaitHistogram.Bounds[RouterRules.WaitHistogram.Bounds.Length - 1]:F0}ms" : $"{ms:F0}ms";
+        }
+
+        /// <summary>The waiting and its outcomes for pick-ups and other interactions. Nothing
+        /// here carries an item the server could hand back, and a request that cannot be improved
+        /// on goes the way vanilla would have sent it, late, rather than being dropped.</summary>
+        private static void AppendNewFamilyHoldLines(StringBuilder sb, RpcOwnerRouter.Counters counters) {
+            sb.AppendLine($"  {Pad("held", 13)} {counters.HeldCount + counters.Parked} (waited for the owner to be sent its ownership, or for the server to place it; longest {counters.MaxHoldMs:F0}ms)");
+            sb.AppendLine($"  {Pad("left alone", 13)} {counters.LeftAlone} (the sender had just handed it over itself - delivered as sent)");
+            sb.AppendLine($"  {Pad("expired", 13)} {counters.Expired} (could not be improved on within {RpcOwnerRouter.HoldTimeoutSeconds:F0}s - delivered as sent)");
+            if (counters.PushExpired > 0) {
+                sb.AppendLine($"  {Pad("never theirs", 13)} {counters.PushExpired} (asked for, and not theirs within {RpcOwnerRouter.PendingGrantSeconds:F0}s)");
+            }
+            sb.AppendLine($"  {Pad("dropped", 13)} {counters.Dropped} (object or player gone while waiting)");
         }
 
         /// <summary>The waiting and its outcomes. Station requests can carry an item, which is

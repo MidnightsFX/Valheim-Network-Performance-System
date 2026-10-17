@@ -635,10 +635,12 @@ namespace NetworkPerformanceSystem.Runtime {
             if (released > 0) { state.LastSendComplete = false; }
         }
 
-        /// <summary>Put the real record back, only if the fake is still what is there.</summary>
+        /// <summary>Put the real record back, only if the fake is still what is there. The record
+        /// goes down while the object stays as it was, which M9 has to hear.</summary>
         private static bool Restore(ZDOMan.ZDOPeer peer, ZDOID id, ParkedZdo entry) {
             if (!peer.m_zdos.TryGetValue(id, out ZDOMan.ZDOPeer.PeerZDOInfo current) || !Same(current, entry.Fake)) { return false; }
             peer.m_zdos[id] = entry.Real;
+            SyncListCache.OnRecordLowered(peer, id);
             return true;
         }
 

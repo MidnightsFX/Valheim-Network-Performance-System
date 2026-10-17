@@ -60,8 +60,8 @@ namespace NetworkPerformanceSystem.Runtime {
 
             // PlayFab, or a wrapper we could neither see through nor match to a Steam connection.
             // ZPlayFabSocket inherits ZNetStats.GetConnectionQuality, which always reports 0 -
-            // LatencyRegistry.Sample rejects that, which is the existing crossplay no-measurement
-            // path. The wrapper forwards to the real socket here and may throw on a dedicated server
+            // rejected here, so crossplay has no transport figure (M41's in-game ping is the one
+            // it has). The wrapper forwards to the real socket here and may throw on a dedicated server
             // exactly as vanilla does: swallowed, and deliberately not counted against the sampler.
             try {
                 inner.GetConnectionQuality(out float _, out float _, out pingMs, out float _, out float _);

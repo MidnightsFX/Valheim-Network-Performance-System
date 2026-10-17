@@ -6,10 +6,11 @@ namespace NetworkPerformanceSystem.Patches {
 
     /// <summary>
     /// M12 - wiring for RpcOwnerRouter, which delivers owner-addressed requests - station item
-    /// requests, hits on creatures and structures, and terrain edits - to the object's current
-    /// owner. See the router for the rules; this file is only the hooks.
+    /// requests, hits on creatures and structures, terrain edits, item pick-ups and other
+    /// interactions - to the object's current owner. See the router for the rules; this file is
+    /// only the hooks.
     ///
-    /// Three hooks, all host-side in effect:
+    /// Four hooks, all host-side in effect:
     ///   * ZRoutedRpc.RPC_RoutedRPC - every routed RPC a client sends arrives here. The prefix
     ///     peeks at the header without allocating, and only for a request the router takes does
     ///     it deserialize and take over; anything else is rewound and left to vanilla.
@@ -20,6 +21,8 @@ namespace NetworkPerformanceSystem.Patches {
     ///     __runOriginal, so a request is delivered by exactly one of them.
     ///   * ZDOMan.Update (postfix) - flushes held forwards after that frame's ZDO sends, and
     ///     hands back the items of any that can no longer be delivered.
+    ///   * ZDOMan.Update (prefix) - before that frame's sends, pushes an object to a player who
+    ///     asked for it and has just become its owner.
     /// </summary>
     [HarmonyPatch]
     internal static class RpcOwnerRouterPatches {
@@ -37,12 +40,22 @@ namespace NetworkPerformanceSystem.Patches {
             MethodInfo getPeer = AccessTools.Method(typeof(ZDOMan), "GetPeer", new[] { typeof(long) });
             FieldInfo server = AccessTools.Field(typeof(ZRoutedRpc), "m_server");
             FieldInfo id = AccessTools.Field(typeof(ZRoutedRpc), "m_id");
+            MethodInfo pushToPeer = AccessTools.Method(typeof(ZDOMan.ZDOPeer), "ForceSendZDO", new[] { typeof(ZDOID) });
+            FieldInfo peerZdos = AccessTools.Field(typeof(ZDOMan.ZDOPeer), "m_zdos");
+            FieldInfo peers = AccessTools.Field(typeof(ZDOMan), "m_peers");
+            MethodInfo setOwner = AccessTools.Method(typeof(ZDO), "SetOwner", new[] { typeof(long) });
 
-            if (incoming == null || route == null || handle == null || update == null || getPeer == null || server == null || id == null) {
+            if (incoming == null || route == null || handle == null || update == null || getPeer == null || server == null || id == null
+                || pushToPeer == null || peerZdos == null || peers == null || setOwner == null) {
                 PatchGuard.Disable(Mechanism.RpcOwnerRouting,
-                    "ZRoutedRpc.RPC_RoutedRPC / RouteRPC / HandleRoutedRPC, ZDOMan.Update / GetPeer or ZRoutedRpc's id fields do not have the expected shape. " +
-                    "Either the game updated or another mod rewrote them first. Station requests, hits and terrain edits go to whoever the sender names, as vanilla.");
+                    "ZRoutedRpc.RPC_RoutedRPC / RouteRPC / HandleRoutedRPC, ZDOMan.Update / GetPeer / m_peers, ZDOPeer.ForceSendZDO / m_zdos, ZDO.SetOwner or ZRoutedRpc's id fields do not have the expected shape. " +
+                    "Either the game updated or another mod rewrote them first. Station requests, hits, terrain edits, item pick-ups and other interactions go to whoever the sender names, as vanilla.");
                 return false;
+            }
+
+            string members = RpcOwnerRouter.VerifyMembers();
+            if (members != null) {
+                Logger.LogWarning($"Owner RPC routing: some item pick-up and interaction requests are {members}");
             }
             return true;
         }
@@ -70,6 +83,12 @@ namespace NetworkPerformanceSystem.Patches {
         [HarmonyPostfix]
         private static void FlushHeld() {
             RpcOwnerRouter.FlushHeld();
+        }
+
+        [HarmonyPatch(typeof(ZDOMan), "Update")]
+        [HarmonyPrefix]
+        private static void ServicePendingGrants() {
+            RpcOwnerRouter.ServicePendingGrants();
         }
 
         /// <summary>

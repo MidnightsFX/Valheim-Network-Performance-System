@@ -220,6 +220,9 @@ namespace NetworkPerformanceSystem.Runtime {
                 _senderResolved = true;
                 _sender = _rpc != null && ZDOMan.instance != null ? ZDOMan.instance.FindPeer(_rpc) : null;
             }
+            // RevisionHeldBySender is about to set the sender's record below the object's, which
+            // for a refused creature does not change at all. A null sender drops every peer's.
+            SyncListCache.OnRecordLowered(_sender, zdo.m_uid);
             if (_sender == null) { return; }
 
             _sender.ForceSendZDO(zdo.m_uid);

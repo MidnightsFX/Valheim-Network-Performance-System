@@ -54,6 +54,7 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<float> SendIntervalSeconds;
         public static ConfigEntry<float> SendSchedulerFrameBudgetMs;
         public static ConfigEntry<int> SendSchedulerMinPeersPercent;
+        public static ConfigEntry<int> SendSchedulerMaxCpuPercent;
 
         // M3 - latency-aware ownership arbitration
         public static ConfigEntry<bool> EnableOwnershipArbitration;
@@ -63,6 +64,7 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<int> OwnershipMaxReassignsPerPass;
         public static ConfigEntry<float> OwnershipLoadPenaltyMs;
         public static ConfigEntry<int> OwnershipUnmeasuredRttMs;
+        public static ConfigEntry<bool> UseInGamePing;
 
         // M3 tier 2 - interactable-but-stationary objects follow the nearest player
         public static ConfigEntry<bool> EnableInteractiveOwnership;
@@ -114,6 +116,8 @@ namespace NetworkPerformanceSystem {
 
         // M12 terrain - digging and other ground edits delivered to the owner of each terrain tile
         public static ConfigEntry<bool> EnableTerrainEditRouting;
+        public static ConfigEntry<bool> EnableItemPickupRouting;
+        public static ConfigEntry<bool> EnableInteractionRouting;
 
         // M30 - a status effect asked for on somebody else's creature is not sent on every ask
         public static ConfigEntry<bool> LimitRepeatedStatusEffects;
@@ -179,6 +183,10 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<bool> KeepPlayersInBackground;
         public static ConfigEntry<int> BackgroundTimeoutSeconds;
         public static ConfigEntry<bool> KeepPlayersWithoutTheMod;
+
+        // M42 - a crossplay player the server drops is told; M43 - a crossplay reconnect gets time to resume
+        public static ConfigEntry<bool> TellDroppedCrossplayPlayers;
+        public static ConfigEntry<bool> ResumeAfterCrossplayReset;
 
         // M21 - ghost peers stop being trusted to simulate long before they are hung up on
         public static ConfigEntry<bool> EvictGhostOwners;
@@ -307,9 +315,11 @@ namespace NetworkPerformanceSystem {
             SendIntervalSeconds = BindServerConfig("Send Scheduler", "Send Interval Seconds", 0.033f,
                 "Seconds between ZDO send rounds. Vanilla is 0.05, lower = more updates, higher = slower updates.", true, 0.02f, 0.2f);
             SendSchedulerFrameBudgetMs = BindServerConfig("Send Scheduler", "Frame Budget Ms", 4f,
-                "Maximum milliseconds per frame the host spends sending ZDOs to peers, once Min Players Per Frame Percent of them have been sent to. Peers are serviced in round-robin order until the budget runs out and the remainder is owed to the next frame, so nobody is starved. On a busy server this is what keeps the frame time bounded: the effective per-peer send rate becomes min(1/interval, budget/cost) - raise it to trade server frame time for send rate, lower it on a CPU-constrained host. nps_stats shows the effective rate and how often the budget is hit.", true, 0.5f, 16f);
+                "Maximum milliseconds per frame the host spends sending ZDOs to peers, once Min Players Per Frame Percent of them have been sent to. Peers are serviced in round-robin order until the budget runs out and the remainder is owed to the next frame, so nobody is starved. This spreads the sends across frames so no single frame stutters; Max Send CPU Percent is what caps their total. Raise it to trade server frame time for send rate, lower it on a CPU-constrained host. nps_stats shows the effective rate and how often the budget is hit.", true, 0.5f, 16f);
             SendSchedulerMinPeersPercent = BindServerConfig("Send Scheduler", "Min Players Per Frame Percent", 25,
-                "The frame budget never stops a frame's sends before this share of the connected players has been sent to (rounded up, at least one). On a big server each send costs more, and the budget alone can cut a frame down to one or two players, leaving each player waiting dozens of server frames for an update. With this, every player is sent to at least once every few server frames however many have joined: 25 is at least once every 4 frames. It only adds sends while the budget is what is limiting, and those sends cost server frame time. 0 leaves the budget alone in charge. nps_stats shows how many sends it adds and what each one costs.", true, 0, 100);
+                "The frame budget never stops a frame's sends before this share of the connected players has been sent to (rounded up, at least one). On a big server each send costs more, and the budget alone can cut a frame down to one or two players, leaving each player waiting dozens of server frames for an update. With this, every player is sent to at least once every few server frames however many have joined: 25 is at least once every 4 frames. It only adds sends while the budget is what is limiting, those sends cost server frame time, and they never go past Max Send CPU Percent. 0 leaves the budget alone in charge. nps_stats shows how many sends it adds and what each one costs.", true, 0, 100);
+            SendSchedulerMaxCpuPercent = BindServerConfig("Send Scheduler", "Max Send CPU Percent", 25,
+                "The most of each second, in percent, the game's main thread may spend sending to players, all players together. When a full round of sends - every player once, at the measured cost of one send - would take more than this, everyone's send interval is stretched until it fits, so a big server in big bases gets fewer updates per player instead of a pegged CPU core. Small servers with cheap sends never reach it and keep Send Interval Seconds. Each update still carries everything that changed. 0 turns the limit off. nps_stats shows the limit, the interval it sets and the share actually spent.", true, 0, 100);
 
             // Arbiter
             EnableOwnershipArbitration = BindServerConfig("Ownership", "Enable Latency-Aware Ownership", true,
@@ -325,9 +335,12 @@ namespace NetworkPerformanceSystem {
             OwnershipLoadPenaltyMs = BindServerConfig("Ownership", "Load Penalty Ms", 0.02f,
                 "Cost added per simulated object (creatures, ships - not walls or trees) a candidate already owns nearby, in milliseconds. This prevents one user from simulating a whole area even if they have the best connection. Low priority objects will be shuffled to others.", true, 0f, 0.5f);
 
-            // Playfab compatibility | TODO more
             OwnershipUnmeasuredRttMs = BindServerConfig("Ownership", "Unmeasured Peer RTT Ms", 150,
-                "Round-trip time assumed for a peer the host has no measurement for - crossplay/PlayFab connections never report one, and every Steam peer is unmeasured for its first seconds. Such a peer still wins objects only it can see, but loses contested ones to any measured peer with a lower ping. Treating unmeasured as 0ms instead would hand them everything in range.", true, 0, 1000);
+                "Round-trip time assumed for a player the host has no ping for: in their first few seconds, and when their game has not answered for ten seconds. With Use In-Game Ping off, crossplay players never have one either. Such a player still wins objects only they can see, but loses contested ones to any player with a lower ping. Treating unmeasured as 0ms instead would hand them everything in range.", true, 0, 1000);
+
+            // M41
+            UseInGamePing = BindServerConfig("Ping", "Use In-Game Ping", true,
+                "Time each player's ping on the server, from the game's own once-a-second ping to the player's answer, instead of asking Steam. Crossplay players get a ping too, players do not need the mod, and the figure includes everything their updates really wait for. Who runs creatures and objects goes by each player's best ping of the last few minutes, so a player whose connection is busy in a fight does not lose the creatures they run because of it; latency compensation uses their current ping. Send windows and send rates always use Steam's figure. Off goes back to Steam's figure everywhere.");
 
             // Lower priority Arbitration
             EnableInteractiveOwnership = BindServerConfig("Ownership", "Interactive Object Ownership", true,
@@ -388,6 +401,10 @@ namespace NetworkPerformanceSystem {
                 "Deliver hits, repairs, removals and snow changes on buildings, trees and rocks to whoever owns them right now. A player whose copy still names an earlier owner sends them to that player, who drops them without a word. Structure Updates only holds back owner changes while this is on.");
             EnableTerrainEditRouting = BindServerConfig("Routed RPC", "Route Terrain Edits To Owner", true,
                 "Deliver digging, raising, levelling, cultivating and paving - and GradualTerrain's smoothing around a dig - to whoever owns that piece of ground right now. A player whose copy still names an earlier owner sends the edit to that player, who drops it without a word, and the ground can then split open along the border with the next piece of ground, which did take it.");
+            EnableItemPickupRouting = BindServerConfig("Routed RPC", "Route Item Pick-ups To Owner", true,
+                "Deliver a player's request to pick up a dropped item to whoever owns the item right now, and send the item to the player the moment it is theirs. Without this, a request sent to a player who no longer owns the item is lost, and the game waits longer each time before asking again, up to half a minute. The server never takes an item from a player who may be picking it up: it passes requests on, and only hands over an item it owns itself or one nobody owns.");
+            EnableInteractionRouting = BindServerConfig("Routed RPC", "Route Interactions To Owner", true,
+                "Deliver opening, stacking into and emptying chests, doors, picking berries and other pickables, eating from feasts, item and armour stands, naming portals, claiming beds, switching wards, saving to map tables, emptying beehives and sap collectors, the incinerator lever, and naming, saddling and commanding tames to whoever owns the object right now. A player whose copy still names an earlier owner sends them to that player, who drops them without a word. Ship and cart cargo is left to ship ownership.");
             LimitRepeatedStatusEffects = BindServerConfig("Routed RPC", "Limit Repeated Status Effects", true,
                 "Send a status effect to a creature another player is simulating at most 4 times a second, instead of every time something asks for it - and an effect that lasts only once in a third of its duration, at least every 2 seconds, since asking again only restarts its timer. An area that gives a status effect keeps applying it, 50 times a second, to creatures that were yours when they walked in. Once one of them is handed to another player every one of those becomes a message, and a few animals in a base can fill a player's whole upload and stop the world loading for the player they were handed to. Runs on each player's game that has this mod, using the server's setting; the server also stops passing the repeats on from players who do not have it. The log names the effect either way.");
 
@@ -508,6 +525,12 @@ namespace NetworkPerformanceSystem {
             GhostOwnerEvictSeconds = BindServerConfig("Connection Timeout", "Ghost Owner Evict Seconds", 10f,
                 "How long a player may be silent before their objects are given to someone else, in seconds. The game pings every peer once a second, so ten seconds is ten missed replies.",
                 true, 3f, 60f);
+
+            // Crossplay connections
+            TellDroppedCrossplayPlayers = BindServerConfig("Crossplay", "Tell Dropped Players", true,
+                "Server side. When the server drops a crossplay player - a mod's join check refusing them, an admin tool or a mod kicking them - send them the game's own disconnect message first, along with anything else still waiting to go to them. The game tells a crossplay player nothing when the server drops them, so they are left in a half-loaded world until their own game gives up, and a message a mod sends just before dropping them is often lost too. With this they go back to the main menu straight away, as Steam players do. Players do not need this mod. Not sent to a player who timed out, left by themselves or was kicked by the game, which tells them itself.");
+            ResumeAfterCrossplayReset = BindServerConfig("Crossplay", "Resume After Connection Reset", true,
+                "When nothing has arrived from the host for 26 seconds, a crossplay player's game resets its connection. Once it is back, give the host 26 seconds again to start sending, instead of resetting the connection again on the very next frame - which repeats every few seconds and lets nothing through. A connection that never comes back still ends at the game's own timeout. Runs on each player's game that has this mod, using the server's setting.");
 
             // Compatibility with ServerSync and other sync frameworks
             ReportVanillaQueueSize = BindServerConfig("Compatibility", "Report Vanilla Queue Size", true,

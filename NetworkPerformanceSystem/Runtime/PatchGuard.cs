@@ -19,7 +19,7 @@ namespace NetworkPerformanceSystem.Runtime {
         SyncListCache,  // M9     - ZDOMan.CreateSyncList per-peer sector scan reuse
         PlayerLimit,    // M10    - ZNet.RPC_PeerInfo configurable player cap
         ConnectionTimeout, // M11 - ZRpc.SetLongTimeout + Steam TimeoutInitial/TimeoutConnected
-        RpcOwnerRouting,   // M12 - ZRoutedRpc.RPC_RoutedRPC delivery of owner-addressed RPCs (station item requests, creature and structure hits, terrain edits) to the current owner
+        RpcOwnerRouting,   // M12 - ZRoutedRpc.RPC_RoutedRPC delivery of owner-addressed RPCs (station item requests, creature and structure hits, terrain edits, item pick-ups, other interactions) to the current owner
         JotunnQueueLimit,  // M13 - Jotunn.Entities.CustomRPC.MaximumSendQueueSize kept above the M2 window ceiling
         QueueSizeView,     // M14 - ZSteamSocket.GetSendQueueSize shown to other mods as vanilla's window would leave it
         DeserializeAlloc,  // M15 - ZDO.Deserialize field read without the fourteen per-ZDO delegates
@@ -47,6 +47,9 @@ namespace NetworkPerformanceSystem.Runtime {
         AutoSendRate,           // M37 - M1's ping postfix + ZNet.Update (host): the send rate, and each player's upload grant, found from load and congestion between the game's 150 KB/s and a maximum
         MapPins,                // M38 - Minimap.UpdatePlayerPins (client): other players' map icons jump to a far new spot instead of sliding there at 200 m/s, and follow players loaded nearby (every player, on the host) live
         MapPositions,           // M39 - ZNet.Update + ZNet.SendPlayerList (host) / ZNet.SendServerSyncPlayerData (client): a player's map position goes out as soon as everyone's copy is more than a few metres off, and a player's own jump is reported at once
+        GamePing,               // M41 - ZRpc.UpdatePing + M1's ReceivePing postfix (host): each player's ping timed from the game's own ping to its answer, for every transport, crossplay included (M40 is kept for lone upload pacing)
+        CrossplayDropNotice,    // M42 - ZNet.Disconnect + ZNet.RPC_Disconnect (host): a crossplay player the server drops is sent the game's "Disconnect" first, with everything still queued for them
+        CrossplayResume,        // M43 - ZPlayFabSocket.Connect (client): a crossplay connection that comes back after a Party reset gets the full 26 s to resume instead of being reset again at once
     }
 
     /// <summary>
@@ -82,10 +85,12 @@ namespace NetworkPerformanceSystem.Runtime {
         /// </summary>
         internal const string ClientGhostWatchdogGUID = "dreamwraith.ClientGhostWatchdog";
 
-        private static readonly HashSet<Mechanism> Disabled = new HashSet<Mechanism>();
+        /// <summary>Indexed by mechanism. IsActive is asked on every hook, many times a frame, so
+        /// it is one array read rather than a set lookup.</summary>
+        private static readonly bool[] Disabled = new bool[System.Enum.GetValues(typeof(Mechanism)).Length];
         private static readonly Dictionary<Mechanism, string> DisableReasons = new Dictionary<Mechanism, string>();
 
-        internal static bool IsActive(Mechanism mechanism) => !Disabled.Contains(mechanism);
+        internal static bool IsActive(Mechanism mechanism) => !Disabled[(int)mechanism];
 
         /// <summary>
         /// Switch a mechanism off for the rest of the session. Logged at warning level because a
@@ -93,7 +98,8 @@ namespace NetworkPerformanceSystem.Runtime {
         /// the user would otherwise believe it is working.
         /// </summary>
         internal static void Disable(Mechanism mechanism, string reason) {
-            if (Disabled.Add(mechanism)) {
+            if (!Disabled[(int)mechanism]) {
+                Disabled[(int)mechanism] = true;
                 DisableReasons[mechanism] = reason;
                 Logger.LogWarning($"{mechanism} disabled: {reason}");
             }
@@ -125,7 +131,7 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             Logger.LogInfo($"Active mechanisms: {string.Join(", ", live.ToArray())}");
-            if (Disabled.Count > 0) {
+            if (DisableReasons.Count > 0) {
                 foreach (KeyValuePair<Mechanism, string> entry in DisableReasons) {
                     Logger.LogInfo($"  inactive - {entry.Key}: {entry.Value}");
                 }

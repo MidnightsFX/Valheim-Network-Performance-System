@@ -28,7 +28,12 @@ NPS addresses these issues in a number of ways
 
 **Server-only works.** Vanilla clients get the send window, ownership, scheduler, station-request and creature-hit
 fixes with nothing installed on their end, and the server follows where they actually are rather than where they
-were two seconds ago. The server also sends settled or distant creatures, fish and birds, and drifting ice, logs and
+were two seconds ago. Picking up a dropped item, and opening chests and doors, picking berries, using item stands,
+beds, wards, portals, map tables and beehives, and commanding tames, reach whoever owns the object now instead of
+being lost on a player who owned it a moment ago, and an item is sent to the player the moment it is theirs. The
+server times every player's ping itself, from the game's own ping to their answer (`Ping / Use In-Game Ping`), so
+crossplay players have one too and who runs what is decided by each player's best ping rather than one inflated
+by a busy fight. The server also sends settled or distant creatures, fish and birds, and drifting ice, logs and
 dropped items in water, to each player less often,
 holds back building, tree and rock updates that change nothing a player can see, and sends the world's list of past
 players only when it has actually changed. Damage numbers go only to players close enough to see them, and
@@ -75,6 +80,10 @@ A player who alt-tabs or minimises the game is not dropped while it sits in the 
 The same goes for whoever hosts from the game itself. A host who alt-tabs out of a windowed game usually keeps it running, and then nothing changes: the game goes on answering every player. But if a host's game stops while it is in the background, it is the players who hang up on the host, so everyone is dropped at once. The host now tells players with the mod when its game goes into the background, and they wait for it for up to `Background Timeout Seconds` until it has kept running there for 5 seconds. After that they are back on `Connection Timeout Seconds`, so a host whose game crashes or whose connection drops while it sits behind another window is still noticed quickly. A host whose game does stall in the background is waited for every time it is there, for the rest of the session. Players who are waiting see a message saying the host's game is in the background, so they can leave sooner if it does not come back.
 
 Players without the mod, or with an older version of it, wait just as long (`Connection Timeout / Keep Players Without The Mod`, on by default). Their game drops the host when it has not answered its connection check for 30 seconds, and only the host's game answers it, so while that game has stopped the mod answers for it from a separate thread, about every 10 seconds. These players get no message, only the game's own connection warning icon, which still shows most of the time. It covers players connected through Steam whose connection no other mod wraps, and stands down, saying so in the log, if another mod changes what the host sends.
+
+On a crossplay server the game never tells a player that the server dropped them. A mod's join check refusing someone, an admin tool or a mod kicking them leaves that player in a half-loaded world until their own game gives up, and a message a mod sends just before dropping them is often lost too. With `Crossplay / Tell Dropped Players` (on by default) the server first sends them the game's own disconnect message, along with anything still waiting to go to them, so they go back to the main menu straight away as Steam players do. Players do not need the mod. It is not sent to a player who timed out, left by themselves or was kicked by the game, which tells them itself. The "Crossplay connections" block in `nps_stats` counts who was told and who was not.
+
+A crossplay player's game resets its connection after 26 seconds without anything from the host. Once it is back, the game checks the same old clock and resets it again on the very next frame, so the reset repeats every few seconds and nothing gets through. Players with the mod give the host another 26 seconds after each reconnect instead (`Crossplay / Resume After Connection Reset`, on by default, following the server's setting). A connection that never comes back still ends at the game's own timeout.
 
 
 > **Lag, rubber-banding, hits not landing? Send a report.**
@@ -154,3 +163,9 @@ running either way.
 - Disconnect ghosting from **[ClientGhostWatchdog](https://github.com/dreamwraith/Valheim-ClientGhostWatchdog)
 by DreamWraith**.
 - ZDO Redirect from BetterZeeRouter
+
+---
+
+If you enjoy my mods donations are appreciated. My mods will never be paid and donations are not required.
+
+<a href="https://ko-fi.com/midnightsfx"><img height="36" src="https://storage.ko-fi.com/cdn/kofi2.png?v=3" alt="Support me on Ko-fi"></a>

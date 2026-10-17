@@ -865,11 +865,13 @@ namespace NetworkPerformanceSystem.Runtime {
             });
             CandidateIndex[zdoMan.m_sessionID] = 0;
 
-            // A peer we have no round-trip measurement for - PlayFab/crossplay, which never
-            // reports one, or a Steam peer in its first seconds - must not read as 0ms, or the
-            // cost function and the lowest-RTT tie-break both hand it every contested object in
-            // range. Price it pessimistically instead: it still wins outright when it is the only
-            // viewer (cost 0 regardless of RTT) and loses to any measured lower-latency peer.
+            // A peer we have no round-trip figure for - one in its first seconds, one whose answers
+            // have stopped, or (with M41 off) a crossplay peer - must not read as 0ms, or the cost
+            // function and the lowest-RTT tie-break both hand it every contested object in range.
+            // Price it pessimistically instead: it still wins outright when it is the only viewer
+            // (cost 0 regardless of RTT) and loses to any measured lower-latency peer. Which figure
+            // a measured peer is priced at - the in-game ping at its best, or Steam's - is
+            // LatencyRegistry.OwnershipRttMs's to decide.
             float unmeasuredMs = ValConfig.OwnershipUnmeasuredRttMs.Value;
 
             List<ZDOMan.ZDOPeer> peers = zdoMan.m_peers;
@@ -919,7 +921,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     Uid = uid,
                     Zone = ZoneSystem.GetZone(refPos),
                     RefPos = refPos,
-                    RttMs = LatencyRegistry.HasMeasurement(uid) ? LatencyRegistry.MeasuredRttMs(uid) : unmeasuredMs,
+                    RttMs = LatencyRegistry.OwnershipRttMs(uid, unmeasuredMs),
                     CanOwn = true,
                     IsViewer = true,
                     NearRadius = Mathf.Max(1, distance.NearSimulationDistance),        // ZoneCompat.NearFor, without asking twice

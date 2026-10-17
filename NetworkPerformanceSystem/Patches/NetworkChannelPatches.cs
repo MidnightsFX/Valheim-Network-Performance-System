@@ -59,12 +59,13 @@ namespace NetworkPerformanceSystem.Patches {
 
         /// <summary>
         /// ZRpc pings every peer once a second and this fires for both the ping and the pong, so
-        /// it is a free, correctly-paced sampling clock. The RTT itself comes out of the socket
-        /// via RttProbe rather than from timing the pong ourselves. RttProbe, not the vanilla
-        /// accessor: ZSteamSocket.GetConnectionQuality is hard-wired to the Steamworks client
-        /// interface and throws on a dedicated server, which only has the game-server one. This
-        /// postfix runs inside ZRpc.Update's catch-all, so a throw here would be swallowed, logged
-        /// without our name, and leave every mechanism silently on vanilla.
+        /// it is a free, correctly-paced sampling clock. Steam's figure comes out of the socket
+        /// via RttProbe. RttProbe, not the vanilla accessor: ZSteamSocket.GetConnectionQuality is
+        /// hard-wired to the Steamworks client interface and throws on a dedicated server, which
+        /// only has the game-server one. The host also times the answer to its own ping here
+        /// (M41, GamePing) - the in-game figure, which every transport has. This postfix runs
+        /// inside ZRpc.Update's catch-all, so a throw here would be swallowed, logged without our
+        /// name, and leave every mechanism silently on vanilla.
         /// </summary>
         [HarmonyPatch(typeof(ZRpc), "ReceivePing")]
         [HarmonyPostfix]
@@ -72,6 +73,14 @@ namespace NetworkPerformanceSystem.Patches {
             if (ZNet.instance == null) { return; }
 
             ZNetPeer peer = FindPeerByRpc(__instance);
+
+            // M41, host only: an answer to the host's own ping is timed. Ahead of every early
+            // return below, on purpose: the pings are paired with their answers in order, so every
+            // answer has to be seen - including those that arrive while the player has no id yet -
+            // or each later answer would be paired with an older ping. Independent of Steam's
+            // figure further down; it is the only measurement a crossplay player has.
+            if (PatchGuard.IsActive(Mechanism.GamePing)) { GamePing.OnPingMessage(__instance, package, peer); }
+
             if (peer?.m_socket == null || peer.m_uid == 0L) { return; }
 
             // M21's heartbeat. Deliberately ahead of the RttSampling gate and outside it: this is
@@ -86,7 +95,7 @@ namespace NetworkPerformanceSystem.Patches {
             if (!PatchGuard.IsActive(Mechanism.RttSampling)) { return; }     // stood down: skip the probe
 
             if (RttProbe.TryGetPingMs(peer.m_socket, out int ping)) {
-                LatencyRegistry.Sample(peer.m_uid, ping);
+                LatencyRegistry.SampleTransport(peer.m_uid, ping);
             }
 
             // The other half of M2's bandwidth-delay product: the rate Steam paces this connection
@@ -208,6 +217,7 @@ namespace NetworkPerformanceSystem.Patches {
         [HarmonyPostfix]
         private static void OnStopAll() {
             LatencyRegistry.Reset();
+            GamePing.Reset();
             RttProbe.Reset();
             PeerLiveness.Reset();
             GhostWatchdog.Reset();

@@ -7,31 +7,50 @@ namespace NetworkPerformanceSystem.Runtime {
     /// Per-peer round-trip time, measured on the host and published to clients.
     ///
     /// Vanilla has no usable RTT: ZNet.GetServerPing() returns seconds since the last pong, not a
-    /// round trip. The real number is the transport's own estimate
-    /// (SteamNetConnectionRealTimeStatus_t.m_nPing), which RttProbe reads once per ZRpc ping
-    /// through whichever Steamworks interface this process initialised. Vanilla's accessor,
-    /// ZSteamSocket.GetConnectionQuality, is hard-wired to the client interface and throws on a
-    /// dedicated server, where only the game-server interface exists; nothing in the game calls
-    /// it server-side, so that went unnoticed. PlayFab sockets report 0.
+    /// round trip. Two measurements are kept for each peer:
     ///
-    /// Every consumer treats "no sample" as zero and falls back to vanilla behaviour, so a peer on
-    /// a transport that does not report ping is never made worse off.
+    ///   * The transport's - SteamNetConnectionRealTimeStatus_t.m_nPing, Steam's own smoothed
+    ///     estimate, which RttProbe reads on every ZRpc ping and answer (about twice a second)
+    ///     through whichever Steamworks interface this process initialised. Vanilla's accessor,
+    ///     ZSteamSocket.GetConnectionQuality, is hard-wired to the client interface and throws on a
+    ///     dedicated server, where only the game-server interface exists; nothing in the game calls
+    ///     it server-side, so that went unnoticed. PlayFab sockets report nothing. Both sides keep
+    ///     this one: a client measures its own link to the host.
+    ///   * The game's (M41, host only) - GamePing times the host's own once-a-second ZRpc ping to
+    ///     its answer. Every transport has it, crossplay included, and it is what a player's
+    ///     updates actually wait for: the transport's round trip plus the queues and a frame at
+    ///     each end.
+    ///
+    /// Who uses which: ownership and latency compensation use the game's figure while Use In-Game
+    /// Ping is on (OwnershipRttMs, TryGetPublishedRttMs), and Steam's otherwise. Send windows and
+    /// send rates always use Steam's (the Transport accessors): they size Steam's own congestion
+    /// window, and a figure that grows with the queue would grow the window with it.
+    ///
+    /// Every consumer treats "no figure" as a reason to fall back to vanilla behaviour, so a peer
+    /// nobody can measure is never made worse off.
     /// </summary>
     internal static class LatencyRegistry {
 
-        /// <summary>Weight of each new sample in the EWMA. At the 1Hz ping cadence this settles
-        /// in roughly 3-4 seconds - fast enough to track a route change, slow enough that a single
-        /// spike does not move an ownership decision.</summary>
+        /// <summary>Weight of each new transport sample in the EWMA. Read about twice a second (on
+        /// each ping and each answer), this settles in roughly two seconds - fast enough to track a
+        /// route change, slow enough that a single spike does not move a decision.</summary>
         private const float SampleAlpha = 0.25f;
 
         /// <summary>RFC3550-style jitter smoothing: jitter += (|delta| - jitter) / 16.</summary>
         private const float JitterDivisor = 16f;
 
-        /// <summary>Samples outside this range are transport noise, not latency.</summary>
+        /// <summary>Transport samples below this are no measurement. Samples above the maximum are
+        /// a measurement of a terrible link and are counted at the maximum, so that link reads as
+        /// bad rather than keeping its last good figure.</summary>
         private const int MinPlausiblePingMs = 1;
-        private const int MaxPlausiblePingMs = 2000;
+        private const int MaxPlausiblePingMs = PingRules.MaxPingMs;
+
+        /// <summary>A transport figure with no sample for this long is not used by ownership or
+        /// compensation. Send windows keep reading the last one, as they always have.</summary>
+        private const float TransportFreshSeconds = (float)PingRules.FreshSeconds;
 
         internal sealed class PeerLatency {
+            // The transport's (Steam's) figure.
             internal float EwmaMs;
             internal float JitterMs;
             internal int LastMs;
@@ -40,9 +59,12 @@ namespace NetworkPerformanceSystem.Runtime {
 
             /// <summary>The connection's ping with nothing queued on it; see PingBaseline.</summary>
             internal readonly PingBaseline Best = new PingBaseline();
+
+            /// <summary>The game's figure (M41), host side only.</summary>
+            internal readonly PingRules.PingEstimate Game = new PingRules.PingEstimate();
         }
 
-        /// <summary>Host side: live measurements, keyed by peer session id.</summary>
+        /// <summary>Live measurements, keyed by peer session id. On a client, only the host.</summary>
         private static readonly Dictionary<long, PeerLatency> Measured = new Dictionary<long, PeerLatency>();
 
         /// <summary>The rate Steam reports it is sending to each peer at, in bytes/sec, read at the
@@ -80,15 +102,22 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>Number of entries in the most recently published table, for diagnostics.</summary>
         internal static int PublishedEntryCount => Published.Count;
 
-        internal static void Sample(long peerUid, int pingMs) {
-            if (peerUid == 0L) { return; }                                    // pre-handshake, uid not assigned yet
-            if (pingMs < MinPlausiblePingMs || pingMs > MaxPlausiblePingMs) { return; }
-
+        private static PeerLatency StateFor(long peerUid) {
             if (!Measured.TryGetValue(peerUid, out PeerLatency state)) {
                 state = new PeerLatency();
                 Measured[peerUid] = state;
             }
+            return state;
+        }
 
+        // -- the transport's figure ----------------------------------------------------------------
+
+        internal static void SampleTransport(long peerUid, int pingMs) {
+            if (peerUid == 0L) { return; }                                    // pre-handshake, uid not assigned yet
+            if (pingMs < MinPlausiblePingMs) { return; }
+            if (pingMs > MaxPlausiblePingMs) { pingMs = MaxPlausiblePingMs; }
+
+            PeerLatency state = StateFor(peerUid);
             if (!state.HasSample) {
                 state.EwmaMs = pingMs;
                 state.JitterMs = 0f;
@@ -103,19 +132,27 @@ namespace NetworkPerformanceSystem.Runtime {
             state.Best.Add(state.LastSampleRealtime, pingMs);
         }
 
-        /// <summary>The peer's ping at its best (PingBaseline) in milliseconds, or 0 until there
-        /// is one. Either side: each measures its own sockets.</summary>
-        internal static float BaselineRttMs(long peerUid) {
+        /// <summary>The transport's ping at its best (PingBaseline) in milliseconds, or 0 until
+        /// there is one. Either side: each measures its own sockets.</summary>
+        internal static float TransportBaselineMs(long peerUid) {
             return Measured.TryGetValue(peerUid, out PeerLatency state) && state.Best.Value > 0f ? state.Best.Value : 0f;
         }
 
         /// <summary>
-        /// Smoothed RTT to a peer in milliseconds, or 0 when unknown. Host-side query - reads the
-        /// live measurements. Zero means "no information", and every caller must treat it as a
+        /// The transport's smoothed RTT to a peer in milliseconds, or 0 when unknown. Either side,
+        /// for its own sockets. Zero means "no information", and every caller must treat it as a
         /// reason to fall back to vanilla behaviour rather than as "this peer is fast".
         /// </summary>
-        internal static float MeasuredRttMs(long peerUid) {
+        internal static float TransportRttMs(long peerUid) {
             return Measured.TryGetValue(peerUid, out PeerLatency state) && state.HasSample ? state.EwmaMs : 0f;
+        }
+
+        /// <summary>The transport's smoothed RTT when it was sampled within the last few seconds;
+        /// 0 otherwise.</summary>
+        internal static float FreshTransportRttMs(long peerUid) {
+            return Measured.TryGetValue(peerUid, out PeerLatency state) && state.HasSample
+                && Time.realtimeSinceStartup - state.LastSampleRealtime <= TransportFreshSeconds
+                ? state.EwmaMs : 0f;
         }
 
         internal static void NoteSteamSendRate(long peerUid, int bytesPerSec) {
@@ -129,27 +166,73 @@ namespace NetworkPerformanceSystem.Runtime {
             return SteamSendRate.TryGetValue(peerUid, out bytesPerSec);
         }
 
-        internal static float MeasuredJitterMs(long peerUid) {
+        internal static float TransportJitterMs(long peerUid) {
             return Measured.TryGetValue(peerUid, out PeerLatency state) && state.HasSample ? state.JitterMs : 0f;
         }
 
-        internal static bool HasMeasurement(long peerUid) {
+        internal static bool HasTransport(long peerUid) {
             return Measured.TryGetValue(peerUid, out PeerLatency state) && state.HasSample;
         }
 
-        /// <summary>The whole measurement for one peer - last sample, smoothed value and jitter
-        /// together. Host side. False until the peer has been sampled at least once.</summary>
+        /// <summary>The whole measurement for one peer - both figures. False until the transport
+        /// has been sampled at least once.</summary>
         internal static bool TryGetState(long peerUid, out PeerLatency state) {
             return Measured.TryGetValue(peerUid, out state) && state.HasSample;
         }
 
+        // -- the game's figure (M41) ------------------------------------------------------------------
+
+        internal static void SampleGame(long peerUid, int rttMs, double now) {
+            if (peerUid == 0L || rttMs <= 0) { return; }
+            StateFor(peerUid).Game.Add(now, rttMs);
+        }
+
+        /// <summary>The game's measurement of one peer, host side, once it has a sample.</summary>
+        internal static bool TryGetGame(long peerUid, out PingRules.PingEstimate game) {
+            game = Measured.TryGetValue(peerUid, out PeerLatency state) && state.Game.Samples > 0 ? state.Game : null;
+            return game != null;
+        }
+
+        // -- what each consumer reads ---------------------------------------------------------------
+
         /// <summary>
-        /// RTT for any session id, usable on either side: the host reads its own measurements, a
-        /// client reads the table the host published. Returns 0 when unknown.
+        /// What the ownership pass prices a peer at, host side. With Use In-Game Ping on: the
+        /// game's figure at its best (PingRules.OwnershipFigure). Off: Steam's smoothed figure.
+        /// Either way, a peer with nothing fresh is priced at <paramref name="unmeasuredMs"/>, not
+        /// at zero - a peer nobody can measure must not win every contested object in range.
+        /// </summary>
+        internal static float OwnershipRttMs(long peerUid, float unmeasuredMs) {
+            if (GamePing.Active) {
+                Measured.TryGetValue(peerUid, out PeerLatency state);
+                return PingRules.OwnershipFigure(state?.Game, GamePing.NowSeconds, unmeasuredMs);
+            }
+            float transport = FreshTransportRttMs(peerUid);
+            return transport > 0f ? transport : unmeasuredMs;
+        }
+
+        /// <summary>
+        /// The figure published for latency compensation, host side: the game's smoothed round trip
+        /// with Use In-Game Ping on, Steam's otherwise - fresh in either case. False when there is
+        /// none, and the peer is left out of the table.
+        /// </summary>
+        internal static bool TryGetPublishedRttMs(long peerUid, out float rttMs) {
+            rttMs = 0f;
+            if (!Measured.TryGetValue(peerUid, out PeerLatency state)) { return false; }
+            if (GamePing.Active) {
+                rttMs = PingRules.PublishFigure(state.Game, GamePing.NowSeconds);
+                return rttMs > 0f;
+            }
+            rttMs = FreshTransportRttMs(peerUid);
+            return rttMs > 0f;
+        }
+
+        /// <summary>
+        /// RTT for any session id, usable on either side: the host reads the figure it publishes,
+        /// a client reads the table the host published. Returns 0 when unknown.
         /// </summary>
         internal static float RttMs(long peerUid) {
-            if (NpsEnv.IsHost()) { return MeasuredRttMs(peerUid); }
-            return Published.TryGetValue(peerUid, out int ms) ? ms : 0f;
+            if (NpsEnv.IsHost()) { return TryGetPublishedRttMs(peerUid, out float ms) ? ms : 0f; }
+            return Published.TryGetValue(peerUid, out int published) ? published : 0f;
         }
 
         /// <summary>
@@ -169,8 +252,8 @@ namespace NetworkPerformanceSystem.Runtime {
                 // A listen host renders client-owned entities too, and it already has the
                 // measurements first-hand - it never receives a published table. Its own hop is
                 // zero, so the whole path is the owner's half.
-                if (!HasMeasurement(ownerUid)) { return 0f; }
-                return MeasuredRttMs(ownerUid) * 0.5f / 1000f;
+                if (!TryGetPublishedRttMs(ownerUid, out float ownerRtt)) { return 0f; }
+                return ownerRtt * 0.5f / 1000f;
             }
 
             if (!HasFreshTable) { return 0f; }
@@ -198,10 +281,10 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>
         /// The latency table for one recipient. Two filters, both deliberate:
         ///
-        /// Only peers with a measurement are included. The client treats a missing entry as "no
-        /// number" and renders vanilla, whereas a published 0 would read as a 0ms peer and
-        /// produce half-path compensation from a value nobody measured - PlayFab/crossplay peers
-        /// never report RTT, and every Steam peer is unmeasured for its first second or two.
+        /// Only peers with a figure (TryGetPublishedRttMs) are included. The client treats a
+        /// missing entry as "no number" and renders vanilla, whereas a published 0 would read as a
+        /// 0ms peer and produce half-path compensation from a value nobody measured - every peer is
+        /// unmeasured for its first seconds, and without M41 a crossplay peer never has a figure.
         ///
         /// Only peers near the recipient are included. A viewer only renders ZDOs inside its own
         /// active area, and an owner is only ever within the activated area of a sector it owns,
@@ -227,7 +310,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             int count = 1;                                                    // the host's own entry
             for (int i = 0; i < peers.Count; i++) {
-                if (Qualifies(peers[i], recipientZone, radius)) { count++; }
+                if (Qualifies(peers[i], recipientZone, radius, out float _)) { count++; }
             }
 
             pkg.Write(count);
@@ -236,17 +319,18 @@ namespace NetworkPerformanceSystem.Runtime {
 
             for (int i = 0; i < peers.Count; i++) {
                 ZNetPeer peer = peers[i];
-                if (!Qualifies(peer, recipientZone, radius)) { continue; }
+                if (!Qualifies(peer, recipientZone, radius, out float rtt)) { continue; }
                 pkg.Write(peer.m_uid);
-                pkg.Write((ushort)Mathf.Clamp(Mathf.RoundToInt(MeasuredRttMs(peer.m_uid)), 0, ushort.MaxValue));
+                pkg.Write((ushort)Mathf.Clamp(Mathf.RoundToInt(rtt), 0, ushort.MaxValue));
             }
 
             return pkg;
         }
 
-        private static bool Qualifies(ZNetPeer peer, Vector2s recipientZone, int radius) {
+        private static bool Qualifies(ZNetPeer peer, Vector2s recipientZone, int radius, out float rttMs) {
+            rttMs = 0f;
             long uid = peer.m_uid;
-            if (uid == 0L || !HasMeasurement(uid)) { return false; }
+            if (uid == 0L || !TryGetPublishedRttMs(uid, out rttMs)) { return false; }
             if (radius == int.MaxValue) { return true; }
             Vector2s zone = ZoneSystem.GetZone(peer.GetRefPos());
             return ZoneCompat.InActiveArea(zone, recipientZone, radius);

@@ -8,14 +8,14 @@ namespace NetworkPerformanceSystem.Patches {
     /// <summary>
     /// M9 - wiring for the per-peer sector scan cache. See SyncListCache for the rules.
     ///
-    /// Three hooks:
+    /// Two hooks:
     ///   * ZDOMan.CreateSyncList - the prefix either builds the sync list itself from the cached
     ///     scan and skips vanilla, or declines and lets vanilla run untouched.
-    ///   * ZDOMan.HandleDestroyedZDO - the single steady-state site that returns a ZDO to the
-    ///     pool, and therefore the moment a cached reference can start meaning something else.
     ///   * ZDOMan.LoadChunks and ZDOMan.Load - the current and legacy world loads, both of which
     ///     bulk-release every ZDO in the world. Nothing cached survives either.
     ///
+    /// A single destroy needs no hook: every cached entry carries the id it was scanned with, so
+    /// an object destroyed or recycled since is passed over where it lies.
     /// ZDOMan.ShutDown also bulk-releases, and is covered by the Reset on ZNet.StopAll.
     /// </summary>
     [HarmonyPatch]
@@ -38,15 +38,14 @@ namespace NetworkPerformanceSystem.Patches {
             MethodInfo force = AccessTools.Method(typeof(ZDOMan), "AddForceSendZdos",
                 new[] { typeof(ZDOMan.ZDOPeer), typeof(List<ZDO>) });
             MethodInfo shouldSend = AccessTools.Method(typeof(ZDOMan.ZDOPeer), "ShouldSend", new[] { typeof(ZDO) });
-            MethodInfo destroyed = AccessTools.Method(typeof(ZDOMan), "HandleDestroyedZDO", new[] { typeof(ZDOID) });
             MethodInfo isValid = AccessTools.Method(typeof(ZDO), "IsValid");
 
             if (create == null || find == null || sort == null || force == null ||
-                shouldSend == null || destroyed == null || isValid == null) {
+                shouldSend == null || isValid == null) {
                 PatchGuard.Disable(Mechanism.SyncListCache,
                     "ZDOMan.CreateSyncList and the methods its server branch is built from do not have the expected shape " +
                     "(CreateSyncList / FindSectorObjects / ServerSortSendZDOS / AddForceSendZdos / ZDOPeer.ShouldSend / " +
-                    "HandleDestroyedZDO / ZDO.IsValid). Either the game updated or another mod rewrote them first. " +
+                    "ZDO.IsValid). Either the game updated or another mod rewrote them first. " +
                     "The sector scan runs on every send, as vanilla.");
                 return false;
             }
@@ -61,17 +60,6 @@ namespace NetworkPerformanceSystem.Patches {
         [HarmonyPrefix]
         private static bool BuildFromCachedScan(ZDOMan __instance, ZDOMan.ZDOPeer peer, List<ZDO> toSync) {
             return !SyncListCache.TryBuildSyncList(__instance, peer, toSync);
-        }
-
-        /// <summary>
-        /// The ZDO reaching this method is about to be handed back to ZDOPool, where a later
-        /// Get() can hand the same instance out as an unrelated object. Postfix rather than
-        /// prefix so the generation only moves once the release has actually happened.
-        /// </summary>
-        [HarmonyPatch(typeof(ZDOMan), "HandleDestroyedZDO")]
-        [HarmonyPostfix]
-        private static void OnZdoDestroyed() {
-            SyncListCache.OnZdoDestroyed();
         }
 
         /// <summary>

@@ -1,5 +1,7 @@
+using HarmonyLib;
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using UnityEngine;
 
 namespace NetworkPerformanceSystem.Runtime {
@@ -144,6 +146,31 @@ namespace NetworkPerformanceSystem.Runtime {
     /// ownership, every later request for that tile waits too, and FlushHeld forwards them in the
     /// order they came (short of the owner changing again meanwhile). Both handlers are gated on
     /// IsOwner, so double delivery is impossible here for the same reason as for stations.
+    ///
+    /// ITEM PICK-UPS are the fifth family. ItemDrop.RequestOwn sends RPC_RequestOwn to the
+    /// sender's copy of the owner, and only the owner answers it, by handing the item over. One
+    /// sent to a stale owner is simply lost, and the game then waits longer before each new try -
+    /// 0.2 s doubling up to 30 s - so a player can stand on an item for most of a minute. Two
+    /// delays, and both are taken out here:
+    ///
+    ///   * The request goes to whoever owns the item now (RouterRules.DecideOwnershipRequest).
+    ///     The host never takes an item from a player who may be picking it up: it only gives
+    ///     away an item it owns itself, or one nobody owns and every copy has heard so; one whose
+    ///     owner has left waits for the ownership pass to place it, as before.
+    ///   * The moment the host's copy names the requester owner - by whatever path that arrived -
+    ///     the item is pushed to them ahead of the host's normal send order (ServicePendingGrants),
+    ///     so their game stops waiting for it.
+    ///
+    /// OTHER INTERACTIONS are the sixth: doors, pickables, feasts, chests, item and armour stands,
+    /// portal names, beds, wards, map tables, beehives, sap collectors, the incinerator, and naming,
+    /// saddling and commanding tames - all addressed to the sender's copy of the owner, all lost on
+    /// a stale one. Each is listed with its own rules (InteractionMembers): which handlers have no
+    /// owner check and so must never be delivered twice, which hand the object to the requester,
+    /// which are judged as creatures. Replies (RPC_OpenResponse and the like) and anything sent
+    /// to everybody are never touched. Two traps only these families can fall into are handled
+    /// explicitly: a player who has just handed an object over itself and is passing a request to
+    /// its new owner before the host has heard (RouterRules.LeaveToFutureOwner), and a pickable
+    /// owned by a dedicated server, whose handler reads the local player and throws there.
     /// </summary>
     internal static class RpcOwnerRouter {
 
@@ -154,6 +181,8 @@ namespace NetworkPerformanceSystem.Runtime {
             Creature,
             Structure,
             Terrain,
+            Pickup,
+            Interaction,
         }
 
         /// <summary>What one family of requests needed correcting. "Re-targeted" and "claimed" are
@@ -169,6 +198,15 @@ namespace NetworkPerformanceSystem.Runtime {
             internal long Dropped;      // object or target gone while waiting, and no item to hand back
             internal float MaxHoldMs;
 
+            // Pick-ups and other interactions only.
+            internal long AlreadyTheirs; // requester already owned it and had not been told - sent it instead
+            internal long Granted;       // the host owned it and handed it to the requester
+            internal long HandedOver;    // a pickable the dedicated server owned, handed to the picker first
+            internal long LeftAlone;     // the sender had just handed the object over itself - left to vanilla
+            internal long Pushed;        // requester became owner and was sent the object ahead of its turn
+            internal long PushExpired;   // requester never became owner within PendingGrantSeconds
+            internal readonly RouterRules.WaitHistogram Waits = new RouterRules.WaitHistogram();
+
             internal void Clear() {
                 Seen = 0;
                 Retargeted = 0;
@@ -179,6 +217,13 @@ namespace NetworkPerformanceSystem.Runtime {
                 Refunded = 0;
                 Dropped = 0;
                 MaxHoldMs = 0f;
+                AlreadyTheirs = 0;
+                Granted = 0;
+                HandedOver = 0;
+                LeftAlone = 0;
+                Pushed = 0;
+                PushExpired = 0;
+                Waits.Clear();
             }
         }
 
@@ -186,6 +231,8 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static readonly Counters Creatures = new Counters();
         internal static readonly Counters Structures = new Counters();
         internal static readonly Counters TerrainEdits = new Counters();
+        internal static readonly Counters Pickups = new Counters();
+        internal static readonly Counters Interactions = new Counters();
 
         /// <summary>The owner-addressed creature requests that must land. Only RPC_Damage - see the
         /// class comment for why RPC_Stagger is not one of them.</summary>
@@ -215,6 +262,160 @@ namespace NetworkPerformanceSystem.Runtime {
 
         /// <summary>Per-prefab verdict: does it carry a TerrainComp.</summary>
         private static readonly Dictionary<int, bool> TerrainPrefabs = new Dictionary<int, bool>();
+
+        // -- item pick-ups and other interactions ------------------------------------------------
+
+        /// <summary>The components whose owner-addressed requests the pick-up and interaction
+        /// families take, as read from a prefab. ShipOrCart marks a prefab whose containers are
+        /// cargo, which ship and cart ownership handle (ShipHelmOwnership) and these families leave
+        /// alone.</summary>
+        [Flags]
+        private enum Kind : uint {
+            None = 0,
+            ItemDrop = 1u << 0,
+            ItemStand = 1u << 1,
+            ArmorStand = 1u << 2,
+            Pickable = 1u << 3,
+            PickableItem = 1u << 4,
+            Feast = 1u << 5,
+            Container = 1u << 6,
+            TeleportWorld = 1u << 7,
+            Bed = 1u << 8,
+            PrivateArea = 1u << 9,
+            MapTable = 1u << 10,
+            Tameable = 1u << 11,
+            Incinerator = 1u << 12,
+            Door = 1u << 13,
+            Beehive = 1u << 14,
+            SapCollector = 1u << 15,
+            ShipOrCart = 1u << 16,
+        }
+
+        /// <summary>
+        /// One owner-addressed request these families take, on one kind of object. Checked
+        /// against the game once at startup (VerifyMembers): a handler that has gone is dropped, and
+        /// one that has lost its owner check is never trusted with a request sent to nobody.
+        /// </summary>
+        private sealed class Member {
+            internal readonly int Hash;
+            internal readonly string Name;
+            internal readonly Kind Component;
+            internal readonly Type Type;
+            internal readonly string Handler;
+            internal readonly bool Gated;
+            internal readonly bool NotOnShipOrCart;
+            internal RouterRules.Rule Rules;
+            internal bool Live = true;
+
+            internal Member(string name, Kind component, Type type, string handler, bool gated, RouterRules.Rule rules, bool notOnShipOrCart = false) {
+                Hash = name.GetStableHashCode();
+                Name = name;
+                Component = component;
+                Type = type;
+                Handler = handler;
+                Gated = gated;
+                Rules = rules;
+                NotOnShipOrCart = notOnShipOrCart;
+            }
+
+            internal RpcOwnerRouter.Family Family => Component == Kind.ItemDrop ? RpcOwnerRouter.Family.Pickup : RpcOwnerRouter.Family.Interaction;
+        }
+
+        private const RouterRules.Rule Interact = RouterRules.Rule.ClaimWhenAbsent | RouterRules.Rule.FutureOwnerGuard | RouterRules.Rule.KeepOrder;
+        private const RouterRules.Rule Ownership = RouterRules.Rule.OwnershipRequest | RouterRules.Rule.GrantsToSender;
+
+        /// <summary>
+        /// Every request the pick-up and interaction families take, with how each is treated. The
+        /// handlers were read in the decompiled game; "gated" ones begin with an IsOwner check and
+        /// do nothing anywhere else, the rest (doors, beehives, sap collectors, tame commands) run
+        /// on any machine that has the object, so one sent to nobody has already run on its
+        /// sender and is left alone (RefuseTargetZero). Deliberately absent: every reply
+        /// (RPC_OpenResponse and the like, addressed to the requester, not the owner), the
+        /// portal's RPC_SetConnected (addressed to the other portal's owner), RPC_SpawnBoss (two
+        /// owners would spawn two bosses), traps (timing), saddles' riding controls, carts, and
+        /// fish, whose RequestPickup works on any machine that has it.
+        /// </summary>
+        private static readonly Member[] AllMembers = {
+            new Member("RPC_RequestOwn", Kind.ItemDrop, typeof(ItemDrop), "RPC_RequestOwn", true, Ownership),
+            new Member("RPC_RequestOwn", Kind.ItemStand, typeof(ItemStand), "RPC_RequestOwn", true, Ownership),
+            new Member("RPC_RequestOwn", Kind.ArmorStand, typeof(ArmorStand), "RPC_RequestOwn", true, Ownership),
+            new Member("RPC_Pick", Kind.Pickable, typeof(Pickable), "RPC_Pick", true, Interact | RouterRules.Rule.HandOverFromDedicatedHost),
+            new Member("Pick", Kind.PickableItem, typeof(PickableItem), "RPC_Pick", true, Interact),
+            new Member("RPC_TryEat", Kind.Feast, typeof(Feast), "RPC_TryEat", true, Interact),
+            new Member("RPC_RequestOpen", Kind.Container, typeof(Container), "RPC_RequestOpen", true, Interact | RouterRules.Rule.GrantsToSender, notOnShipOrCart: true),
+            new Member("RPC_RequestStack", Kind.Container, typeof(Container), "RPC_RequestStack", true, Interact | RouterRules.Rule.GrantsToSender, notOnShipOrCart: true),
+            new Member("RPC_RequestTakeAll", Kind.Container, typeof(Container), "RPC_RequestTakeAll", true, Interact, notOnShipOrCart: true),
+            new Member("RPC_DropItem", Kind.ItemStand, typeof(ItemStand), "RPC_DropItem", true, Interact),
+            new Member("RPC_DropItemByName", Kind.ArmorStand, typeof(ArmorStand), "RPC_DropItemByName", true, Interact),
+            new Member("RPC_DestroyAttachment", Kind.ItemStand, typeof(ItemStand), "RPC_DestroyAttachment", true, Interact),
+            new Member("RPC_DestroyAttachment", Kind.ArmorStand, typeof(ArmorStand), "RPC_DestroyAttachment", true, Interact),
+            new Member("RPC_SetTag", Kind.TeleportWorld, typeof(TeleportWorld), "RPC_SetTag", true, Interact),
+            new Member("SetOwner", Kind.Bed, typeof(Bed), "RPC_SetOwner", true, Interact),
+            new Member("ToggleEnabled", Kind.PrivateArea, typeof(PrivateArea), "RPC_ToggleEnabled", true, Interact),
+            new Member("TogglePermitted", Kind.PrivateArea, typeof(PrivateArea), "RPC_TogglePermitted", true, Interact),
+            new Member("MapData", Kind.MapTable, typeof(MapTable), "RPC_MapData", true, Interact),
+            new Member("SetName", Kind.Tameable, typeof(Tameable), "RPC_SetName", true, Interact | RouterRules.Rule.CreaturePresence),
+            new Member("AddSaddle", Kind.Tameable, typeof(Tameable), "RPC_AddSaddle", true, Interact | RouterRules.Rule.CreaturePresence),
+            new Member("Command", Kind.Tameable, typeof(Tameable), "RPC_Command", false, Interact | RouterRules.Rule.RefuseTargetZero | RouterRules.Rule.CreaturePresence),
+            new Member("RPC_RequestIncinerate", Kind.Incinerator, typeof(Incinerator), "RPC_RequestIncinerate", true, Interact),
+            new Member("UseDoor", Kind.Door, typeof(Door), "RPC_UseDoor", false, Interact | RouterRules.Rule.RefuseTargetZero),
+            new Member("RPC_Extract", Kind.Beehive, typeof(Beehive), "RPC_Extract", false, Interact | RouterRules.Rule.RefuseTargetZero),
+            new Member("RPC_Extract", Kind.SapCollector, typeof(SapCollector), "RPC_Extract", false, Interact | RouterRules.Rule.RefuseTargetZero),
+        };
+
+        /// <summary>AllMembers by method hash. Several components can register the same name
+        /// (RPC_RequestOwn is the item's, the item stand's, the armour stand's and the cart's), so
+        /// the prefab's components decide which member, if any, a request is.</summary>
+        private static readonly Dictionary<int, Member[]> MembersByHash = BuildMembersByHash();
+
+        private static Dictionary<int, Member[]> BuildMembersByHash() {
+            Dictionary<int, List<Member>> grouped = new Dictionary<int, List<Member>>();
+            foreach (Member member in AllMembers) {
+                if (!grouped.TryGetValue(member.Hash, out List<Member> list)) {
+                    list = new List<Member>();
+                    grouped[member.Hash] = list;
+                }
+                list.Add(member);
+            }
+            Dictionary<int, Member[]> result = new Dictionary<int, Member[]>();
+            foreach (KeyValuePair<int, List<Member>> pair in grouped) { result[pair.Key] = pair.Value.ToArray(); }
+            return result;
+        }
+
+        /// <summary>Per-prefab components, for the pick-up and interaction families.</summary>
+        private static readonly Dictionary<int, Kind> InteractionPrefabs = new Dictionary<int, Kind>();
+
+        /// <summary>
+        /// A player who asked for an object (an item, a chest, an item stand), remembered until the
+        /// host's copy names them owner - by whichever path that change arrives - and they are
+        /// sent the object at once. Keyed by object: a second requester replaces the first.
+        /// </summary>
+        private struct PendingGrant {
+            internal long Requester;
+            internal Family Family;
+            internal float FirstSeen;
+            internal float ExpiresAt;
+        }
+
+        /// <summary>How long a request for an object is followed. RequestOwn's own retries come
+        /// faster than this at first, and each one renews the request.</summary>
+        internal const float PendingGrantSeconds = 5f;
+
+        /// <summary>Hostile-input and runaway guard; a full server's pick-ups in flight are tens.</summary>
+        private const int MaxPendingGrants = 512;
+
+        private static readonly Dictionary<ZDOID, PendingGrant> Pending = new Dictionary<ZDOID, PendingGrant>();
+        private static readonly List<ZDOID> PendingScratch = new List<ZDOID>();
+        internal static long PendingSkipped;
+
+        /// <summary>Ids whose held request waited in this FlushHeld pass; a KeepOrder request for
+        /// the same object waits behind it rather than overtaking it.</summary>
+        private static readonly HashSet<ZDOID> WaitedThisPass = new HashSet<ZDOID>();
+
+        /// <summary>Set while DeliverAsAddressed hands a message back to vanilla's RouteRPC, so
+        /// the router's own RouteRPC prefix lets it through untouched.</summary>
+        private static bool _passThrough;
+        private static bool _membersVerified;
 
         /// <summary>
         /// The owner-addressed requests the station components make. Anything they send to
@@ -278,6 +479,8 @@ namespace NetworkPerformanceSystem.Runtime {
             internal Vector3 At;          // where the station stood when the request arrived
             internal long ForcedFor;      // the owner its ZDO has been force-sent to, 0 if none yet
             internal bool Retargeted;     // already counted in Retargeted
+            internal RouterRules.Rule Rules;
+            internal long AddressedTo;    // the peer the sender named, before any re-targeting
         }
 
         private static readonly List<Request> Held = new List<Request>();
@@ -298,6 +501,8 @@ namespace NetworkPerformanceSystem.Runtime {
                 case Family.Station: return Stations;
                 case Family.Creature: return Creatures;
                 case Family.Terrain: return TerrainEdits;
+                case Family.Pickup: return Pickups;
+                case Family.Interaction: return Interactions;
                 default: return Structures;
             }
         }
@@ -321,7 +526,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 pkg.ReadLong();                                              // m_targetPeerID
                 ZDOID targetZdo = pkg.ReadZDOID();
                 int methodHash = pkg.ReadInt();
-                if (!TryClassify(targetZdo, methodHash, out ZDO zdo, out Family family)) {
+                if (!TryClassify(targetZdo, methodHash, out ZDO zdo, out Family family, out RouterRules.Rule rules)) {
                     pkg.SetPos(saved);
                     return false;
                 }
@@ -331,7 +536,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 data.Deserialize(pkg);
 
                 For(family).Seen++;
-                if (!TryTake(data, zdo, family, out Request request)) {
+                if (!TryTake(data, zdo, family, rules, out Request request)) {
                     pkg.SetPos(saved);
                     return false;
                 }
@@ -358,13 +563,13 @@ namespace NetworkPerformanceSystem.Runtime {
         /// has been dealt with here and vanilla must not run.
         /// </summary>
         internal static bool TryRoute(ZRoutedRpc router, ZRoutedRpc.RoutedRPCData data) {
-            if (!HooksLive(router) || data == null) { return false; }
+            if (_passThrough || !HooksLive(router) || data == null) { return false; }
 
             try {
-                if (!TryClassify(data.m_targetZDO, data.m_methodHash, out ZDO zdo, out Family family)) { return false; }
+                if (!TryClassify(data.m_targetZDO, data.m_methodHash, out ZDO zdo, out Family family, out RouterRules.Rule rules)) { return false; }
 
                 For(family).Seen++;
-                if (!TryTake(data, zdo, family, out Request request)) { return false; }
+                if (!TryTake(data, zdo, family, rules, out Request request)) { return false; }
                 return Route(router, ref request, zdo, retry: false, expired: false) != Outcome.Vanilla;
             } catch (Exception e) {
                 Logger.LogWarning($"Owner RPC routing fell back to vanilla: {e.GetType().Name}: {e.Message}");
@@ -378,12 +583,18 @@ namespace NetworkPerformanceSystem.Runtime {
         /// probes; only a matching hash pays for the ZDO lookup and the prefab check. A hit on a
         /// player matches the hash and fails every prefab check, and is left alone. The families
         /// are tried in order - station, creature, structure - so an RPC_Damage on a creature is
-        /// always a creature hit, and one on a wall or a tree is a structure hit. Terrain edits share
-        /// no method name with the others, so where they sit in that order does not matter.
+        /// always a creature hit, and one on a wall or a tree is a structure hit. Terrain edits,
+        /// item pick-ups and the other interactions share no method name with the others, so where
+        /// they sit in that order does not matter.
+        ///
+        /// The rules returned for the four families that shipped first are exactly how they always
+        /// behaved: an absent owner is replaced by the requester, judged by what each player loads
+        /// for a creature and by the presence square for the rest.
         /// </summary>
-        private static bool TryClassify(ZDOID target, int methodHash, out ZDO zdo, out Family family) {
+        private static bool TryClassify(ZDOID target, int methodHash, out ZDO zdo, out Family family, out RouterRules.Rule rules) {
             zdo = null;
             family = Family.Station;
+            rules = RouterRules.Rule.ClaimWhenAbsent;
             if (target.IsNone()) { return false; }
 
             bool station = RequestHashes.Contains(methodHash) && ValConfig.EnableStationRpcRouting.Value;
@@ -392,7 +603,11 @@ namespace NetworkPerformanceSystem.Runtime {
                 && ValConfig.EnableStructureHitRouting != null && ValConfig.EnableStructureHitRouting.Value;
             bool terrain = TerrainRequestHashes.Contains(methodHash)
                 && ValConfig.EnableTerrainEditRouting != null && ValConfig.EnableTerrainEditRouting.Value;
-            if (!station && !creature && !structure && !terrain) { return false; }
+            bool pickups = ValConfig.EnableItemPickupRouting != null && ValConfig.EnableItemPickupRouting.Value;
+            bool interactions = ValConfig.EnableInteractionRouting != null && ValConfig.EnableInteractionRouting.Value;
+            Member[] members = null;
+            bool member = (pickups || interactions) && MembersByHash.TryGetValue(methodHash, out members);
+            if (!station && !creature && !structure && !terrain && !member) { return false; }
 
             zdo = ZDOMan.instance?.GetZDO(target);
             if (zdo == null) { return false; }
@@ -407,7 +622,22 @@ namespace NetworkPerformanceSystem.Runtime {
             }
             if (creature && OwnershipPolicy.IsCreature(zdo)) {
                 family = Family.Creature;
+                rules |= RouterRules.Rule.CreaturePresence;
                 return true;
+            }
+            if (member) {
+                Kind kind = KindOf(zdo);
+                if (kind == Kind.None) { return false; }
+                for (int i = 0; i < members.Length; i++) {
+                    Member candidate = members[i];
+                    if (!candidate.Live || (kind & candidate.Component) == 0) { continue; }
+                    if (candidate.NotOnShipOrCart && (kind & Kind.ShipOrCart) != 0) { continue; }
+                    family = candidate.Family;
+                    if (family == Family.Pickup ? !pickups : !interactions) { continue; }
+                    rules = candidate.Rules;
+                    return true;
+                }
+                return false;
             }
             family = Family.Structure;
             return structure && StructureUpdates.IsHeldStructure(zdo);
@@ -416,12 +646,14 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>
         /// The request the router will carry for this message, or false to leave it to vanilla.
         /// A station request is told here what it carries, while its station is certainly still
-        /// there to be read. The one refusal: a CookingStation.RPC_AddItem sent to nobody (target
+        /// there to be read. The refusals: a CookingStation.RPC_AddItem sent to nobody (target
         /// 0) has already filled a slot on its sender, which ran it before sending - see the class
-        /// comment - so it is not the router's to deliver again, or to refund.
+        /// comment - so it is not the router's to deliver again, or to refund; and the same goes
+        /// for any interaction whose handler has no owner check (RefuseTargetZero).
         /// </summary>
-        private static bool TryTake(ZRoutedRpc.RoutedRPCData data, ZDO zdo, Family family, out Request request) {
-            request = new Request { Data = data, Family = family };
+        private static bool TryTake(ZRoutedRpc.RoutedRPCData data, ZDO zdo, Family family, RouterRules.Rule rules, out Request request) {
+            request = new Request { Data = data, Family = family, Rules = rules, AddressedTo = data.m_targetPeerID };
+            if ((rules & RouterRules.Rule.RefuseTargetZero) != 0 && data.m_targetPeerID == 0L) { return false; }
             if (family != Family.Station) { return true; }
 
             StationKind station = Station(zdo);
@@ -452,13 +684,17 @@ namespace NetworkPerformanceSystem.Runtime {
 
             float now = Time.realtimeSinceStartup;
             int kept = 0;
+            WaitedThisPass.Clear();
             for (int i = 0; i < Held.Count; i++) {
                 Request held = Held[i];
                 Counters counters = For(held.Family);
                 bool keep = false;
                 try {
                     ZDO zdo = ZDOMan.instance.GetZDO(held.Data.m_targetZDO);
-                    if (zdo == null) {
+                    if (zdo != null && (held.Rules & RouterRules.Rule.KeepOrder) != 0 && WaitedThisPass.Contains(zdo.m_uid)) {
+                        // An earlier request for this object is still waiting: stay behind it.
+                        keep = true;
+                    } else if (zdo == null) {
                         // The host keeps every ZDO, so this station was destroyed, and its owner
                         // dropped what was in it. What this request carried never got there.
                         if (!Refund(held, counters, "the station was destroyed while it waited")) { counters.Dropped++; }
@@ -468,6 +704,7 @@ namespace NetworkPerformanceSystem.Runtime {
                         switch (Route(router, ref held, zdo, retry: true, expired: expired)) {
                             case Outcome.Wait:
                                 keep = true;
+                                WaitedThisPass.Add(zdo.m_uid);
                                 break;
                             case Outcome.Done:
                                 if (waitedMs > counters.MaxHoldMs) { counters.MaxHoldMs = waitedMs; }
@@ -504,28 +741,78 @@ namespace NetworkPerformanceSystem.Runtime {
         /// here, so a Vanilla outcome hands back exactly what arrived.
         /// </summary>
         private static Outcome Route(ZRoutedRpc router, ref Request request, ZDO zdo, bool retry, bool expired) {
+            RouterRules.Rule rules = request.Rules;
+            if ((rules & RouterRules.Rule.OwnershipRequest) != 0) { return RouteOwnershipRequest(router, ref request, zdo, retry, expired); }
+
             ZRoutedRpc.RoutedRPCData data = request.Data;
             Family family = request.Family;
             ZDOMan zdoMan = ZDOMan.instance;
             long self = router.m_id;
             Counters counters = For(family);
+            bool creatureTest = (rules & RouterRules.Rule.CreaturePresence) != 0;
+            // Pick-ups and the other interactions push an object only to a player who already
+            // holds it (PushIfHeld), and never hand a held request back to vanilla to be dropped.
+            // The four older families keep exactly the behaviour they shipped with.
+            bool newFamily = family == Family.Pickup || family == Family.Interaction;
+            long sender = data.m_senderPeerID;
 
             long owner = zdo.GetOwner();
+
+            if ((rules & RouterRules.Rule.FutureOwnerGuard) != 0 && owner == sender
+                && RouterRules.LeaveToFutureOwner(owner, sender, self, request.AddressedTo, SenderCaughtUp(zdoMan, sender, self, zdo), retry)) {
+                counters.LeftAlone++;
+                return Outcome.Vanilla;
+            }
+
+            if (!retry && (rules & RouterRules.Rule.GrantsToSender) != 0 && sender != self) {
+                NotePending(zdo.m_uid, sender, family);
+            }
+
+            if (!retry && (rules & RouterRules.Rule.KeepOrder) != 0 && HasHeldFor(zdo.m_uid)) {
+                // An earlier request for this object is still waiting; deliver this one after it.
+                Hold(ref request, counters, parked: false);
+                return Outcome.Done;
+            }
+
             ZDOMan.ZDOPeer ownerPeer = null;
             bool claim = false;
+            bool handOver = false;
 
-            if (owner == 0L || !Holds(family, zdoMan, owner, self, zdo, out ownerPeer)) {
+            if ((rules & RouterRules.Rule.HandOverFromDedicatedHost) != 0 && owner == self && NpsEnv.IsDedicated()) {
+                // Pickable.RPC_Pick reads Player.m_localPlayer before it drops anything, and a
+                // dedicated server has none: run there, the pick throws and is lost, as it is in
+                // vanilla. The server is the owner letting go, so nobody else can be picking it:
+                // the picker takes it, and runs the pick as its owner.
+                if (sender == self || !Holds(creatureTest, zdoMan, sender, self, zdo, out ownerPeer)) {
+                    return retry ? DeliverAsAddressed(router, ref request) : Outcome.Vanilla;
+                }
+                owner = sender;
+                claim = true;
+                handOver = true;
+            } else if (owner == 0L || !Holds(creatureTest, zdoMan, owner, self, zdo, out ownerPeer)) {
+                if ((rules & RouterRules.Rule.ClaimWhenAbsent) == 0) {
+                    // Not one this family may hand over: wait for the ownership pass to place it.
+                    if (!retry) {
+                        Hold(ref request, counters, parked: true);
+                        return Outcome.Done;
+                    }
+                    if (!expired) { return Outcome.Wait; }
+                    counters.Expired++;
+                    return DeliverAsAddressed(router, ref request);
+                }
+
                 // Nobody present is simulating this. The requester is standing at it - they have
                 // the instance, or they could not have interacted - so they are the right owner,
                 // and the ownership pass would agree within two seconds.
-                long sender = data.m_senderPeerID;
-                if (sender != self && !Holds(family, zdoMan, sender, self, zdo, out ownerPeer)) {
+                if (sender != self && !Holds(creatureTest, zdoMan, sender, self, zdo, out ownerPeer)) {
                     // The host's view of the requester does not put them there either, so there
                     // is no credible owner to name. With no item at stake vanilla's delivery is
-                    // the honest one (on a retry, the request is dropped). With one, vanilla's
-                    // delivery would lose it: wait for somebody to be there - the requester,
-                    // usually, once the host catches up with them - and hand it back if nobody is.
-                    if (request.Refund == null) { return Outcome.Vanilla; }
+                    // the honest one (on a retry, the request is dropped - except for the newer
+                    // families, which do what vanilla would have done when it arrived). With one,
+                    // vanilla's delivery would lose it: wait for somebody to be there - the
+                    // requester, usually, once the host catches up with them - and hand it back
+                    // if nobody is.
+                    if (request.Refund == null) { return newFamily && retry ? DeliverAsAddressed(router, ref request) : Outcome.Vanilla; }
                     if (!retry) {
                         Hold(ref request, counters, parked: true);
                         return Outcome.Done;
@@ -542,7 +829,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             if (claim) {
                 zdo.SetOwner(owner);
-                counters.Claimed++;
+                if (handOver) { counters.HandedOver++; } else { counters.Claimed++; }
             }
 
             if (owner != data.m_targetPeerID) {
@@ -572,7 +859,7 @@ namespace NetworkPerformanceSystem.Runtime {
             // update is at the front of its next send - again if the owner changes while this
             // waits - then wait for it; FlushHeld will forward this behind it.
             if (request.ForcedFor != owner) {
-                zdoMan.ForceSendZDO(owner, zdo.m_uid);
+                if (newFamily) { PushIfHeld(zdoMan, owner, zdo.m_uid); } else { zdoMan.ForceSendZDO(owner, zdo.m_uid); }
                 request.ForcedFor = owner;
             }
 
@@ -599,6 +886,274 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
+        /// A request for ownership itself - picking up an item, taking an item stand. The owner
+        /// answers it by handing the object to the requester, so the question is only ever "who
+        /// can hand it over now?"; RouterRules.DecideOwnershipRequest answers it, and this carries
+        /// the answer out. Presence is the presence square for both sides: it is what the ownership
+        /// pass rescues by, so an owner outside it is one the pass is about to replace and is not
+        /// sent the request.
+        /// </summary>
+        private static Outcome RouteOwnershipRequest(ZRoutedRpc router, ref Request request, ZDO zdo, bool retry, bool expired) {
+            ZRoutedRpc.RoutedRPCData data = request.Data;
+            ZDOMan zdoMan = ZDOMan.instance;
+            long self = router.m_id;
+            Counters counters = For(request.Family);
+            long owner = zdo.GetOwner();
+            long sender = data.m_senderPeerID;
+
+            bool senderCaughtUp = SenderCaughtUp(zdoMan, sender, self, zdo);
+            bool senderPresent = Holds(false, zdoMan, sender, self, zdo, out _);
+            ZDOMan.ZDOPeer ownerPeer = null;
+            bool ownerPresent = owner != 0L && owner != self && owner != sender && Holds(false, zdoMan, owner, self, zdo, out ownerPeer);
+            bool settled = owner == 0L && senderPresent && Settled(zdoMan, zdo, sender);
+
+            RouterRules.OwnReqAction action = RouterRules.DecideOwnershipRequest(owner, sender, self, senderCaughtUp,
+                                                                                 senderPresent, settled, ownerPresent, retry, expired);
+            if (!retry && sender != self && action != RouterRules.OwnReqAction.LeaveAlone) {
+                NotePending(zdo.m_uid, sender, request.Family);
+            }
+
+            switch (action) {
+                case RouterRules.OwnReqAction.LeaveAlone:
+                    counters.LeftAlone++;
+                    return Outcome.Vanilla;
+
+                case RouterRules.OwnReqAction.DeliverAsAddressed:
+                    if (owner == sender) { counters.LeftAlone++; } else { counters.Expired++; }
+                    return DeliverAsAddressed(router, ref request);
+
+                case RouterRules.OwnReqAction.PushToSender:
+                    // Theirs already; their copy is behind. The object is the answer.
+                    counters.AlreadyTheirs++;
+                    PushIfHeld(zdoMan, sender, zdo.m_uid);
+                    ResolvePending(zdo.m_uid, sender);
+                    return Outcome.Done;
+
+                case RouterRules.OwnReqAction.ClaimForSender:
+                case RouterRules.OwnReqAction.GrantFromHost:
+                    // Exactly what the owner's own handler does (SetOwner(sender)), done on the
+                    // copy that decides - and without needing an instance of the object here.
+                    zdo.SetOwner(sender);
+                    if (action == RouterRules.OwnReqAction.ClaimForSender) { counters.Claimed++; } else { counters.Granted++; }
+                    if (sender != self) { PushIfHeld(zdoMan, sender, zdo.m_uid); }
+                    ResolvePending(zdo.m_uid, sender);
+                    return Outcome.Done;
+
+                case RouterRules.OwnReqAction.Forward:
+                    if (!retry && HasHeldFrom(zdo.m_uid, sender)) {
+                        // The game asks again while an earlier ask still waits here; one is enough.
+                        return Outcome.Done;
+                    }
+                    if (owner != data.m_targetPeerID) {
+                        if (!request.Retargeted) {
+                            counters.Retargeted++;
+                            request.Retargeted = true;
+                        }
+                        data.m_targetPeerID = owner;
+                    }
+                    if (IsCaughtUp(ownerPeer, zdo)) {
+                        Forward(ownerPeer.m_peer, data);
+                        return Outcome.Done;
+                    }
+                    if (request.ForcedFor != owner) {
+                        PushIfHeld(zdoMan, owner, zdo.m_uid);
+                        request.ForcedFor = owner;
+                    }
+                    if (!retry) {
+                        Hold(ref request, counters, parked: false);
+                        return Outcome.Done;
+                    }
+                    if (!expired) { return Outcome.Wait; }
+                    counters.Expired++;
+                    Forward(ownerPeer.m_peer, data);
+                    return Outcome.Done;
+
+                default:
+                    // Wait: unowned and not settled, or the owner has left. The ownership pass
+                    // places it within two seconds; look again each frame until then.
+                    if (!retry) {
+                        if (HasHeldFrom(zdo.m_uid, sender)) { return Outcome.Done; }
+                        Hold(ref request, counters, parked: true);
+                        return Outcome.Done;
+                    }
+                    return Outcome.Wait;
+            }
+        }
+
+        /// <summary>The sender has been sent (or wrote) the owner revision the host holds. The host
+        /// itself always has.</summary>
+        private static bool SenderCaughtUp(ZDOMan zdoMan, long sender, long self, ZDO zdo) {
+            if (sender == self) { return true; }
+            ZDOMan.ZDOPeer peer = zdoMan.GetPeer(sender);
+            return peer != null && IsCaughtUp(peer, zdo);
+        }
+
+        /// <summary>
+        /// Every player who could have the object loaded and holds a copy of it has been sent the
+        /// owner revision the host holds - so nobody is still acting on an older owner. Asked only
+        /// of an object nobody owns, before the host hands it to the requester.
+        /// </summary>
+        private static bool Settled(ZDOMan zdoMan, ZDO zdo, long except) {
+            Vector2s zone = ZoneSystem.GetZone(zdo.GetPosition());
+            ushort revision = zdo.OwnerRevision;
+            List<ZDOMan.ZDOPeer> peers = zdoMan.m_peers;
+            for (int i = 0; i < peers.Count; i++) {
+                ZDOMan.ZDOPeer peer = peers[i];
+                if (peer?.m_peer == null || peer.m_peer.m_uid == except) { continue; }
+                if (!peer.m_zdos.TryGetValue(zdo.m_uid, out ZDOMan.ZDOPeer.PeerZDOInfo info) || info.m_ownerRevision >= revision) { continue; }
+
+                // An older copy: only a player who loads the object could be acting on it.
+                Vector3 refPos = peer.m_peer.GetRefPos();
+                if (refPos == Vector3.zero) { return false; }
+                SimulationDistance distance = ZoneCompat.For(peer.m_peer);
+                if (ZoneCompat.NearRingLoaded(ZoneSystem.GetZone(refPos), zone, Mathf.Max(1, distance.NearSimulationDistance), distance.IsClassic)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Puts the object at the front of this player's next send, when the player already holds a
+        /// copy of it. A player who has never been sent it gets it in the normal order: an object
+        /// with physics that arrived ahead of the floor it stands on would fall through (issue #5).
+        /// Separate from the ownership pass's ForceSendIfHeld so neither one's counters read the
+        /// other's work.
+        /// </summary>
+        private static bool PushIfHeld(ZDOMan zdoMan, long uid, ZDOID id) {
+            ZDOMan.ZDOPeer peer = zdoMan.GetPeer(uid);
+            if (peer == null || !peer.m_zdos.ContainsKey(id)) { return false; }
+            peer.ForceSendZDO(id);
+            return true;
+        }
+
+        private static bool HasHeldFor(ZDOID id) {
+            for (int i = 0; i < Held.Count; i++) {
+                if (Held[i].Data.m_targetZDO == id) { return true; }
+            }
+            return false;
+        }
+
+        private static bool HasHeldFrom(ZDOID id, long sender) {
+            for (int i = 0; i < Held.Count; i++) {
+                if (Held[i].Data.m_targetZDO == id && Held[i].Data.m_senderPeerID == sender
+                    && (Held[i].Rules & RouterRules.Rule.OwnershipRequest) != 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// What vanilla's RPC_RoutedRPC would have done with this message when it arrived: run it
+        /// here if it was addressed here or to everybody (and was not the host's own, which ran
+        /// already), and pass it on unless it was addressed here. Used where a held request of the
+        /// newer families can no longer be improved on - vanilla's delivery, late, rather than
+        /// none.
+        /// </summary>
+        private static Outcome DeliverAsAddressed(ZRoutedRpc router, ref Request request) {
+            ZRoutedRpc.RoutedRPCData data = request.Data;
+            long self = router.m_id;
+            data.m_targetPeerID = request.AddressedTo;
+            long target = data.m_targetPeerID;
+
+            if ((target == self || target == 0L) && data.m_senderPeerID != self) {
+                data.m_parameters.SetPos(0);
+                router.HandleRoutedRPC(data);
+            }
+            if (target != self) {
+                _passThrough = true;
+                try {
+                    router.RouteRPC(data);
+                } finally {
+                    _passThrough = false;
+                }
+            }
+            return Outcome.Done;
+        }
+
+        // -- following requests for ownership ----------------------------------------------------
+
+        private static void NotePending(ZDOID id, long requester, Family family) {
+            float now = Time.realtimeSinceStartup;
+            if (Pending.TryGetValue(id, out PendingGrant grant) && grant.Requester == requester) {
+                grant.ExpiresAt = now + PendingGrantSeconds;
+                Pending[id] = grant;
+                return;
+            }
+            if (!Pending.ContainsKey(id) && Pending.Count >= MaxPendingGrants) {
+                PendingSkipped++;
+                return;
+            }
+            Pending[id] = new PendingGrant { Requester = requester, Family = family, FirstSeen = now, ExpiresAt = now + PendingGrantSeconds };
+        }
+
+        private static void ResolvePending(ZDOID id, long requester) {
+            if (!Pending.TryGetValue(id, out PendingGrant grant) || grant.Requester != requester) { return; }
+            For(grant.Family).Waits.Add((Time.realtimeSinceStartup - grant.FirstSeen) * 1000d);
+            Pending.Remove(id);
+        }
+
+        internal static int PendingCount => Pending.Count;
+
+        /// <summary>
+        /// Prefix on ZDOMan.Update: after this frame's incoming RPC_ZDOData has been applied and
+        /// before this frame's sends. A player who asked for an object and is now its owner in the
+        /// host's copy - whoever handed it over, by the owner-only packet path or any other - is
+        /// sent it at the front of this frame's send to them, instead of waiting for the host's
+        /// distance-and-age order to reach it. That order is what left players standing on an
+        /// item, re-asking for it, after its owner had already given it to them.
+        /// </summary>
+        internal static void ServicePendingGrants() {
+            if (Pending.Count == 0) { return; }
+
+            ZDOMan zdoMan = ZDOMan.instance;
+            ZRoutedRpc router = ZRoutedRpc.instance;
+            if (zdoMan == null || router == null || !router.m_server || !PatchGuard.IsActive(Mechanism.RpcOwnerRouting)) {
+                Pending.Clear();
+                return;
+            }
+
+            float now = Time.realtimeSinceStartup;
+            PendingScratch.Clear();
+            foreach (KeyValuePair<ZDOID, PendingGrant> pair in Pending) {
+                PendingGrant grant = pair.Value;
+                Counters counters = For(grant.Family);
+                ZDO zdo = zdoMan.GetZDO(pair.Key);
+                if (zdo == null) {
+                    PendingScratch.Add(pair.Key);                             // picked up, or destroyed
+                    continue;
+                }
+
+                ZDOMan.ZDOPeer peer = zdoMan.GetPeer(grant.Requester);
+                bool holds = false;
+                int revision = -1;
+                if (peer != null && peer.m_zdos.TryGetValue(pair.Key, out ZDOMan.ZDOPeer.PeerZDOInfo info)) {
+                    holds = true;
+                    revision = info.m_ownerRevision;
+                }
+
+                switch (RouterRules.ServiceGrant(zdo.GetOwner(), grant.Requester, holds, revision, zdo.OwnerRevision, now, grant.ExpiresAt)) {
+                    case RouterRules.GrantAction.Push:
+                        peer.ForceSendZDO(pair.Key);
+                        counters.Pushed++;
+                        counters.Waits.Add((now - grant.FirstSeen) * 1000d);
+                        PendingScratch.Add(pair.Key);
+                        break;
+                    case RouterRules.GrantAction.Done:
+                        counters.Waits.Add((now - grant.FirstSeen) * 1000d);
+                        PendingScratch.Add(pair.Key);
+                        break;
+                    case RouterRules.GrantAction.Expire:
+                        counters.PushExpired++;
+                        PendingScratch.Add(pair.Key);
+                        break;
+                }
+            }
+            for (int i = 0; i < PendingScratch.Count; i++) { Pending.Remove(PendingScratch[i]); }
+        }
+
+        /// <summary>
         /// Is this peer, as the host currently sees it, somewhere it can handle a request on this
         /// object - and, for the forward, which ZDOPeer is it? Asked of the current owner ("still
         /// there to take this?") and, when the owner is not, of the requester ("may it be handed
@@ -616,9 +1171,10 @@ namespace NetworkPerformanceSystem.Runtime {
         ///     creature by the next pass, and the hit forwarded to it would find no instance. A
         ///     peer that has stopped answering is excluded here as it is there (M21).
         ///
-        /// A peer with no position yet (the (0,0,0) sentinel) is nowhere.
+        /// A peer with no position yet (the (0,0,0) sentinel) is nowhere. Which test applies is the
+        /// request's CreaturePresence rule: hits on creatures and requests on tames.
         /// </summary>
-        private static bool Holds(Family family, ZDOMan zdoMan, long uid, long self, ZDO zdo, out ZDOMan.ZDOPeer peer) {
+        private static bool Holds(bool creature, ZDOMan zdoMan, long uid, long self, ZDO zdo, out ZDOMan.ZDOPeer peer) {
             peer = null;
             Vector3 refPos;
             if (uid == self) {
@@ -629,7 +1185,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             Vector2s zone = ZoneSystem.GetZone(zdo.GetPosition());
             Vector2s peerZone = ZoneSystem.GetZone(refPos);
-            if (family != Family.Creature) {
+            if (!creature) {
                 // Stations and structures: the pass's "owner present" test for anything that is
                 // not a creature, so it rescues nothing the router has just given away.
                 return ZoneCompat.InActiveArea(zone, peerZone, ZoneCompat.ActiveZoneRadius);
@@ -723,6 +1279,99 @@ namespace NetworkPerformanceSystem.Runtime {
             bool terrain = go.GetComponent<TerrainComp>() != null;
             TerrainPrefabs[prefab] = terrain;
             return terrain;
+        }
+
+        /// <summary>
+        /// Which of the pick-up and interaction components this ZDO's prefab carries. Answered from
+        /// the prefab, as Station is, so another object that registers a request of the same name
+        /// is left alone. A component on a child counts when it belongs to the root's ZNetView -
+        /// that is the view its requests are registered on.
+        /// </summary>
+        private static Kind KindOf(ZDO zdo) {
+            int prefab = zdo.GetPrefab();
+            if (InteractionPrefabs.TryGetValue(prefab, out Kind cached)) { return cached; }
+
+            if (ZNetScene.instance == null) { return Kind.None; }
+            GameObject go = ZNetScene.instance.GetPrefab(prefab);
+            if (go == null) { return Kind.None; }      // unknown here - do not cache a verdict we cannot justify
+
+            ZNetView view = go.GetComponent<ZNetView>();
+            Kind kind = Kind.None;
+            if (Has<ItemDrop>(go, view)) { kind |= Kind.ItemDrop; }
+            if (Has<ItemStand>(go, view)) { kind |= Kind.ItemStand; }
+            if (Has<ArmorStand>(go, view)) { kind |= Kind.ArmorStand; }
+            if (Has<Pickable>(go, view)) { kind |= Kind.Pickable; }
+            if (Has<PickableItem>(go, view)) { kind |= Kind.PickableItem; }
+            if (Has<Feast>(go, view)) { kind |= Kind.Feast; }
+            if (Has<Container>(go, view)) { kind |= Kind.Container; }
+            if (Has<TeleportWorld>(go, view)) { kind |= Kind.TeleportWorld; }
+            if (Has<Bed>(go, view)) { kind |= Kind.Bed; }
+            if (Has<PrivateArea>(go, view)) { kind |= Kind.PrivateArea; }
+            if (Has<MapTable>(go, view)) { kind |= Kind.MapTable; }
+            if (Has<Tameable>(go, view)) { kind |= Kind.Tameable; }
+            if (Has<Incinerator>(go, view)) { kind |= Kind.Incinerator; }
+            if (Has<Door>(go, view)) { kind |= Kind.Door; }
+            if (Has<Beehive>(go, view)) { kind |= Kind.Beehive; }
+            if (Has<SapCollector>(go, view)) { kind |= Kind.SapCollector; }
+            if (go.GetComponent<Ship>() != null || go.GetComponent<Vagon>() != null) { kind |= Kind.ShipOrCart; }
+
+            InteractionPrefabs[prefab] = kind;
+            return kind;
+        }
+
+        private static bool Has<T>(GameObject go, ZNetView view) where T : Component {
+            if (go.GetComponent<T>() != null) { return true; }
+            if (view == null) { return false; }
+            T child = go.GetComponentInChildren<T>(true);
+            return child != null && child.GetComponentInParent<ZNetView>(true) == view;
+        }
+
+        /// <summary>
+        /// Checks every pick-up and interaction member against the game at startup. A handler that
+        /// is gone is dropped (its requests are left to vanilla). A handler listed as starting with
+        /// an owner check that no longer calls ZNetView.IsOwner is kept but never trusted with a
+        /// request sent to nobody, which its sender has then already run. Returns the problems
+        /// found, or null.
+        /// </summary>
+        internal static string VerifyMembers() {
+            // Harmony may call a patch class's Prepare more than once; the answer cannot change.
+            if (_membersVerified) { return null; }
+            _membersVerified = true;
+
+            List<string> gone = new List<string>();
+            List<string> ungated = new List<string>();
+            MethodInfo isOwner = AccessTools.Method(typeof(ZNetView), nameof(ZNetView.IsOwner));
+            foreach (Member member in AllMembers) {
+                MethodInfo handler = AccessTools.Method(member.Type, member.Handler);
+                if (handler == null) {
+                    member.Live = false;
+                    gone.Add($"{member.Type.Name}.{member.Handler}");
+                    continue;
+                }
+                if (!member.Gated || isOwner == null) { continue; }
+
+                bool gated = false;
+                try {
+                    foreach (CodeInstruction instruction in PatchProcessor.GetOriginalInstructions(handler)) {
+                        if (instruction.operand is MethodInfo called && called == isOwner) {
+                            gated = true;
+                            break;
+                        }
+                    }
+                } catch (Exception) {
+                    gated = false;
+                }
+                if (!gated) {
+                    member.Rules |= RouterRules.Rule.RefuseTargetZero;
+                    ungated.Add($"{member.Type.Name}.{member.Handler}");
+                }
+            }
+
+            if (gone.Count == 0 && ungated.Count == 0) { return null; }
+            string text = "";
+            if (gone.Count > 0) { text += "left to vanilla because the game no longer has them: " + string.Join(", ", gone.ToArray()) + ". "; }
+            if (ungated.Count > 0) { text += "no longer checked for their owner, so never delivered when sent to nobody: " + string.Join(", ", ungated.ToArray()) + "."; }
+            return text;
         }
 
         /// <summary>
@@ -864,10 +1513,15 @@ namespace NetworkPerformanceSystem.Runtime {
             Held.Clear();
             StationPrefabs.Clear();
             TerrainPrefabs.Clear();
+            InteractionPrefabs.Clear();
+            Pending.Clear();
+            PendingSkipped = 0;
             Stations.Clear();
             Creatures.Clear();
             Structures.Clear();
             TerrainEdits.Clear();
+            Pickups.Clear();
+            Interactions.Clear();
         }
     }
 }

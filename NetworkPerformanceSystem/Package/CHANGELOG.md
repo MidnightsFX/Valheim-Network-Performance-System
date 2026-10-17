@@ -1,5 +1,12 @@
 # Changelog
 
+**1.18.0**
+- Dropped items are picked up straight away instead of sometimes taking many seconds.
+- Doors, chests, item stands, berry bushes, beds, wards, portals, map tables, beehives and tame commands now reach whoever owns them instead of sometimes being lost.
+- Ping is now measured inside the game, so crossplay players have one too, and a player whose connection gets busy in a fight no longer loses the creatures they run because of it.
+- Crossplay players the server drops are now sent back to the menu instead of being left in a half-loaded world, and a crossplay connection that resets itself gets a real chance to recover.
+- The server spends less CPU deciding what to send each player, most of all around big bases and in fights.
+
 **1.17.0**
 - Digging and other changes to the ground now reach whoever owns that ground, instead of sometimes being lost
 - Players with the mod now wait for the host of a game-hosted world whose game stops while backgrounded

@@ -168,6 +168,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     SamplePeers(now);
                 }
                 SampleScheduler(now);
+                SampleRouterAndPing(now);
                 TrafficLedger.Tick(now, ZNet.instance != null ? ZNet.instance.GetPeers().Count : 0);
                 ReportWriterState();
             }
@@ -188,6 +189,7 @@ namespace NetworkPerformanceSystem.Runtime {
             _nextHandoffId = 0L;
             _lastPeerSampleMs = 0d;
             _lastSchedulerSampleMs = 0d;
+            _lastRouterSampleMs = 0d;
             _reportedStop = false;
             HandoffsRecorded = 0L;
             DragBacksRecorded = 0L;
@@ -313,8 +315,11 @@ namespace NetworkPerformanceSystem.Runtime {
         /// send cost, how often the frame budget cut a frame short and how many sends the minimum
         /// share made past it. Together they say whether the budget or the minimum is setting the
         /// rate on a big server, and what the minimum costs in server frame time - which is what
-        /// Min Players Per Frame Percent's default has to be judged on. The first call of a
-        /// session only takes the baseline.
+        /// Min Players Per Frame Percent's default has to be judged on. cpu is the share of the
+        /// window spent sending, against the cpuMax ceiling; intervalMs is the interval the
+        /// ceiling had stretched the sends to at the end of the window (Send Interval Seconds
+        /// when it was not holding), from costMs per send. The first call of a session only
+        /// takes the baseline.
         /// </summary>
         private static void SampleScheduler(double now) {
             if (_lastSchedulerSampleMs > 0d && now - _lastSchedulerSampleMs < SchedulerSampleMs) { return; }
@@ -354,10 +359,115 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Int("breaks", dBreaks)
                 .Num("hz", peers > 0 ? dServiced * 1000d / windowMs / peers : 0d, "0.#")
                 .Num("sendMs", dSends > 0 ? dSendMs / dSends : 0d, "0.###")
+                .Num("cpu", dSendMs * 100d / windowMs, "0.#")
+                .Int("cpuMax", ValConfig.SendSchedulerMaxCpuPercent.Value)
+                .Num("intervalMs", Patches.SendSchedulerPatches.CurrentIntervalSeconds * 1000d, "0")
+                .Num("costMs", Patches.SendSchedulerPatches.CeilingCostMs, "0.###")
                 .End());
         }
 
         // -- session and config ------------------------------------------------------------
+
+        // -- item pick-ups, other interactions and the in-game ping -------------------------------
+
+        private const double RouterSampleMs = 60000d;
+        private static double _lastRouterSampleMs;
+        private static readonly long[] _routerLast = new long[2 * 8];
+        private static readonly long[] _waitLast = new long[RouterRules.WaitHistogram.Bounds.Length + 1];
+        private static readonly long[] _waitNow = new long[RouterRules.WaitHistogram.Bounds.Length + 1];
+        private static long _pingSentLast;
+        private static readonly long[] _verdictLast = new long[PingRules.VerdictCount];
+        private static long _stallsLast;
+
+        /// <summary>
+        /// Once a minute: what the pick-up and interaction routing did (M12's two newest families),
+        /// with how long players waited for an item, and what the in-game ping (M41) timed and why
+        /// it threw answers away. Deltas over the minute; the first call of a session only takes
+        /// the baseline.
+        /// </summary>
+        private static void SampleRouterAndPing(double now) {
+            if (_lastRouterSampleMs > 0d && now - _lastRouterSampleMs < RouterSampleMs) { return; }
+            bool baseline = _lastRouterSampleMs <= 0d;
+            double windowMs = now - _lastRouterSampleMs;
+            _lastRouterSampleMs = now;
+
+            RpcOwnerRouter.Counters p = RpcOwnerRouter.Pickups;
+            RpcOwnerRouter.Counters n = RpcOwnerRouter.Interactions;
+            long[] current = {
+                p.Seen, p.Retargeted, p.AlreadyTheirs, p.Claimed + p.Granted, p.Pushed, p.HeldCount + p.Parked, p.Expired + p.LeftAlone, p.PushExpired,
+                n.Seen, n.Retargeted, n.Claimed, n.HandedOver, n.Pushed, n.HeldCount + n.Parked, n.Expired + n.LeftAlone, n.Dropped,
+            };
+            p.Waits.CopyTo(_waitNow);
+
+            long sent = GamePing.PingsSent;
+            long stalls = GamePing.Stalls;
+            long[] verdicts = (long[])GamePing.Verdicts.Clone();
+
+            // A session reset zeroes the totals; that window is a baseline, not a sample.
+            bool reset = current[0] < _routerLast[0] || sent < _pingSentLast;
+            if (!baseline && !reset) {
+                long[] waits = new long[_waitNow.Length];
+                long waitTotal = 0;
+                for (int i = 0; i < waits.Length; i++) { waits[i] = _waitNow[i] - _waitLast[i]; waitTotal += waits[i]; }
+
+                if (current[0] - _routerLast[0] > 0 || current[8] - _routerLast[8] > 0) {
+                    EmitServer(Line.Begin("router")
+                        .Num("t", now, "0.#")
+                        .Num("ms", windowMs, "0")
+                        .Int("pSeen", current[0] - _routerLast[0])
+                        .Int("pRetarget", current[1] - _routerLast[1])
+                        .Int("pTheirs", current[2] - _routerLast[2])
+                        .Int("pGiven", current[3] - _routerLast[3])
+                        .Int("pPushed", current[4] - _routerLast[4])
+                        .Int("pHeld", current[5] - _routerLast[5])
+                        .Int("pAsSent", current[6] - _routerLast[6])
+                        .Int("pNever", current[7] - _routerLast[7])
+                        .Int("pWaits", waitTotal)
+                        .Num("pWait50", WaitBound(waits, waitTotal, 0.5), "0")
+                        .Num("pWait90", WaitBound(waits, waitTotal, 0.9), "0")
+                        .Int("iSeen", current[8] - _routerLast[8])
+                        .Int("iRetarget", current[9] - _routerLast[9])
+                        .Int("iClaimed", current[10] - _routerLast[10])
+                        .Int("iHandedOver", current[11] - _routerLast[11])
+                        .Int("iPushed", current[12] - _routerLast[12])
+                        .Int("iHeld", current[13] - _routerLast[13])
+                        .Int("iAsSent", current[14] - _routerLast[14])
+                        .Int("iDropped", current[15] - _routerLast[15])
+                        .End());
+                }
+
+                if (sent - _pingSentLast > 0) {
+                    JsonLine line = Line.Begin("ping")
+                        .Num("t", now, "0.#")
+                        .Num("ms", windowMs, "0")
+                        .Flag("active", GamePing.Active)
+                        .Int("sent", sent - _pingSentLast)
+                        .Int("stalls", stalls - _stallsLast);
+                    for (int i = 0; i < verdicts.Length; i++) {
+                        long delta = verdicts[i] - _verdictLast[i];
+                        if (delta != 0) { line.Int(((PingRules.PingVerdict)i).ToString(), delta); }
+                    }
+                    EmitServer(line.End());
+                }
+            }
+
+            Array.Copy(current, _routerLast, current.Length);
+            Array.Copy(_waitNow, _waitLast, _waitNow.Length);
+            _pingSentLast = sent;
+            _stallsLast = stalls;
+            Array.Copy(verdicts, _verdictLast, verdicts.Length);
+        }
+
+        /// <summary>A wait bucket's upper bound in ms for the record: -1 with no waits, and one
+        /// past the last bound for the open bucket (JSON has no infinity).</summary>
+        private static double WaitBound(long[] counts, long total, double share) {
+            double bound = RouterRules.WaitHistogram.Percentile(counts, total, share);
+            if (double.IsInfinity(bound)) {
+                double[] bounds = RouterRules.WaitHistogram.Bounds;
+                return bounds[bounds.Length - 1] + 1d;
+            }
+            return bound;
+        }
 
         private static void EmitSession() {
             List<string> live = new List<string>();
@@ -685,6 +795,17 @@ namespace NetworkPerformanceSystem.Runtime {
                         .Num("rtt", latency.EwmaMs, "0.#")
                         .Num("jitter", latency.JitterMs, "0.#");
                 }
+                // M41: the in-game round trip (rtt and the rest above stay Steam's), its best of
+                // the last few minutes, how many answers it rests on, and the figure the ownership
+                // pass priced this player at.
+                if (LatencyRegistry.TryGetGame(peer.m_uid, out PingRules.PingEstimate game)) {
+                    line.Num("appRtt", game.EwmaMs, "0.#")
+                        .Int("appLast", game.LastMs)
+                        .Num("appBase", game.BaselineMs, "0.#")
+                        .Num("appJit", game.JitterMs, "0.#")
+                        .Int("appN", game.Samples);
+                }
+                line.Num("ownRtt", LatencyRegistry.OwnershipRttMs(peer.m_uid, ValConfig.OwnershipUnmeasuredRttMs.Value), "0.#");
 
                 if (RttProbe.TryGetLinkStatus(peer.m_socket, out RttProbe.LinkStatus link)) {
                     line.Int("pending", link.PendingBytes)

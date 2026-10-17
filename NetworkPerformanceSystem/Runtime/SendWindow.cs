@@ -103,12 +103,15 @@ namespace NetworkPerformanceSystem.Runtime {
             if (!ValConfig.EnableSendWindowSizing.Value) { return false; }
 
             // Both sides measure their own sockets, so this works for the host sizing each client
-            // and for a client sizing its own upstream to the host.
-            if (!LatencyRegistry.HasMeasurement(uid)) { return false; }
+            // and for a client sizing its own upstream to the host. Always the transport's own
+            // figure, never the in-game one (M41): this window is Steam's - bytes in flight until
+            // Steam acknowledges them - and the in-game round trip also counts the very queues
+            // the window would then grow to fill.
+            if (!LatencyRegistry.HasTransport(uid)) { return false; }
 
             LatencyRegistry.TryGetSteamSendRate(uid, out int observed);
             rate = PickRate(observed, SteamTransport.PinnedSendRateBytesPerSec);
-            float rtt = WindowRttMs(LatencyRegistry.MeasuredRttMs(uid), LatencyRegistry.BaselineRttMs(uid));
+            float rtt = WindowRttMs(LatencyRegistry.TransportRttMs(uid), LatencyRegistry.TransportBaselineMs(uid));
             window = Compute(rate, rtt, SendIntervalMs(),
                              ValConfig.SendWindowBdpFactor.Value, EffectiveMaxBytes(rate, ValConfig.SendWindowMaxBytes.Value));
             return true;
@@ -145,10 +148,12 @@ namespace NetworkPerformanceSystem.Runtime {
         internal const float BaselineRttCap = 1.5f;
 
         /// <summary>How long this machine waits between sends to one peer: M2b's interval while it
-        /// runs, otherwise vanilla's 0.05s gate (or ReturnToSender's, which is the same).</summary>
+        /// runs - stretched while its CPU ceiling holds the rate down, so a slower rate does not
+        /// also shrink what each send may carry - otherwise vanilla's 0.05s gate (or
+        /// ReturnToSender's, which is the same).</summary>
         internal static float SendIntervalMs() {
             if (PatchGuard.IsActive(Mechanism.SendScheduler) && ValConfig.EnableSchedulerFix.Value) {
-                return Mathf.Max(0.01f, ValConfig.SendIntervalSeconds.Value) * 1000f;
+                return Patches.SendSchedulerPatches.CurrentIntervalSeconds * 1000f;
             }
             return VanillaSendIntervalMs;
         }

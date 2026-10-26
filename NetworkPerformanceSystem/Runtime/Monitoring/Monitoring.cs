@@ -372,7 +372,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
         private const double RouterSampleMs = 60000d;
         private static double _lastRouterSampleMs;
-        private static readonly long[] _routerLast = new long[2 * 8];
+        private static readonly long[] _routerLast = new long[2 * 8 + 1];
         private static readonly long[] _waitLast = new long[RouterRules.WaitHistogram.Bounds.Length + 1];
         private static readonly long[] _waitNow = new long[RouterRules.WaitHistogram.Bounds.Length + 1];
         private static long _pingSentLast;
@@ -396,6 +396,7 @@ namespace NetworkPerformanceSystem.Runtime {
             long[] current = {
                 p.Seen, p.Retargeted, p.AlreadyTheirs, p.Claimed + p.Granted, p.Pushed, p.HeldCount + p.Parked, p.Expired + p.LeftAlone, p.PushExpired,
                 n.Seen, n.Retargeted, n.Claimed, n.HandedOver, n.Pushed, n.HeldCount + n.Parked, n.Expired + n.LeftAlone, n.Dropped,
+                RpcOwnerRouter.Creatures.InOrder,       // creature hits whose new owner had no copy yet - sent in order, not pushed
             };
             p.Waits.CopyTo(_waitNow);
 
@@ -410,7 +411,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 long waitTotal = 0;
                 for (int i = 0; i < waits.Length; i++) { waits[i] = _waitNow[i] - _waitLast[i]; waitTotal += waits[i]; }
 
-                if (current[0] - _routerLast[0] > 0 || current[8] - _routerLast[8] > 0) {
+                if (current[0] - _routerLast[0] > 0 || current[8] - _routerLast[8] > 0 || current[16] - _routerLast[16] > 0) {
                     EmitServer(Line.Begin("router")
                         .Num("t", now, "0.#")
                         .Num("ms", windowMs, "0")
@@ -433,6 +434,7 @@ namespace NetworkPerformanceSystem.Runtime {
                         .Int("iHeld", current[13] - _routerLast[13])
                         .Int("iAsSent", current[14] - _routerLast[14])
                         .Int("iDropped", current[15] - _routerLast[15])
+                        .Int("cInOrder", current[16] - _routerLast[16])
                         .End());
                 }
 
@@ -660,6 +662,8 @@ namespace NetworkPerformanceSystem.Runtime {
                 .Int("proxRescued", OwnershipArbiter.LastPassProximityRescued)
                 .Int("proxHeld", OwnershipArbiter.LastPassProximityHeld)
                 .Int("firstInOrder", OwnershipArbiter.LastPassFirstSendsInOrder)
+                .Int("copyPreferred", OwnershipArbiter.LastPassCopyPreferred)
+                .Int("copyWaited", OwnershipArbiter.LastPassCopyWaited)
                 .Int("steered", OwnershipArbiter.LastPassSteered)
                 .Int("shed", OwnershipArbiter.LastPassShed)
                 .Int("shedBlocked", OwnershipArbiter.LastPassShedBlocked)
@@ -1033,7 +1037,8 @@ namespace NetworkPerformanceSystem.Runtime {
         /// <summary>
         /// A player whose game is in the background has been silent past the deadline they would
         /// otherwise have been dropped at ("usualS"), and is being kept up to "deadlineS" (Keep
-        /// Players In The Background). Whether they came back is in the peer records that follow:
+        /// Players In The Background) - null with Enable Background Timeout off, for no limit.
+        /// Whether they came back is in the peer records that follow:
         /// "ghost" clears when they answer again, and the peer stops appearing if they were
         /// dropped. One record per silent stretch.
         /// </summary>

@@ -145,12 +145,17 @@ namespace NetworkPerformanceSystem.Runtime {
         private static void Warn(float secondsLeft, bool hostAway) {
             if (_warning && Time.realtimeSinceStartup - _lastWarnAt < WarnRepeatSeconds) { return; }
 
+            // No number to count down while the host's game has no background limit
+            // (Enable Background Timeout off).
+            bool noLimit = float.IsPositiveInfinity(secondsLeft);
             if (!_warning) {
                 _warning = true;
                 TotalWarnings++;
-                Logger.LogWarning(hostAway
-                    ? $"The server has stopped answering, and the host's game is in the background. Waiting up to {secondsLeft:F0}s more for it."
-                    : $"The server has stopped answering. Leaving in {secondsLeft:F0}s unless it comes back.");
+                Logger.LogWarning(!hostAway
+                    ? $"The server has stopped answering. Leaving in {secondsLeft:F0}s unless it comes back."
+                    : noLimit
+                        ? "The server has stopped answering, and the host's game is in the background. Waiting for it for as long as it stays there."
+                        : $"The server has stopped answering, and the host's game is in the background. Waiting up to {secondsLeft:F0}s more for it.");
             }
             _lastWarnAt = Time.realtimeSinceStartup;
 
@@ -159,9 +164,9 @@ namespace NetworkPerformanceSystem.Runtime {
             if (MessageHud.instance != null) {
                 float left = Mathf.Max(0f, secondsLeft);
                 MessageHud.instance.ShowMessage(MessageHud.MessageType.Center,
-                    hostAway
-                        ? $"The host's game is in the background - waiting for it ({left:F0}s)"
-                        : $"Lost contact with the server - reconnecting ({left:F0}s)",
+                    !hostAway ? $"Lost contact with the server - reconnecting ({left:F0}s)"
+                    : noLimit ? "The host's game is in the background - waiting for it"
+                    : $"The host's game is in the background - waiting for it ({left:F0}s)",
                     0, null, showDespiteHiddenHUD: true, log: false);
             }
         }

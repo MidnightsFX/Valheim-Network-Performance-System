@@ -182,6 +182,7 @@ namespace NetworkPerformanceSystem {
         public static ConfigEntry<int> LoadingTimeoutSeconds;
         public static ConfigEntry<bool> KeepPlayersInBackground;
         public static ConfigEntry<int> BackgroundTimeoutSeconds;
+        public static ConfigEntry<bool> EnableBackgroundTimeout;
         public static ConfigEntry<bool> KeepPlayersWithoutTheMod;
 
         // M42 - a crossplay player the server drops is told; M43 - a crossplay reconnect gets time to resume
@@ -516,8 +517,10 @@ namespace NetworkPerformanceSystem {
             KeepPlayersInBackground = BindServerConfig("Connection Timeout", "Keep Players In The Background", true,
                 "Do not drop a player for going quiet while their game is in the background - alt-tabbed or minimised. On some computers the game stops running entirely while it is not the active window, and the player then comes back to a lost connection once 'Connection Timeout Seconds' has passed. With this on, a player whose game said it went into the background gets 'Background Timeout Seconds' instead, for as long as it stays there. Turn it off to drop them like anyone else. Players need this mod for the server to know; their creatures are still handed to other players after 'Ghost Owner Evict Seconds'. On a server hosted from the game itself it works the other way too: players with this mod wait for the host's game if it stops in the background, instead of all being dropped. A host whose game keeps running there, as it usually does in a window, is only waited for during its first few seconds in the background.");
             BackgroundTimeoutSeconds = BindServerConfig("Connection Timeout", "Background Timeout Seconds", 600,
-                "How long a player whose game is in the background may go without a packet before they are dropped, in seconds, when 'Keep Players In The Background' is on. Never shorter than 'Loading Timeout Seconds'.",
+                "How long a player whose game is in the background may go without a packet before they are dropped, in seconds, when 'Keep Players In The Background' is on. Never shorter than 'Loading Timeout Seconds'. With 'Enable Background Timeout' off, this is only how long a computer that has gone to sleep, lost its connection or crashed is waited for.",
                 false, 30, 3600);
+            EnableBackgroundTimeout = BindServerConfig("Connection Timeout", "Enable Background Timeout", true,
+                "Drop a player whose game has been in the background for longer than 'Background Timeout Seconds'. Turn it off to keep them connected however long their game stays in the background - alt-tabbed for an hour, say - for as long as their computer is still connected. A player whose computer goes to sleep, loses its connection or whose game crashes while it is in the background is still dropped once 'Background Timeout Seconds' has passed. Their slot is held all the while; their creatures are still handed to other players after 'Ghost Owner Evict Seconds'. Needs 'Keep Players In The Background'. On a server hosted from the game itself, players wait for the host's game the same way however long it is stopped in the background.");
             KeepPlayersWithoutTheMod = BindServerConfig("Connection Timeout", "Keep Players Without The Mod", true,
                 "On a server hosted from the game itself: while the host's game has stopped in the background and players with this mod are waiting for it, keep players without this mod (or with an older version of it) connected as well, by answering their game's connection check for it. They see the game's own connection warning icon instead of a message. Needs 'Keep Players In The Background'. Turn it off to have them dropped after 30 seconds as before.");
             EvictGhostOwners = BindServerConfig("Connection Timeout", "Evict Ghost Owners", true,
@@ -596,6 +599,7 @@ namespace NetworkPerformanceSystem {
             LoadingTimeoutSeconds.SettingChanged += OnConnectionTimeoutSettingChanged;
             KeepPlayersInBackground.SettingChanged += OnConnectionTimeoutSettingChanged;
             BackgroundTimeoutSeconds.SettingChanged += OnConnectionTimeoutSettingChanged;
+            EnableBackgroundTimeout.SettingChanged += OnConnectionTimeoutSettingChanged;
 
             // Jotunn's CustomRPC limit is derived from the window ceiling, so it follows these two
             // - including the edit Jotunn makes on a client when the server's values arrive at join.

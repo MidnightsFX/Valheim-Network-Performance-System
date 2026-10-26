@@ -49,7 +49,8 @@ namespace NetworkPerformanceSystem.Runtime {
     /// go out and nothing is sent from here. Never for a game in front: a host whose game hangs
     /// while it is the active window is dropped by its players exactly as before, because the
     /// wait flag can only be raised by a frame that ran in the background. And never past
-    /// Background Timeout Seconds of stall, the longest anyone with the mod would wait either.
+    /// Background Timeout Seconds of stall, the longest anyone with the mod would wait either -
+    /// with Enable Background Timeout off, for as long as the stall lasts, as they would.
     /// A host that hangs in the background, rather than being paused there, is waited for that
     /// long - the same cost Keep Players In The Background already carries for players with the
     /// mod. A host whose game crashes takes this thread with it, and its players' Steam
@@ -201,7 +202,7 @@ namespace NetworkPerformanceSystem.Runtime {
             PlayersCovered = Scratch.Count;
             PlayersWrapped = wrapped;
             Publish(worker, Scratch, IntervalSeconds(ConnectionTimeout.InWorldTimeoutSeconds),
-                    ConnectionTimeout.BackgroundTimeoutSeconds);
+                    ConnectionTimeout.BackgroundDeadlineSeconds);
         }
 
         /// <summary>Session end, from ZNet.StopAll. The thread is told to stop and wakes at once;
@@ -290,10 +291,11 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>Hands the thread a new plan when anything in it changed. Allocates only then:
-        /// the same players at the same settings, refreshed once a second, cost nothing.</summary>
+        /// the same players at the same settings, refreshed once a second, cost nothing. An
+        /// infinite give-up (no background limit) is one the thread never reaches.</summary>
         private static void Publish(Worker worker, List<uint> handles, float intervalSeconds, float giveUpSeconds) {
             long interval = Ticks(intervalSeconds);
-            long giveUp = Ticks(giveUpSeconds);
+            long giveUp = float.IsPositiveInfinity(giveUpSeconds) ? long.MaxValue : Ticks(giveUpSeconds);
             Plan current = Volatile.Read(ref worker.Current);
             if (current != null && current.IntervalTicks == interval && current.GiveUpTicks == giveUp
                 && SameHandles(current.Handles, handles)) {

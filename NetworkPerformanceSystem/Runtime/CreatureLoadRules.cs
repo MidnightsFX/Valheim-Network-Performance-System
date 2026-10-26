@@ -198,6 +198,11 @@ namespace NetworkPerformanceSystem.Runtime {
         /// pass at the shedding player's cost per creature; +inf when unknown (the host, whose
         /// creatures cost no player's upload).</summary>
         internal float UploadRoom;
+
+        /// <summary>The host has already sent this candidate the creature being placed, so it
+        /// can run it the moment it is told to (OwnershipArbiter.HoldsCopy). One that has not
+        /// cannot until its first copy lands, behind every floor and wall around it.</summary>
+        internal bool Holds;
     }
 
     /// <summary>
@@ -686,14 +691,25 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>The best eligible option with room, excluding one candidate index; -1 when
-        /// there is none. Returns a position in the list, not a candidate index.</summary>
-        internal static int PickWithRoom(List<ReceiverOption> options, int excludeIndex) {
+        /// there is none. Returns a position in the list, not a candidate index.
+        ///
+        /// With preferHolders, an option the host has already sent the creature (Holds) beats one
+        /// it has not, whatever their scores, and the scores only rank options alike in that: a
+        /// player without a copy cannot run the creature until its first copy arrives, behind
+        /// every floor and wall around it (OwnershipArbiter.HoldsCopy). Only when no option with
+        /// room holds a copy is the best of the rest taken, so the answer is never -1 for that
+        /// reason alone.</summary>
+        internal static int PickWithRoom(List<ReceiverOption> options, int excludeIndex, bool preferHolders = false) {
             int best = -1;
             for (int i = 0; i < options.Count; i++) {
                 ReceiverOption option = options[i];
                 if (!option.Eligible || option.Room <= 0 || option.Index == excludeIndex) { continue; }
                 if (best < 0) { best = i; continue; }
                 ReceiverOption incumbent = options[best];
+                if (preferHolders && option.Holds != incumbent.Holds) {
+                    if (option.Holds) { best = i; }
+                    continue;
+                }
                 if (IsBetter(option.Total, option.Worst, option.Rtt, incumbent.Total, incumbent.Worst, incumbent.Rtt)) { best = i; }
             }
             return best;
@@ -712,16 +728,22 @@ namespace NetworkPerformanceSystem.Runtime {
         /// one with the most upload room left (UploadRoom) that takes it, then the fewest
         /// creatures - so the upload a creature costs lands where there is room for it, rather
         /// than on a player who runs few creatures but whose own upload is close to full.
+        ///
+        /// With preferHolders, as in PickWithRoom: while any option with room has been sent the
+        /// creature, only those are in the running. The caller reads Holds on the answer to learn
+        /// whether it got one.
         /// </summary>
-        internal static int PickReceiver(List<ReceiverOption> options, int excludeIndex, float marginMs, bool byUploadRoom = false) {
-            int best = PickWithRoom(options, excludeIndex);
+        internal static int PickReceiver(List<ReceiverOption> options, int excludeIndex, float marginMs, bool byUploadRoom = false, bool preferHolders = true) {
+            int best = PickWithRoom(options, excludeIndex, preferHolders);
             if (best < 0) { return -1; }
 
+            bool holdersOnly = preferHolders && options[best].Holds;
             float bar = options[best].Total + marginMs;
             int chosen = best;
             for (int i = 0; i < options.Count; i++) {
                 ReceiverOption option = options[i];
                 if (i == best || !option.Eligible || option.Room <= 0 || option.Index == excludeIndex) { continue; }
+                if (holdersOnly && !option.Holds) { continue; }
                 if (option.Total > bar) { continue; }
                 ReceiverOption current = options[chosen];
                 if (byUploadRoom && option.UploadRoom != current.UploadRoom) {

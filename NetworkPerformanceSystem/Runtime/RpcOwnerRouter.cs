@@ -112,6 +112,15 @@ namespace NetworkPerformanceSystem.Runtime {
     ///     hit the creature, so its game has the instance; a bow shot from the outer ring is as
     ///     good a claim as a sword swing. The claim is judged by the same near-ring test as the
     ///     owner's presence, so it is one the pass will keep rather than undo two seconds later.
+    ///   * A hit whose owner has not yet been sent its ownership waits for that update, and the
+    ///     update is pushed to the front of the owner's next send - but only when the owner
+    ///     already holds a copy (PushIfHeld). AddForceSendZdos inserts at index 0, ahead of the
+    ///     Terrain-then-Solid order a first delivery gets, so a creature pushed to a player who
+    ///     has never been sent it lands before the floor it stands on and that player's physics
+    ///     drops it: issue #5 again, through a second door. The arbiter closed its own door in
+    ///     1.11.1 (ForceSendIfHeld); this family pushed unconditionally until 1.18.1. A player
+    ///     without a copy now gets the creature in the game's order, already naming them owner,
+    ///     and the hit follows it or expires as any held hit does. Counters.InOrder counts them.
     ///
     /// Double delivery is as impossible for hits as for station requests, with one cosmetic
     /// exception: RPC_Damage counts the attacker's hit statistic before its IsOwner check, so a
@@ -207,6 +216,10 @@ namespace NetworkPerformanceSystem.Runtime {
             internal long PushExpired;   // requester never became owner within PendingGrantSeconds
             internal readonly RouterRules.WaitHistogram Waits = new RouterRules.WaitHistogram();
 
+            // Pick-ups, other interactions and creature hits: the owner had never been sent the
+            // object, so it was not pushed ahead of the floor under it; it goes in the game's order.
+            internal long InOrder;
+
             internal void Clear() {
                 Seen = 0;
                 Retargeted = 0;
@@ -223,6 +236,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 LeftAlone = 0;
                 Pushed = 0;
                 PushExpired = 0;
+                InOrder = 0;
                 Waits.Clear();
             }
         }
@@ -750,10 +764,13 @@ namespace NetworkPerformanceSystem.Runtime {
             long self = router.m_id;
             Counters counters = For(family);
             bool creatureTest = (rules & RouterRules.Rule.CreaturePresence) != 0;
-            // Pick-ups and the other interactions push an object only to a player who already
-            // holds it (PushIfHeld), and never hand a held request back to vanilla to be dropped.
-            // The four older families keep exactly the behaviour they shipped with.
+            // Pick-ups, the other interactions and creature hits push an object only to a player
+            // who already holds it (PushIfHeld): pushed ahead of the floor it stands on, an object
+            // with physics falls through (issue #5). Stations, structures and terrain tiles have
+            // no physics to lose and keep the unconditional push they shipped with. Only the two
+            // newest families also never hand a held request back to vanilla to be dropped.
             bool newFamily = family == Family.Pickup || family == Family.Interaction;
+            bool pushOnlyIfHeld = newFamily || family == Family.Creature;
             long sender = data.m_senderPeerID;
 
             long owner = zdo.GetOwner();
@@ -859,7 +876,11 @@ namespace NetworkPerformanceSystem.Runtime {
             // update is at the front of its next send - again if the owner changes while this
             // waits - then wait for it; FlushHeld will forward this behind it.
             if (request.ForcedFor != owner) {
-                if (newFamily) { PushIfHeld(zdoMan, owner, zdo.m_uid); } else { zdoMan.ForceSendZDO(owner, zdo.m_uid); }
+                if (!pushOnlyIfHeld) {
+                    zdoMan.ForceSendZDO(owner, zdo.m_uid);
+                } else if (!PushIfHeld(zdoMan, owner, zdo.m_uid)) {
+                    counters.InOrder++;
+                }
                 request.ForcedFor = owner;
             }
 

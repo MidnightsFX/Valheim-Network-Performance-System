@@ -115,6 +115,10 @@ namespace NetworkPerformanceSystem.Runtime {
             /// ZNetPeer.GetRefPos and ZNet.GetReferencePosition are both plain field reads and
             /// BuildCandidates already reads both, so this costs twelve bytes and nothing else.</summary>
             internal Vector3 RefPos;
+
+            /// <summary>The peer's send records, for HoldsCopy. Null for the host, which holds
+            /// every object.</summary>
+            internal ZDOMan.ZDOPeer Peer;
         }
 
         private struct Verdict {
@@ -460,6 +464,14 @@ namespace NetworkPerformanceSystem.Runtime {
         internal static int LastPassFirstSendsInOrder;
         internal static long TotalFirstSendsInOrder;
 
+        /// <summary>Creatures placed on a present player the host had already sent them, over the
+        /// one the rules would otherwise have chosen, who had not been; and moves not made this
+        /// pass because the player they would go to has no copy yet. See HoldsCopy.</summary>
+        internal static int LastPassCopyPreferred;
+        internal static int LastPassCopyWaited;
+        internal static long TotalCopyPreferred;
+        internal static long TotalCopyWaited;
+
         /// <summary>Everything else kept the same way: owned objects in a zone nobody is present
         /// in, left with an owner who still has them loaded rather than released (Keep Objects
         /// While Loaded). Each one is a release this pass did not make, and usually the rescue it
@@ -629,6 +641,8 @@ namespace NetworkPerformanceSystem.Runtime {
             LastPassCreaturesRescued = 0;
             LastPassCreaturesKept = 0;
             LastPassFirstSendsInOrder = 0;
+            LastPassCopyPreferred = 0;
+            LastPassCopyWaited = 0;
             LastPassLoadedKept = 0;
             LastPassLeaderKept = 0;
             LastPassLeaderRescued = 0;
@@ -926,6 +940,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     IsViewer = true,
                     NearRadius = Mathf.Max(1, distance.NearSimulationDistance),        // ZoneCompat.NearFor, without asking twice
                     NearClassic = distance.IsClassic,
+                    Peer = peers[i],
                 });
             }
         }
@@ -1198,60 +1213,97 @@ namespace NetworkPerformanceSystem.Runtime {
         }
 
         /// <summary>
-        /// The candidate a creature should go to when the sector's best is at their allowance:
-        /// the best of the present candidates that may own and have room, by the cost function's
-        /// own ranking. 0 when there is none. The sector's best itself when it has room - which is
-        /// always, while M35 is off.
+        /// Whether a candidate has been sent this object. The host has, always. A player has when
+        /// its send record (ZDOPeer.m_zdos) names it, which SendZDOs writes as it serialises and
+        /// RPC_ZDOData writes for the player's own uploads.
+        ///
+        /// A player without a copy cannot run a creature given to it until the first copy lands -
+        /// in the game's order, behind every floor and wall around it, several seconds at a big
+        /// base - and the one way to make it land sooner, a force-send to the front of the queue,
+        /// is the fall of issue #5 (ForceSendIfHeld). So wherever more than one present player
+        /// could take a creature, one that holds a copy is preferred over one that does not, and
+        /// a MOVE whose only possible target holds none waits a pass: its owner is still running
+        /// it, and two seconds later the newcomer's copy has usually arrived. A RESCUE has nobody
+        /// running it at all, so it lands on the best there is, holder or not.
+        ///
+        /// One dictionary probe per candidate, paid only where a creature is about to be placed or
+        /// moved - never on the keep paths that retire most of a zone.
         /// </summary>
-        private static long RoomyTarget(SectorVerdict verdict, out float total) {
-            total = verdict.BestTotalMs;
-            if (RoomOf(verdict.BestUid) > 0) { return verdict.BestUid; }
+        private static bool CandidateHoldsCopy(int candidateIndex, ZDOID id) {
+            ZDOMan.ZDOPeer peer = Candidates[candidateIndex].Peer;
+            return peer == null || peer.m_zdos.ContainsKey(id);
+        }
 
-            FillReceiverOptions(verdict, shedReceiversOnly: false);
-            int pick = CreatureLoadRules.PickWithRoom(ReceiverOptions, -1);
-            if (pick < 0) { return 0L; }
-            total = ReceiverOptions[pick].Total;
-            return Candidates[ReceiverOptions[pick].Index].Uid;
+        private static bool HoldsCopy(long uid, ZDOID id) {
+            return CandidateIndex.TryGetValue(uid, out int index) && CandidateHoldsCopy(index, id);
         }
 
         /// <summary>
-        /// Where a creature goes when the sector's best may be at their allowance: the best
-        /// itself when it has room; otherwise the best of the present candidates that may own
-        /// and have room (RoomyTarget), counted as steered; and the best ANYWAY when nobody else
-        /// has room. An allowance only says "give these to somebody else", so where there is
-        /// nobody else it does not hold - a struggling player who is the only one who can run a
-        /// creature gets it, exactly as with M35 off. Never 0 while the sector has an eligible
-        /// candidate.
+        /// Where a creature goes among the present candidates: the sector's best, when it has
+        /// room for one more creature and has been sent this one; otherwise the best of the
+        /// present candidates that may own, have room and hold a copy (PickWithRoom with
+        /// preferHolders), then the best with room, and the best ANYWAY when nobody has room. An
+        /// allowance only says "give these to somebody else", so where there is nobody else it
+        /// does not hold - a struggling player who is the only one who can run a creature gets
+        /// it, exactly as with M35 off. Never 0 while the sector has an eligible candidate.
+        ///
+        /// steered: the allowance moved the answer off the sector's best. preferred: a copy moved
+        /// it off what the allowance alone would have chosen. Whether a non-holder may be taken
+        /// is the caller's call (HoldsCopy): a rescue has to land, a move can wait.
         /// </summary>
-        private static long PlaceCreature(SectorVerdict verdict, out float total, out bool steered) {
+        private static long PlaceCreature(SectorVerdict verdict, ZDO zdo, out float total, out bool steered, out bool preferred) {
             total = verdict.BestTotalMs;
             steered = false;
-            if (RoomOf(verdict.BestUid) > 0) { return verdict.BestUid; }
+            preferred = false;
+            long best = verdict.BestUid;
+            ZDOID id = zdo.m_uid;
+            bool bestHasRoom = RoomOf(best) > 0;
+            if (bestHasRoom && HoldsCopy(best, id)) { return best; }
 
-            long roomy = RoomyTarget(verdict, out float roomyTotal);
-            if (roomy == 0L) { return verdict.BestUid; }
-            total = roomyTotal;
-            steered = roomy != verdict.BestUid;
-            return roomy;
+            FillReceiverOptions(verdict, id, shedReceiversOnly: false);
+            int pick = CreatureLoadRules.PickWithRoom(ReceiverOptions, -1, preferHolders: true);
+            if (pick < 0) { return best; }                                    // nobody has room: the best anyway
+
+            // What the allowance alone would have chosen, so the two counters stay apart.
+            long plain = best;
+            if (!bestHasRoom) {
+                int plainPick = CreatureLoadRules.PickWithRoom(ReceiverOptions, -1);
+                if (plainPick >= 0) { plain = Candidates[ReceiverOptions[plainPick].Index].Uid; }
+            }
+
+            long chosen = Candidates[ReceiverOptions[pick].Index].Uid;
+            total = ReceiverOptions[pick].Total;
+            steered = plain != best;
+            preferred = chosen != plain;
+            return chosen;
         }
 
-        /// <summary>A rescued creature's owner when the sector's best is at their allowance: the
-        /// best candidate with room, or the best anyway when nobody has room - a rescue has to
-        /// land, because an unowned creature is frozen and cannot be hurt.</summary>
-        private static long RoomyRescueTarget(SectorVerdict verdict) {
-            long target = PlaceCreature(verdict, out _, out bool steered);
+        /// <summary>A rescued creature's owner: PlaceCreature's answer, counted. A rescue has to
+        /// land - an unowned creature is frozen and cannot be hurt - so when nobody present holds
+        /// a copy it goes to the best candidate with room, or the best anyway.</summary>
+        private static long RoomyRescueTarget(SectorVerdict verdict, ZDO zdo) {
+            long target = PlaceCreature(verdict, zdo, out _, out bool steered, out bool preferred);
+            CountPlacement(steered, preferred);
+            return target;
+        }
+
+        private static void CountPlacement(bool steered, bool preferred) {
             if (steered) {
                 LastPassSteered++;
                 TotalSteered++;
             }
-            return target;
+            if (preferred) {
+                LastPassCopyPreferred++;
+                TotalCopyPreferred++;
+            }
         }
 
+        /// <param name="id">The creature being placed, for each option's Holds (HoldsCopy).</param>
         /// <param name="uploadPerCreature">What one creature costs the upload it lands on,
         /// bytes/sec, for a creature moved off a full upload: each creature given to a candidate
         /// this pass or the last is taken off its upload room, and a candidate with none left is
         /// not offered it. 0 otherwise.</param>
-        private static void FillReceiverOptions(SectorVerdict verdict, bool shedReceiversOnly, float uploadPerCreature = 0f) {
+        private static void FillReceiverOptions(SectorVerdict verdict, ZDOID id, bool shedReceiversOnly, float uploadPerCreature = 0f) {
             ReceiverOptions.Clear();
             List<int> presentIndex = verdict.PresentIndex;
             for (int i = 0; i < presentIndex.Count; i++) {
@@ -1269,6 +1321,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     Eligible = Candidates[index].CanOwn && (!shedReceiversOnly || ShedReceiver[index])
                                && !(uploadPerCreature > 0f && uploadRoom <= 0f),
                     UploadRoom = uploadRoom,
+                    Holds = CandidateHoldsCopy(index, id),
                 });
             }
         }
@@ -1370,12 +1423,23 @@ namespace NetworkPerformanceSystem.Runtime {
                 int taken = 0;
                 for (int k = i; k < end && taken < quota; k++) {
                     ShedEntry entry = ShedEntries[k];
-                    FillReceiverOptions(entry.Sector, shedReceiversOnly: true, perCreature);
+                    FillReceiverOptions(entry.Sector, entry.Zdo.m_uid, shedReceiversOnly: true, perCreature);
                     int pick = CreatureLoadRules.PickReceiver(ReceiverOptions, ownerIndex, _challengeMarginMs, byUpload);
                     if (pick < 0) {
                         LastPassShedBlocked++;
                         TotalShedBlocked++;
                         continue;
+                    }
+                    if (!ReceiverOptions[pick].Holds) {
+                        // Nobody with room has been sent it yet. Its owner is still running it,
+                        // so it waits a pass rather than stall on a machine that cannot (HoldsCopy).
+                        LastPassCopyWaited++;
+                        TotalCopyWaited++;
+                        continue;
+                    }
+                    if (pick != CreatureLoadRules.PickReceiver(ReceiverOptions, ownerIndex, _challengeMarginMs, byUpload, preferHolders: false)) {
+                        LastPassCopyPreferred++;
+                        TotalCopyPreferred++;
                     }
 
                     long receiver = Candidates[ReceiverOptions[pick].Index].Uid;
@@ -1771,6 +1835,16 @@ namespace NetworkPerformanceSystem.Runtime {
                             && OwnershipPolicy.ShouldPullToSoleNearby(Candidates[ownerIndex].IsViewer, ownerSq, _proximityPullSq)
                             && !OwnershipPolicy.IsDirectlyControlled(zdo)
                             && now - Touch(zdo.m_uid, currentOwner, now) >= minHold) {
+                            if (creature && !CandidateHoldsCopy(sole, zdo.m_uid)) {
+                                // The one player near it has not been sent it yet - they have
+                                // just arrived - and could not run it before their first copy
+                                // lands, behind the floors around it. Its owner is still running
+                                // it, so the pull waits a pass (HoldsCopy).
+                                LastPassProximityKept++;
+                                LastPassCopyWaited++;
+                                TotalCopyWaited++;
+                                continue;
+                            }
                             // Priority is the staleness the near player stops paying - the same
                             // quantity, in the same unit, as every other entry in this queue, so
                             // the shared sort in Drain stays meaningful across both kinds.
@@ -1843,9 +1917,23 @@ namespace NetworkPerformanceSystem.Runtime {
                 long target = verdict.BestUid;
                 float targetTotal = verdict.BestTotalMs;
                 bool steered = false;
-                if (creature && _allowanceActive && RoomOf(target) <= 0) {
-                    target = PlaceCreature(verdict, out targetTotal, out steered);
+                bool preferred = false;
+                if (creature) {
+                    // Also prefers a player the host has sent the creature over one it has not
+                    // (HoldsCopy): a newcomer the cost function would hand it to waits for their
+                    // first copy, and the owner keeps running it meanwhile.
+                    target = PlaceCreature(verdict, zdo, out targetTotal, out steered, out preferred);
                     if (target == currentOwner) {
+                        if (preferred) {
+                            LastPassCopyWaited++;
+                            TotalCopyWaited++;
+                        }
+                        if (shedCandidate) { CollectShed(zdo, verdict, currentOwner, now, minHold, soleScan); }
+                        continue;
+                    }
+                    if (!HoldsCopy(target, zdo.m_uid)) {
+                        LastPassCopyWaited++;
+                        TotalCopyWaited++;
                         if (shedCandidate) { CollectShed(zdo, verdict, currentOwner, now, minHold, soleScan); }
                         continue;
                     }
@@ -1871,10 +1959,7 @@ namespace NetworkPerformanceSystem.Runtime {
                     Creature = creature, OldOwner = currentOwner,
                 });
                 if (creature) { ReserveCreature(target, currentOwner); }
-                if (steered) {
-                    LastPassSteered++;
-                    TotalSteered++;
-                }
+                CountPlacement(steered, preferred);
             }
         }
 
@@ -1956,21 +2041,27 @@ namespace NetworkPerformanceSystem.Runtime {
             }
 
             long target;
+            bool steered = false;
+            bool preferred = false;
             bool proximity = near == 1 && _proximityEnabled && Candidates[sole].CanOwn;
             if (proximity) {
                 target = Candidates[sole].Uid;
             } else {
-                target = verdict.BestUid;
                 // M35: not onto a player at their allowance while somebody else present can take
-                // it. With nobody else, the allowance does not hold (PlaceCreature).
-                if (_allowanceActive && RoomOf(target) <= 0) {
-                    target = PlaceCreature(verdict, out _, out bool steered);
-                    if (steered) {
-                        LastPassSteered++;
-                        TotalSteered++;
-                    }
-                }
+                // it. With nobody else, the allowance does not hold (PlaceCreature). A player the
+                // host has sent it is preferred over one it has not.
+                target = PlaceCreature(verdict, zdo, out _, out steered, out preferred);
             }
+            if (!HoldsCopy(target, zdo.m_uid)) {
+                // The player it would go to has not been sent it yet. Its owner, outside the
+                // presence square but still loading it, is running it, so the move waits a pass
+                // (HoldsCopy).
+                LastPassCreaturesKept++;
+                LastPassCopyWaited++;
+                TotalCopyWaited++;
+                return;
+            }
+            CountPlacement(steered, preferred);
 
             int ownerIndex = CandidateIndex[owner];                           // OwnerStillLoads found it
             int targetIndex = CandidateIndex.TryGetValue(target, out int found) ? found : ownerIndex;
@@ -2360,17 +2451,29 @@ namespace NetworkPerformanceSystem.Runtime {
         /// "rescues this layer changed" rather than "rescues it looked at".
         ///
         /// A creature falling back to the sector's best skips a best that is at its creature
-        /// allowance (M35) for the best with room, when there is one. Ships and carts are not
-        /// creatures and never do.
+        /// allowance (M35) for the best with room, when there is one, and a best the host has not
+        /// sent it for one it has (HoldsCopy). Ships and carts are not creatures and never do.
+        ///
+        /// The one player near a creature can be one who has just arrived and has not been sent
+        /// it yet. Nobody is running it, so it has to land now: on another present player who
+        /// holds a copy and can run it at once, if there is one; the proximity layer pulls it to
+        /// the near player once their copy has arrived.
         /// </summary>
         private static long SoleNearbyOrBest(ZDO zdo, SectorVerdict verdict, bool creature) {
-            if (!_proximityEnabled) { return creature ? RoomyRescueTarget(verdict) : verdict.BestUid; }
+            if (!_proximityEnabled) { return creature ? RoomyRescueTarget(verdict, zdo) : verdict.BestUid; }
 
             if (NearbyViewers(verdict, zdo.GetPosition(), out int sole) != 1 || !Candidates[sole].CanOwn) {
-                return creature ? RoomyRescueTarget(verdict) : verdict.BestUid;
+                return creature ? RoomyRescueTarget(verdict, zdo) : verdict.BestUid;
             }
 
             long uid = Candidates[sole].Uid;
+            if (creature && !CandidateHoldsCopy(sole, zdo.m_uid)) {
+                long holder = PlaceCreature(verdict, zdo, out _, out bool steered, out _);
+                if (holder != uid && HoldsCopy(holder, zdo.m_uid)) {
+                    CountPlacement(steered, preferred: true);
+                    return holder;
+                }
+            }
             if (uid != verdict.BestUid) {
                 LastPassProximityRescued++;
                 TotalProximityRescued++;
@@ -3005,6 +3108,10 @@ namespace NetworkPerformanceSystem.Runtime {
             TotalCreaturesOptimised = 0;
             LastPassFirstSendsInOrder = 0;
             TotalFirstSendsInOrder = 0;
+            LastPassCopyPreferred = 0;
+            LastPassCopyWaited = 0;
+            TotalCopyPreferred = 0;
+            TotalCopyWaited = 0;
             _creaturesEnabled = false;
             LastPassLoadedKept = 0;
             _keepWhileLoaded = false;

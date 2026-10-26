@@ -864,21 +864,26 @@ namespace NetworkPerformanceSystem.Runtime {
                     }
                     held = $"; {inBackground} player(s) there now, {ConnectionTimeout.BackgroundHolds} kept past the usual deadline this session";
                 }
-                sb.AppendLine($"  in background    {ConnectionTimeout.BackgroundTimeoutSeconds}s while a player's game says it is alt-tabbed or minimised{held}");
+                bool noLimit = ConnectionTimeout.BackgroundUnlimited;
+                string waitFor = noLimit ? "for it with no limit" : $"{ConnectionTimeout.BackgroundTimeoutSeconds}s for it";
+                sb.AppendLine(noLimit
+                    ? $"  in background    no limit while a player's game says it is alt-tabbed or minimised, {ConnectionTimeout.BackgroundTimeoutSeconds}s once their computer goes silent too (Enable Background Timeout is off){held}"
+                    : $"  in background    {ConnectionTimeout.BackgroundTimeoutSeconds}s while a player's game says it is alt-tabbed or minimised{held}");
                 if (NpsEnv.IsHost() && !NpsEnv.IsDedicated()) {
                     string now = !ConnectionTimeout.HostInBackground ? ""
                         : ConnectionTimeout.HostToldWait ? "; in the background now, players are waiting for it"
                         : "; in the background now and still running, players keep their usual deadline";
                     sb.AppendLine(ConnectionTimeout.HostStopsInBackground
-                        ? $"  host's game      has stopped in the background this session; players with the mod wait {ConnectionTimeout.BackgroundTimeoutSeconds}s for it whenever it is there{now}"
-                        : $"  host's game      players with the mod wait {ConnectionTimeout.BackgroundTimeoutSeconds}s for it only until it has run {ConnectionTimeout.HostRunningProofSeconds:F0}s in the background{now}");
+                        ? $"  host's game      has stopped in the background this session; players with the mod wait {waitFor} whenever it is there{now}"
+                        : $"  host's game      players with the mod wait {waitFor} only until it has run {ConnectionTimeout.HostRunningProofSeconds:F0}s in the background{now}");
                     string keepalive = HostKeepalive.StatsLine();
                     if (keepalive != null) { sb.AppendLine($"                   {keepalive}"); }
                 } else if (NpsEnv.IsClient() && ConnectionTimeout.HostInBackground) {
                     ZNetPeer server = ZNet.instance.GetServerPeer();
-                    sb.AppendLine(server != null && ConnectionTimeout.IsInBackground(server.m_rpc)
-                        ? $"  host's game      in the background now - waiting up to {ConnectionTimeout.BackgroundTimeoutSeconds}s for it"
-                        : "  host's game      in the background now and still running - the usual deadline applies");
+                    sb.AppendLine(server == null || !ConnectionTimeout.IsInBackground(server.m_rpc)
+                        ? "  host's game      in the background now and still running - the usual deadline applies"
+                        : noLimit ? "  host's game      in the background now - waiting for it with no limit"
+                        : $"  host's game      in the background now - waiting up to {ConnectionTimeout.BackgroundTimeoutSeconds}s for it");
                 }
             } else if (ConnectionTimeout.Active) {
                 sb.AppendLine("  in background    no longer than anyone else (Keep Players In The Background is off)");
@@ -934,7 +939,10 @@ namespace NetworkPerformanceSystem.Runtime {
                     sb.AppendLine("  watchdog         off (EnableGhostWatchdog)");
                 } else {
                     float deadline = ConnectionTimeout.DeadlineFor(server?.m_rpc);
-                    sb.AppendLine($"  watchdog         warns at {GhostWatchdog.WarnAfterSeconds(server?.m_rpc):F0}s, leaves at {deadline:F0}s{(GhostWatchdog.Warning ? "  [WARNING ACTIVE]" : "")}");
+                    string leaves = float.IsPositiveInfinity(deadline)
+                        ? "leaves only on a dead connection while the host's game is in the background"
+                        : $"leaves at {deadline:F0}s";
+                    sb.AppendLine($"  watchdog         warns at {GhostWatchdog.WarnAfterSeconds(server?.m_rpc):F0}s, {leaves}{(GhostWatchdog.Warning ? "  [WARNING ACTIVE]" : "")}");
                     sb.AppendLine($"  session totals   {GhostWatchdog.TotalWarnings} warnings, {GhostWatchdog.TotalTrips} disconnects");
                 }
             }
@@ -1560,6 +1568,7 @@ namespace NetworkPerformanceSystem.Runtime {
                 sb.AppendLine($"  {Pad("seen", 13)} {c.Seen} hits on creatures sent through the server");
                 sb.AppendLine($"  {Pad("re-targeted", 13)} {c.Retargeted} (attacker's copy named a stale owner, or nobody - delivered to the one simulating it)");
                 sb.AppendLine($"  {Pad("claimed", 13)} {c.Claimed} (nobody was simulating it - handed to the attacker first)");
+                sb.AppendLine($"  {Pad("in order", 13)} {c.InOrder} (new owner had never been sent the creature - not pushed ahead of the floor under it; it arrives in the game's order and the hit follows)");
                 AppendHoldLines(sb, c, items: false);
             }
 
@@ -1693,6 +1702,9 @@ namespace NetworkPerformanceSystem.Runtime {
             if (counters.PushExpired > 0) {
                 sb.AppendLine($"  {Pad("never theirs", 13)} {counters.PushExpired} (asked for, and not theirs within {RpcOwnerRouter.PendingGrantSeconds:F0}s)");
             }
+            if (counters.InOrder > 0) {
+                sb.AppendLine($"  {Pad("in order", 13)} {counters.InOrder} (new owner had never been sent the object - not pushed ahead of the floor under it)");
+            }
             sb.AppendLine($"  {Pad("dropped", 13)} {counters.Dropped} (object or player gone while waiting)");
         }
 
@@ -1810,6 +1822,7 @@ namespace NetworkPerformanceSystem.Runtime {
 
             sb.AppendLine($"  static held {OwnershipArbiter.LastPassStaticHeld} (present owner is not the lowest-latency one; kept because the object does not move)");
             sb.AppendLine($"  in order    {OwnershipArbiter.LastPassFirstSendsInOrder} owner changes not pushed to a player who had never been sent the object; it reaches them behind the floors and walls around it (since start {OwnershipArbiter.TotalFirstSendsInOrder})");
+            sb.AppendLine($"  with copy   {OwnershipArbiter.LastPassCopyPreferred} creatures given to a player who had already been sent them over one who had not yet, {OwnershipArbiter.LastPassCopyWaited} moves waited for the chosen player's first copy (since start {OwnershipArbiter.TotalCopyPreferred} / {OwnershipArbiter.TotalCopyWaited})");
             sb.AppendLine($"  pass time   {OwnershipArbiter.LastPassMs:F1}ms");
             sb.AppendLine($"  total since start  rescued {OwnershipArbiter.TotalRescued} ({OwnershipArbiter.TotalCreaturesRescued} creatures), optimised {OwnershipArbiter.TotalOptimised} ({OwnershipArbiter.TotalCreaturesOptimised} creatures), interactive {OwnershipArbiter.TotalInteractiveOptimised}, proximity pulled {OwnershipArbiter.TotalProximityPulled} / rescued {OwnershipArbiter.TotalProximityRescued} / held {OwnershipArbiter.TotalProximityHeld}");
 

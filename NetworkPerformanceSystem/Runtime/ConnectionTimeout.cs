@@ -65,6 +65,14 @@ namespace NetworkPerformanceSystem.Runtime {
     /// that Steam would otherwise drop sooner. Their objects are not held: PeerLiveness stops
     /// trusting a quiet peer to simulate anything long before either deadline.</para>
     ///
+    /// <para>OR NONE. With Enable Background Timeout off, ZRpc holds a connection whose game is in
+    /// the background to no deadline at all, however long it stays there - for an admin who would
+    /// rather hold a slot than have a player who stepped away come back to the menu. Steam's
+    /// TimeoutConnected keeps Background Timeout Seconds, and that is the bound left: a game that
+    /// has merely stopped still has Steam's thread acknowledging, so it is kept; a computer that
+    /// has gone to sleep, lost its line or lost the game to a crash has not, and Steam closes the
+    /// connection after Background Timeout Seconds as before.</para>
+    ///
     /// <para>AND THE SAME FOR THE HOST. On a server hosted from the game itself the host is a
     /// player who alt-tabs too. Usually nothing happens: most hosts play windowed, the game keeps
     /// running in the background, and its main thread goes on answering every client's ZRpc
@@ -132,8 +140,17 @@ namespace NetworkPerformanceSystem.Runtime {
 
         /// <summary>The ZRpc deadline for a peer whose game last said it is in the background,
         /// when Keep Players In The Background is on; 0 when it is off. Never below either of the
-        /// other two.</summary>
+        /// other two. With BackgroundUnlimited it is Steam's deadline only.</summary>
         internal static float BackgroundTimeoutSeconds { get; private set; }
+
+        /// <summary>Enable Background Timeout is off, under Keep Players In The Background: ZRpc
+        /// never hangs up on a peer whose game is in the background.</summary>
+        internal static bool BackgroundUnlimited { get; private set; }
+
+        /// <summary>What ZRpc holds a peer in the background to: BackgroundTimeoutSeconds, or
+        /// infinity with no limit, which ZRpc's "silence > deadline" never passes.</summary>
+        internal static float BackgroundDeadlineSeconds =>
+            BackgroundUnlimited ? float.PositiveInfinity : BackgroundTimeoutSeconds;
 
         /// <summary>Whether ZRpc.Update rewrites the static per peer. Off while tuning is off, so
         /// the game's own value - or another mod's - is left alone.</summary>
@@ -258,7 +275,8 @@ namespace NetworkPerformanceSystem.Runtime {
 
         private static float DeadlineOf(PeerState state) {
             float deadline = BaseDeadlineOf(state);
-            return state.InBackground && BackgroundTimeoutSeconds > deadline ? BackgroundTimeoutSeconds : deadline;
+            float background = BackgroundDeadlineSeconds;
+            return state.InBackground && background > deadline ? background : deadline;
         }
 
         /// <summary>Whether the host is holding this connection to the background deadline right
@@ -301,15 +319,21 @@ namespace NetworkPerformanceSystem.Runtime {
 
             if (!NpsEnv.IsHost()) {
                 Logger.LogInfo($"The host's game is in the background and has not answered for {usual:F0}s. " +
-                               $"Waiting for it for up to {deadline:F0}s while it stays there (Keep Players In The Background).");
+                               $"Waiting for it {HowLong(deadline)} (Keep Players In The Background).");
                 return;
             }
 
             ZNetPeer peer = ZNet.instance != null ? Patches.NetworkChannelPatches.FindPeerByRpc(rpc) : null;
             string name = peer != null && !string.IsNullOrEmpty(peer.m_playerName) ? peer.m_playerName : "A player";
             Logger.LogInfo($"{name}'s game is in the background and has not answered for {usual:F0}s. " +
-                           $"Keeping them connected for up to {deadline:F0}s while it stays there (Keep Players In The Background).");
+                           $"Keeping them connected {HowLong(deadline)} (Keep Players In The Background).");
             if (peer != null && Monitoring.Active) { Monitoring.OnBackgroundHold(peer.m_uid, usual, deadline); }
+        }
+
+        private static string HowLong(float deadline) {
+            return float.IsPositiveInfinity(deadline)
+                ? "for as long as it stays there"
+                : $"for up to {deadline:F0}s while it stays there";
         }
 
         /// <summary>Times the background deadline has kept a quiet player connected past the one
@@ -504,18 +528,24 @@ namespace NetworkPerformanceSystem.Runtime {
                 BackgroundTimeoutSeconds = KeepInBackground
                     ? Math.Max(ValConfig.BackgroundTimeoutSeconds.Value, JoiningTimeoutSeconds)
                     : 0f;
+                BackgroundUnlimited = KeepInBackground
+                    && ValConfig.EnableBackgroundTimeout != null
+                    && !ValConfig.EnableBackgroundTimeout.Value;
             } else {
                 InWorldTimeoutSeconds = vanilla;
                 JoiningTimeoutSeconds = vanilla;
                 BackgroundTimeoutSeconds = 0f;
+                BackgroundUnlimited = false;
             }
 
             float before = ZRpc.m_timeout;
             ZRpc.m_timeout = JoiningTimeoutSeconds;
 
+            string background = BackgroundUnlimited
+                ? $", no limit while their game is in the background (Steam still drops a computer silent for {BackgroundTimeoutSeconds}s)"
+                : BackgroundTimeoutSeconds > 0f ? $", {BackgroundTimeoutSeconds}s while their game is in the background" : "";
             string line = _perPeer
-                ? $"ZRpc ping timeout {before}s -> {JoiningTimeoutSeconds}s while joining, {InWorldTimeoutSeconds}s once in the world"
-                  + (BackgroundTimeoutSeconds > 0f ? $", {BackgroundTimeoutSeconds}s while their game is in the background" : "")
+                ? $"ZRpc ping timeout {before}s -> {JoiningTimeoutSeconds}s while joining, {InWorldTimeoutSeconds}s once in the world{background}"
                 : $"ZRpc ping timeout {before}s -> {ZRpc.m_timeout}s (vanilla)";
             if (_longMode) { line += " [crossplay]"; }
             if (line == _lastLoggedRpc) { return; }
@@ -536,6 +566,8 @@ namespace NetworkPerformanceSystem.Runtime {
             int wantInitial = Active
                 ? ValConfig.ConnectTimeoutSeconds.Value * MillisPerSecond
                 : VanillaSteamInitialMillis;
+            // Background Timeout Seconds even with BackgroundUnlimited: it is then the only bound
+            // on a computer that has gone silent while its game is in the background.
             int wantConnected = Active
                 ? Math.Max(Math.Max(ValConfig.LoadingTimeoutSeconds.Value, ValConfig.ConnectionTimeoutSeconds.Value),
                            KeepInBackground ? ValConfig.BackgroundTimeoutSeconds.Value : 0) * MillisPerSecond

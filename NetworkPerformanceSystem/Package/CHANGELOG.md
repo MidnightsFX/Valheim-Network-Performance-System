@@ -1,5 +1,9 @@
 # Changelog
 
+**1.18.1**
+- Creatures go to a player whose game already has them rather than to one who has just arrived and is still loading the area.
+- Options to disable the timeout due to a server going idle
+
 **1.18.0**
 - Dropped items are picked up straight away instead of sometimes taking many seconds.
 - Doors, chests, item stands, berry bushes, beds, wards, portals, map tables, beehives and tame commands now reach whoever owns them instead of sometimes being lost.

@@ -1,5 +1,8 @@
 # Changelog
 
+**1.18.2**
+- Updated for Valheim 1.0.21
+
 **1.18.1**
 - Creatures go to a player whose game already has them rather than to one who has just arrived and is still loading the area.
 - Options to disable the timeout due to a server going idle

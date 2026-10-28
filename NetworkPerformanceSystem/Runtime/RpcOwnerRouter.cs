@@ -54,6 +54,10 @@ namespace NetworkPerformanceSystem.Runtime {
     /// rather than deliver it a second time. RPC_RemoveDoneItem is left out for the same reason -
     /// it has no gate either, and a dropped one costs a second press of E, not an item.
     ///
+    /// Every path keeps the message's sender as it arrived - handled here, forwarded, or handed
+    /// back to vanilla - and since game 1.0.21 CookingStation.RPC_AddItem depends on it: it stores
+    /// the sender as the slot's player, and SpawnItem names the cooked item's crafter after them.
+    ///
     /// ITEMS THAT CANNOT BE DELIVERED ARE HANDED BACK. Some requests still find nobody to take
     /// them: nobody the host can see at the station (the owner has gone, and the host has not yet
     /// caught up with the requester arriving), the station destroyed while the request waited, or

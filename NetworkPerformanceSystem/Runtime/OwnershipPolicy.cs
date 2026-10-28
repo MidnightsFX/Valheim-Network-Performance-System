@@ -359,9 +359,9 @@ namespace NetworkPerformanceSystem.Runtime {
         ///
         /// WearNTear - and Piece, which it always accompanies - excludes the prefab outright, and
         /// that exclusion is the structural safety rule. WearNTear is what makes an object part of
-        /// a building: UpdateSupport writes s_support only on the owner (WearNTear.cs:529, :915),
+        /// a building: UpdateSupport writes s_support only on the owner (WearNTear.cs:531, :916),
         /// and a collapsing piece addresses RPC_ClearCachedSupport at a NEIGHBOURING piece's
-        /// GetZDO().GetOwner() (WearNTear.cs:889) - an owner-addressed call across two different
+        /// GetZDO().GetOwner() (WearNTear.cs:890) - an owner-addressed call across two different
         /// ZDOs, which is a strictly harder stale-owner problem than anything tier 2 accepts.
         /// Nothing in the seven components below belongs on a player-built piece, so the exclusion
         /// costs nothing and keeps every support network out of a tier that moves owners between

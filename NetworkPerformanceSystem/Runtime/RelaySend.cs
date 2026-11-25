@@ -7,15 +7,14 @@ namespace NetworkPerformanceSystem.Runtime {
     /// M19 - the host's routed-RPC relay, sent without rebuilding the message for every recipient.
     ///
     /// Vanilla's relay (ZRoutedRpc.RouteRPC) builds a fresh ZPackage per relayed message and
-    /// serialises the RoutedRPCData into it, which copies the parameter package out through
-    /// GetArray. It then calls ZRpc.Invoke("RoutedRPC", pkg) once per recipient, and each of those
-    /// allocates a params object[], hashes the method name, and copies the whole message out
-    /// through GetArray a second time into ZRpc's own package - before the socket copies it a
-    /// third time into its send queue. Only that last copy has to exist.
+    /// serialises the RoutedRPCData into it. It then calls ZRpc.Invoke("RoutedRPC", pkg) once per
+    /// recipient, and each of those allocates a params object[], hashes the method name, and copies
+    /// the whole message into ZRpc's own package - before the socket copies it again into its send
+    /// queue. Only that last copy has to exist.
     ///
-    /// Here the message is written once into a kept frame, laid out exactly as ZRpc.Invoke lays it
-    /// out - [int hash of "RoutedRPC"][int length][serialised RoutedRPCData] - and that frame is
-    /// handed to each recipient's socket. Roughly ten objects fewer per relayed message and two
+    /// Here the message is serialised once into a kept frame, laid out exactly as ZRpc.Invoke lays
+    /// it out - [int hash of "RoutedRPC"][int length][serialised RoutedRPCData] - and that frame is
+    /// handed to each recipient's socket. Roughly ten objects fewer per relayed message and one
     /// fewer per recipient. The idea is EnRoute's (ComfyMods); the reset below is what it lacks.
     ///
     /// THE PLAYFAB TRAP. ZPlayFabSocket.Send appends its in-flight sequence number and a message
@@ -35,9 +34,9 @@ namespace NetworkPerformanceSystem.Runtime {
     /// THE ONE BEHAVIOURAL DIFFERENCE is that the relay no longer passes through ZRpc.Invoke, so a
     /// mod that hooks ZRpc.Invoke to observe traffic will not see relayed RoutedRPCs. Nothing known
     /// depends on that - Compress hooks the ZDO send's own call site, not Invoke - but it is why
-    /// this has its own switch. This mod's own traffic monitoring is told directly (SendFrame). ZRpc's sent-packet and sent-byte counters are kept exactly as
-    /// Invoke keeps them, and ZRpc's debug mode (which writes the method name into the frame) is
-    /// left to vanilla.
+    /// this has its own switch. This mod's own traffic monitoring is told directly (SendFrame).
+    /// ZRpc's sent-packet and sent-byte counters are kept exactly as Invoke keeps them, and ZRpc's
+    /// debug mode (which writes the method name into the frame) is left to vanilla.
     /// </summary>
     internal static class RelaySend {
 
@@ -92,20 +91,7 @@ namespace NetworkPerformanceSystem.Runtime {
             frame.Clear();
             frame.Write(RoutedRpcHash);
             frame.Write(0);                                                   // length, patched below
-
-            // RoutedRPCData.Serialize, less the GetArray copy of the parameters: the same fields in
-            // the same order, with the parameter bytes read straight out of their stream. Every
-            // ZPackage stream is an expandable MemoryStream, so its buffer is always exposed.
-            frame.Write(data.m_msgID);
-            frame.Write(data.m_senderPeerID);
-            frame.Write(data.m_targetPeerID);
-            frame.Write(data.m_targetZDO);
-            frame.Write(data.m_methodHash);
-
-            ZPackage parameters = data.m_parameters;
-            int parameterBytes = parameters.Size();                            // flushes, and is Length - as GetArray copies
-            frame.Write(parameterBytes);
-            frame.m_writer.Write(parameters.m_stream.GetBuffer(), 0, parameterBytes);
+            data.Serialize(frame);
 
             int length = frame.Size();
             frame.m_stream.Position = 4;

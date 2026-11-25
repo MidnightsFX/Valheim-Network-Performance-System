@@ -65,6 +65,9 @@ Works on dedicated servers and on player-hosted games.
 
 ## Diagnosing and Reporting a problem
 
+<details>
+<summary>Extended troubleshooting information</summary>
+
 An easy way to start is enabling the nps_stats display Run `nps_stats_collect` (needs `devcommands`, since sampling costs a Steam call per peer per tick), play, then `nps_stats`.
 
 A player the link-pressure table marks as `LOSSY` is already being dealt with: the server steps that one player's send rate down until their connection stops losing packets, and back up once it is clean, without changing anyone else's rate (`Steam Transport / Enable Loss Backoff`). A player whose loss does not improve - once their rate is below what their connection was already carrying, or at the lowest rate - has a connection problem the rate cannot fix: they go back to full speed (never above the game's 150 KB/s) and are left there until the server restarts. Loss measured during an outage at the server's end is ignored. The "Loss backoff" block shows who is backed off and by how much.
@@ -84,7 +87,7 @@ Players without the mod, or with an older version of it, wait just as long (`Con
 On a crossplay server the game never tells a player that the server dropped them. A mod's join check refusing someone, an admin tool or a mod kicking them leaves that player in a half-loaded world until their own game gives up, and a message a mod sends just before dropping them is often lost too. With `Crossplay / Tell Dropped Players` (on by default) the server first sends them the game's own disconnect message, along with anything still waiting to go to them, so they go back to the main menu straight away as Steam players do. Players do not need the mod. It is not sent to a player who timed out, left by themselves or was kicked by the game, which tells them itself. The "Crossplay connections" block in `nps_stats` counts who was told and who was not.
 
 A crossplay player's game resets its connection after 26 seconds without anything from the host. Once it is back, the game checks the same old clock and resets it again on the very next frame, so the reset repeats every few seconds and nothing gets through. Players with the mod give the host another 26 seconds after each reconnect instead (`Crossplay / Resume After Connection Reset`, on by default, following the server's setting). A connection that never comes back still ends at the game's own timeout.
-
+</details>
 
 > **Lag, rubber-banding, hits not landing? Send a report.**
 >
@@ -163,6 +166,11 @@ running either way.
 - Disconnect ghosting from **[ClientGhostWatchdog](https://github.com/dreamwraith/Valheim-ClientGhostWatchdog)
 by DreamWraith**.
 - ZDO Redirect from BetterZeeRouter
+
+<!--
+AI_Assisted_Creation: This assembly was partially created with the assistance of AI.
+AI_Model_Vendor: Anthropic
+-->
 
 ---
 

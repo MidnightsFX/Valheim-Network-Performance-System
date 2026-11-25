@@ -1,5 +1,8 @@
 # Changelog
 
+**1.19.0**
+- Updated for Valheim 1.0.30
+
 **1.18.2**
 - Updated for Valheim 1.0.21
 

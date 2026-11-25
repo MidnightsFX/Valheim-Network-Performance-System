@@ -12,7 +12,7 @@ namespace NetworkPerformanceSystem.Runtime {
     /// WHY REUSE IS SAFE. Nothing retains either package past the call:
     ///
     ///   * the outer one goes to ZRpc.Invoke, which copies it into ZRpc's own package via
-    ///     ZPackage.Write(ZPackage) - and that reads through GetArray(), which honours Length, so
+    ///     ZPackage.Write(ZPackage) - and that copies the stream's buffer only up to its Length, so
     ///     a reused buffer with spare capacity contributes nothing extra;
     ///   * ZSteamSocket.Send then copies again into the socket's send queue;
     ///   * the inner one is already Clear()ed per ZDO by vanilla, so it never held anything across

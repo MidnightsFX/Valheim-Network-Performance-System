@@ -69,33 +69,6 @@ namespace NetworkPerformanceSystem.Patches {
                 PatchGuard.Disable(Mechanism.RelaySendReuse,
                     "ZRpc's socket / sent counters / debug flag, ZPackage's stream and writer, ZRoutedRpc.GetPeer(long) or RoutedRPCData.Serialize(ZPackage) " +
                     "do not have the expected shape. Either the game updated or another mod rewrote them first. Relayed RPCs are sent as vanilla.");
-                return;
-            }
-
-            // Serialize is not called on the fast path, but the frame reproduces it field for field.
-            // If it has grown a field the frame does not know about, the frame would be wrong, so
-            // compare the IL's field reads against the six the frame writes.
-            int fieldReads = CountFieldReads(serialize);
-            if (fieldReads != ExpectedSerializeFieldReads) {
-                PatchGuard.Disable(Mechanism.RelaySendReuse,
-                    $"RoutedRPCData.Serialize reads {fieldReads} field(s), expected {ExpectedSerializeFieldReads}. The message layout has changed and the " +
-                    "reused frame no longer matches it. Relayed RPCs are sent as vanilla.");
-            }
-        }
-
-        /// <summary>msgID, sender, target, target ZDO, method hash, parameters.</summary>
-        private const int ExpectedSerializeFieldReads = 6;
-
-        /// <summary>-1 when the body cannot be read, which never equals the expected count.</summary>
-        private static int CountFieldReads(MethodInfo method) {
-            try {
-                int count = 0;
-                foreach (CodeInstruction instruction in PatchProcessor.GetOriginalInstructions(method)) {
-                    if (instruction.opcode == System.Reflection.Emit.OpCodes.Ldfld) { count++; }
-                }
-                return count;
-            } catch (System.Exception) {
-                return -1;
             }
         }
 
